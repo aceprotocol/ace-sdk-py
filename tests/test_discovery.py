@@ -6,10 +6,11 @@ from unittest.mock import patch
 import pytest
 from ace import SoftwareIdentity
 from ace._utils import to_base64
+from ace import discovery
 from ace.discovery import (
     validate_ace_id, validate_registration_file, verify_registration_id,
     get_registration_signing_public_key, get_registration_encryption_public_key,
-    fetch_registration_file, _parse_registration_json, _check_ssrf,
+    fetch_registration_file, _parse_registration_json, _resolve_and_check_ssrf,
 )
 from ace.types import RegistrationFile, SigningConfig
 
@@ -154,51 +155,102 @@ def test_fetch_rejects_single_label_domain():
         fetch_registration_file("localhost")
 
 
+class _DummyConn:
+    closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class _DummyResponse:
+    status = 200
+    reason = "OK"
+
+    def __init__(self, headers=None, body=b"{}", status=200):
+        self._headers = headers if headers is not None else {"Content-Type": "application/json"}
+        self._body = body
+        self.status = status
+
+    def getheader(self, name, default=None):
+        return self._headers.get(name, default)
+
+    def read(self, size=-1):
+        return self._body if size < 0 else self._body[:size]
+
+
+def _patch_pinned(monkeypatch, response):
+    conn = _DummyConn()
+    monkeypatch.setattr("ace.discovery._urlopen_pinned", lambda domain, timeout: (conn, response))
+    return conn
+
+
 def test_fetch_rejects_oversized_content_length(monkeypatch):
-    class DummyResponse:
-        status = 200
-        reason = "OK"
-        headers = {
-            "Content-Type": "application/json",
-            "Content-Length": str(1_048_577),
-        }
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def read(self, size=-1):
-            return b"{}"
-
-    monkeypatch.setattr("ace.discovery.urlopen", lambda req, timeout=10.0: DummyResponse())
-
+    resp = _DummyResponse(headers={"Content-Type": "application/json", "Content-Length": str(1_048_577)})
+    conn = _patch_pinned(monkeypatch, resp)
     with pytest.raises(ValueError, match="too large"):
         fetch_registration_file("example.com")
+    assert conn.closed  # connection is always closed
 
 
 def test_fetch_rejects_oversized_body(monkeypatch):
-    class DummyResponse:
-        status = 200
-        reason = "OK"
-        headers = {
-            "Content-Type": "application/json",
-        }
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
+    class _BigBody(_DummyResponse):
         def read(self, size=-1):
             return b"a" * size
 
-    monkeypatch.setattr("ace.discovery.urlopen", lambda req, timeout=10.0: DummyResponse())
-
+    _patch_pinned(monkeypatch, _BigBody())
     with pytest.raises(ValueError, match="too large"):
         fetch_registration_file("example.com")
+
+
+def test_fetch_rejects_redirect(monkeypatch):
+    resp = _DummyResponse(headers={"Location": "http://169.254.169.254/"}, body=b"", status=302)
+    _patch_pinned(monkeypatch, resp)
+    with pytest.raises(ValueError, match="Refusing to follow redirect"):
+        fetch_registration_file("example.com")
+
+
+def test_urlopen_pinned_connects_to_the_vetted_ip(monkeypatch):
+    """Pinning: the socket connects to the vetted IP, and TLS/Host use the domain."""
+    monkeypatch.setattr("ace.discovery.socket.getaddrinfo", _mock_getaddrinfo("93.184.216.34"))
+    captured: dict = {}
+
+    class _Sock:
+        def close(self):
+            pass
+
+    def fake_create_connection(addr, timeout=None):
+        captured["addr"] = addr
+        return _Sock()
+
+    class _Ctx:
+        def wrap_socket(self, sock, server_hostname=None):
+            captured["sni"] = server_hostname
+            return sock
+
+    class _Conn:
+        def __init__(self, host, port, timeout=None):
+            captured["host"] = host
+
+        sock = None
+
+        def request(self, *a, **k):
+            pass
+
+        def getresponse(self):
+            return "RESP"
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("ace.discovery.socket.create_connection", fake_create_connection)
+    monkeypatch.setattr("ace.discovery.ssl.create_default_context", lambda: _Ctx())
+    monkeypatch.setattr("ace.discovery.http.client.HTTPSConnection", _Conn)
+
+    conn, resp = discovery._urlopen_pinned("example.com", 10.0)
+    assert captured["addr"] == ("93.184.216.34", 443)  # connected to the vetted IP, not re-resolved
+    assert captured["sni"] == "example.com"            # TLS cert validated against the domain
+    assert captured["host"] == "example.com"           # Host header is the domain
+    assert resp == "RESP"
 
 
 def test_parse_registration_json_ed25519():
@@ -264,30 +316,30 @@ def _mock_getaddrinfo(ip_str):
 def test_check_ssrf_rejects_loopback(monkeypatch):
     monkeypatch.setattr("ace.discovery.socket.getaddrinfo", _mock_getaddrinfo("127.0.0.1"))
     with pytest.raises(ValueError, match="non-public IP"):
-        _check_ssrf("evil.com")
+        _resolve_and_check_ssrf("evil.com")
 
 
 def test_check_ssrf_rejects_private_10(monkeypatch):
     monkeypatch.setattr("ace.discovery.socket.getaddrinfo", _mock_getaddrinfo("10.0.0.1"))
     with pytest.raises(ValueError, match="non-public IP"):
-        _check_ssrf("internal.corp")
+        _resolve_and_check_ssrf("internal.corp")
 
 
 def test_check_ssrf_rejects_private_192(monkeypatch):
     monkeypatch.setattr("ace.discovery.socket.getaddrinfo", _mock_getaddrinfo("192.168.1.1"))
     with pytest.raises(ValueError, match="non-public IP"):
-        _check_ssrf("router.local")
+        _resolve_and_check_ssrf("router.local")
 
 
 def test_check_ssrf_rejects_link_local(monkeypatch):
     monkeypatch.setattr("ace.discovery.socket.getaddrinfo", _mock_getaddrinfo("169.254.1.1"))
     with pytest.raises(ValueError, match="non-public IP"):
-        _check_ssrf("metadata.internal")
+        _resolve_and_check_ssrf("metadata.internal")
 
 
 def test_check_ssrf_allows_public_ip(monkeypatch):
     monkeypatch.setattr("ace.discovery.socket.getaddrinfo", _mock_getaddrinfo("93.184.216.34"))
-    _check_ssrf("example.com")  # should not raise
+    _resolve_and_check_ssrf("example.com")  # should not raise
 
 
 def test_check_ssrf_rejects_dns_failure(monkeypatch):
@@ -296,7 +348,7 @@ def test_check_ssrf_rejects_dns_failure(monkeypatch):
         raise socket.gaierror("Name resolution failed")
     monkeypatch.setattr("ace.discovery.socket.getaddrinfo", fail)
     with pytest.raises(ValueError, match="DNS resolution failed"):
-        _check_ssrf("nonexistent.invalid")
+        _resolve_and_check_ssrf("nonexistent.invalid")
 
 
 def test_fetch_rejects_loopback_domain(monkeypatch):

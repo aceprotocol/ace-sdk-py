@@ -82,6 +82,7 @@ def test_sign_data():
         mp["conversationId"],
         mp["messageId"],
         mp["threadId"],
+        _b64(mp["ephemeralPubKey"]),
         _b64(mp["ciphertext"]),
     )
     sign_data = build_sign_data(sd["action"], sd["aceId"], sd["timestamp"], message_payload)

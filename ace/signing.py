@@ -19,6 +19,10 @@ _MAX_TIMESTAMP = (1 << 53) - 1
 # Unified domain prefix for all sign-data contexts
 _DOMAIN_PREFIX = b"ace.v1"
 
+# secp256k1 curve order N and N/2 — used to enforce canonical low-S signatures.
+_SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+_SECP256K1_HALF_ORDER = _SECP256K1_ORDER // 2
+
 
 def _length_prefix(data: bytes) -> bytes:
     """4-byte big-endian length prefix."""
@@ -85,7 +89,21 @@ def verify_signature(
 
         # Extract r, s, v from 65-byte signature
         compact = signature[:64]
+        r = int.from_bytes(signature[:32], "big")
+        s = int.from_bytes(signature[32:64], "big")
         v = signature[64]
+
+        # Reject out-of-range and non-canonical (high-S) signatures. ECDSA is
+        # malleable: (r, s) and (r, n - s) recover the same key, so accepting
+        # high-S lets an observer re-mint a valid signature with different bytes
+        # and slip past signature-keyed replay protection. Requiring low-S makes
+        # the signature bytes canonical (matches how all ACE SDKs sign).
+        if v not in (0, 1):
+            return False
+        if r < 1 or r >= _SECP256K1_ORDER:
+            return False
+        if s < 1 or s > _SECP256K1_HALF_ORDER:
+            return False
 
         # Recover public key using coincurve
         try:

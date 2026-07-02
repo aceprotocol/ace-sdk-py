@@ -33,12 +33,16 @@ from .signing import (
     build_sign_data, encode_payload,
     verify_signature, encode_signature, decode_signature,
 )
-from .messages import create_message, parse_message, parse_message_from_registration, validate_body
+from .messages import (
+    create_message, parse_message, parse_message_from_registration,
+    parse_message_from_peer, validate_body,
+)
 from .discovery import (
     validate_registration_file, validate_ace_id, verify_registration_id,
     get_registration_signing_public_key, get_registration_encryption_public_key,
     fetch_registration_file,
     validate_profile,
+    verify_encryption_key_binding, VerifiedPeer,
 )
 from .security import check_timestamp_freshness, validate_message_id, ReplayDetector
 from .state_machine import ThreadStateMachine, ThreadSnapshot, InvalidTransitionError, validate_thread_id
@@ -59,12 +63,14 @@ __all__ = [
     "build_sign_data", "encode_payload",
     "verify_signature", "encode_signature", "decode_signature",
     # Messages
-    "create_message", "parse_message", "parse_message_from_registration", "validate_body",
+    "create_message", "parse_message", "parse_message_from_registration",
+    "parse_message_from_peer", "validate_body",
     # Discovery
     "validate_registration_file", "validate_ace_id", "verify_registration_id",
     "get_registration_signing_public_key", "get_registration_encryption_public_key",
     "fetch_registration_file",
     "validate_profile",
+    "verify_encryption_key_binding", "VerifiedPeer",
     # Security
     "check_timestamp_freshness", "validate_message_id", "ReplayDetector",
     # State Machine

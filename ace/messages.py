@@ -20,6 +20,7 @@ from .discovery import (
     verify_registration_id,
     get_registration_signing_public_key,
     get_registration_encryption_public_key,
+    VerifiedPeer,
 )
 from .state_machine import ThreadStateMachine, validate_thread_id, InvalidTransitionError
 
@@ -43,9 +44,17 @@ def _build_signed_message_payload(
     conversation_id: str,
     message_id: str,
     thread_id: str | None,
+    ephemeral_pub_key: bytes,
     payload: bytes,
 ) -> bytes:
-    return encode_payload(type_, to_id, conversation_id, message_id, _normalize_thread_id(thread_id), payload)
+    # ephemeral_pub_key is signed too: it is what the recipient uses to derive the
+    # decryption key, so it is part of the sender's commitment. Omitting it would
+    # let a relay swap the ephemeral key (garbling the message) without breaking
+    # the signature.
+    return encode_payload(
+        type_, to_id, conversation_id, message_id, _normalize_thread_id(thread_id),
+        ephemeral_pub_key, payload,
+    )
 
 
 # === Schema Validation ===
@@ -240,7 +249,7 @@ def create_message(
 
     # 3. Build sign data and sign
     message_payload = _build_signed_message_payload(
-        type_, to_id, conversation_id, message_id, thread_id, payload
+        type_, to_id, conversation_id, message_id, thread_id, ephemeral_pub_key, payload
     )
     sign_data = build_sign_data("message", from_id, ts, message_payload)
     signature, scheme = sender.sign(sign_data)
@@ -346,12 +355,14 @@ def parse_message(
             f"bytes exceeds max {MAX_PAYLOAD_SIZE}"
         )
     payload_bytes = from_base64(msg.encryption.payload)
+    ephemeral_pub_key = from_base64(msg.encryption.ephemeral_pub_key)
     message_payload = _build_signed_message_payload(
         msg.type,
         msg.to_id,
         msg.conversation_id,
         msg.message_id,
         msg.thread_id,
+        ephemeral_pub_key,
         payload_bytes,
     )
     sign_data = build_sign_data("message", msg.from_id, msg.timestamp, message_payload)
@@ -372,8 +383,8 @@ def parse_message(
             replay_detector.release(msg.message_id)
         raise ValueError("Signature verification failed")
 
-    # 5. Decrypt body (pipeline step 5)
-    ephemeral_pub_key = from_base64(msg.encryption.ephemeral_pub_key)
+    # 5. Decrypt body (pipeline step 5) — ephemeral_pub_key was decoded and
+    # signature-verified above, so decryption uses the authenticated key.
     try:
         decrypted = receiver.decrypt_payload(ephemeral_pub_key, payload_bytes, msg.conversation_id)
     except Exception:
@@ -432,4 +443,28 @@ def parse_message_from_registration(
         state_machine=state_machine,
         replay_detector=replay_detector,
         sender_encryption_pub_key=get_registration_encryption_public_key(sender_registration),
+    )
+
+
+def parse_message_from_peer(
+    msg: ACEMessage,
+    receiver: ACEIdentity,
+    sender: VerifiedPeer,
+    state_machine: ThreadStateMachine,
+    replay_detector: ReplayDetector | None = None,
+) -> ParsedMessage:
+    """Safe path for messages whose sender keys came from a relay.
+
+    ``sender`` must be a :class:`VerifiedPeer` — obtainable only after the sender's
+    encryption-key binding was verified — so the recipient never encrypts against
+    or trusts a relay-substituted X25519 key.  ``conversation_id`` is recomputed
+    from the verified encryption keys and must match the envelope.
+    """
+    return parse_message(
+        msg,
+        receiver,
+        sender.signing_public_key,
+        state_machine=state_machine,
+        replay_detector=replay_detector,
+        sender_encryption_pub_key=sender.encryption_public_key,
     )

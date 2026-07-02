@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import json
 import re
 import socket
-from urllib.request import Request, urlopen
-from urllib.error import URLError
+import ssl
+from dataclasses import dataclass
+from typing import Any
 
 import base58
 from coincurve import PublicKey as SecpPublicKey
@@ -19,7 +21,10 @@ from .types import (
     Capability, PricingInfo, ChainInfo, ProfilePricing,
 )
 from .identity import compute_ace_id
+from .signing import build_sign_data, encode_payload, verify_signature, decode_signature
 from ._utils import from_base64, secp_pubkey_to_address, CONTROL_CHAR_RE
+
+_VALID_SCHEMES: frozenset[str] = frozenset({"ed25519", "secp256k1"})
 
 _ACE_ID_PATTERN = re.compile(r"^ace:sha256:[a-f0-9]{64}$")
 _VALID_DOMAIN_PATTERN = re.compile(
@@ -31,19 +36,37 @@ _VALID_DOMAIN_PATTERN = re.compile(
 _DEFAULT_MAX_REGISTRATION_BYTES = 1_048_576
 
 
-def _check_ssrf(domain: str) -> None:
-    """Resolve domain and reject private/loopback/link-local IP addresses."""
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+def _resolve_and_check_ssrf(domain: str) -> list[str]:
+    """Resolve ``domain`` and reject if ANY address is private/internal.
+
+    Returns the vetted IP strings so the caller can connect to exactly the address
+    that was checked. Resolving here and connecting to the returned IP (rather than
+    re-resolving the hostname) removes the DNS-rebinding TOCTOU window: the IP that
+    passed the check is the IP we connect to.
+    """
     try:
         results = socket.getaddrinfo(domain, 443, proto=socket.IPPROTO_TCP)
     except socket.gaierror as exc:
         raise ValueError(f"DNS resolution failed for '{domain[:100]}': {exc}") from exc
 
-    for family, _, _, _, sockaddr in results:
+    vetted: list[str] = []
+    for _family, _type, _proto, _canon, sockaddr in results:
         ip = ipaddress.ip_address(sockaddr[0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        if (
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+        ):
             raise ValueError(
                 f"Refusing to connect to non-public IP {ip} resolved from '{domain[:100]}'"
             )
+        if sockaddr[0] not in vetted:
+            vetted.append(sockaddr[0])
+    if not vetted:
+        raise ValueError(f"No addresses resolved for '{domain[:100]}'")
+    return vetted
 
 
 def _decode_ed25519_address(address: str) -> bytes:
@@ -129,6 +152,141 @@ def get_registration_encryption_public_key(reg: RegistrationFile) -> bytes:
     return from_base64(reg.signing.encryption_public_key)
 
 
+# === Encryption-key binding (relay-sourced peer keys) ===
+#
+# ``ace_id`` self-certifies only the *signing* key (ace_id == sha256(signingKey)).
+# The X25519 *encryption* key is a separate key; on its own it is an unauthenticated
+# claim.  A relay that routes ciphertext is untrusted by design, so a relay could
+# hand a client its own X25519 key and read messages the client believes are E2E
+# encrypted.  The binding below is the proof that closes that gap: it is the very
+# same signature the relay requires at registration, so verifying it needs no new
+# trust anchor — just the identity's own signing key.
+
+_MISSING = object()
+
+
+def verify_encryption_key_binding(
+    ace_id: str,
+    scheme: SigningScheme,
+    encryption_public_key: str,
+    signing_public_key: str,
+    timestamp: int,
+    signature: str,
+) -> bool:
+    """Verify that ``encryption_public_key`` was authorized by ``ace_id``.
+
+    The binding is identical to what ``POST /v1/register`` signs:
+
+        build_sign_data("register", ace_id, timestamp,
+                        encode_payload(encryptionPublicKey, signingPublicKey))
+
+    signed by the identity's signing key.  This function also re-checks that
+    ``ace_id == sha256(signingPublicKey)``, so a ``True`` result means: *this exact
+    X25519 key was signed by the key that defines this identity*.
+
+    ``encryption_public_key`` and ``signing_public_key`` MUST be the Base64 wire
+    strings (the signature commits to those strings, not to raw bytes).  Returns
+    ``False`` on any malformed input rather than raising, so callers can treat all
+    verification failures uniformly.
+    """
+    if scheme not in _VALID_SCHEMES:
+        return False
+    if isinstance(timestamp, bool):
+        return False
+    if isinstance(timestamp, float):
+        if not timestamp.is_integer():
+            return False
+        timestamp = int(timestamp)
+    if not isinstance(timestamp, int):
+        return False
+    try:
+        signing_pub_bytes = from_base64(signing_public_key)
+    except (ValueError, TypeError):
+        return False
+    # The signing key must be the one that defines this identity.
+    if compute_ace_id(signing_pub_bytes) != ace_id:
+        return False
+    try:
+        payload = encode_payload(encryption_public_key, signing_public_key)
+        sign_data = build_sign_data("register", ace_id, timestamp, payload)
+        sig_bytes = decode_signature(signature, scheme)
+    except (ValueError, TypeError):
+        return False
+    try:
+        return verify_signature(sign_data, sig_bytes, scheme, signing_pub_bytes)
+    except (ValueError, TypeError):
+        return False
+
+
+@dataclass(frozen=True)
+class VerifiedPeer:
+    """A peer's public keys AFTER verifying its identity and encryption-key binding.
+
+    Holding an instance is proof that ``ace_id`` matches the signing key AND that
+    the X25519 ``encryption_public_key`` was signed by that identity.  Construct
+    ONLY via :meth:`from_relay_response`; the bare constructor bypasses verification
+    and must never be fed untrusted data.
+    """
+
+    ace_id: str
+    scheme: SigningScheme
+    signing_public_key: bytes
+    encryption_public_key: bytes
+
+    @classmethod
+    def from_relay_response(cls, data: dict[str, Any]) -> "VerifiedPeer":
+        """Build a verified peer from a relay ``GET /v1/peer`` or ``/v1/discover`` entry.
+
+        Raises ``ValueError`` if the binding signature is absent or fails — a relay
+        that substitutes an X25519 key cannot produce a passing binding, so an
+        instance can only be obtained for a genuine key.
+        """
+        if not isinstance(data, dict):
+            raise ValueError("Peer response must be a dict")
+        ace_id = _peer_field(data, "aceId", "ace_id")
+        scheme = _peer_field(data, "scheme")
+        enc_pub_b64 = _peer_field(data, "encryptionPublicKey", "encryption_public_key")
+        sign_pub_b64 = _peer_field(data, "signingPublicKey", "signing_public_key")
+        signature = _peer_field(data, "registrationSignature", "registration_signature", default=None)
+        registered_at = _peer_field(data, "registeredAt", "registered_at", default=None)
+
+        if not isinstance(ace_id, str) or not validate_ace_id(ace_id):
+            raise ValueError(f"Invalid peer aceId: '{str(ace_id)[:80]}'")
+        if scheme not in _VALID_SCHEMES:
+            raise ValueError(f"Unsupported peer signing scheme: '{str(scheme)[:32]}'")
+        if not isinstance(enc_pub_b64, str) or not isinstance(sign_pub_b64, str):
+            raise ValueError("Peer response signingPublicKey/encryptionPublicKey must be strings")
+        if signature is None or registered_at is None:
+            raise ValueError(
+                "Peer response is missing the encryption-key binding "
+                "(registrationSignature/registeredAt); its encryptionPublicKey cannot be "
+                "trusted.  Without the binding a relay could substitute its own X25519 key "
+                "and read messages meant to be end-to-end encrypted."
+            )
+        if not verify_encryption_key_binding(
+            ace_id, scheme, enc_pub_b64, sign_pub_b64, registered_at, signature,
+        ):
+            raise ValueError(
+                "Peer encryption-key binding failed verification: the encryptionPublicKey is "
+                "not signed by this identity's signing key (possible key substitution / relay MITM)."
+            )
+        return cls(
+            ace_id=ace_id,
+            scheme=scheme,  # type: ignore[arg-type]
+            signing_public_key=from_base64(sign_pub_b64),
+            encryption_public_key=from_base64(enc_pub_b64),
+        )
+
+
+def _peer_field(d: dict[str, Any], *keys: str, default: Any = _MISSING) -> Any:
+    for key in keys:
+        if key in d:
+            return d[key]
+    if default is not _MISSING:
+        return default
+    raise ValueError(f"Peer response missing required field '{keys[0]}'")
+
+
 def _parse_registration_json(data: dict) -> RegistrationFile:
     """Parse a raw JSON dict into a RegistrationFile dataclass."""
     signing_raw = data.get("signing", {})
@@ -184,6 +342,36 @@ def _parse_registration_json(data: dict) -> RegistrationFile:
         raise ValueError(f"Missing required registration field: {e}") from None
 
 
+def _urlopen_pinned(domain: str, timeout: float) -> tuple[http.client.HTTPSConnection, http.client.HTTPResponse]:
+    """IO shell: resolve+vet the domain, connect to the vetted IP, issue the GET.
+
+    Pins the TCP connection to the exact address that passed the SSRF check (no
+    re-resolution → no DNS-rebinding window) while validating TLS SNI/cert against
+    the real domain. Returns ``(conn, response)``; the caller must close ``conn``.
+    """
+    vetted_ip = _resolve_and_check_ssrf(domain)[0]
+    context = ssl.create_default_context()
+    try:
+        raw_sock = socket.create_connection((vetted_ip, 443), timeout=timeout)
+    except OSError as exc:
+        raise ValueError(
+            f"Failed to connect to {vetted_ip} for '{domain[:100]}': {exc}"
+        ) from exc
+
+    conn = http.client.HTTPSConnection(domain, 443, timeout=timeout)
+    try:
+        # Pin the pre-vetted socket; wrap_socket(server_hostname=domain) sets SNI
+        # and verifies the certificate against the real domain, not the IP.
+        conn.sock = context.wrap_socket(raw_sock, server_hostname=domain)
+        conn.request("GET", "/.well-known/ace.json", headers={"Accept": "application/json"})
+        return conn, conn.getresponse()
+    except (OSError, ssl.SSLError) as exc:
+        conn.close()
+        raise ValueError(
+            f"Failed to fetch registration file from https://{domain}/.well-known/ace.json: {exc}"
+        ) from exc
+
+
 def fetch_registration_file(
     domain: str, *, timeout: float = 10.0, max_bytes: int = _DEFAULT_MAX_REGISTRATION_BYTES
 ) -> RegistrationFile:
@@ -200,41 +388,42 @@ def fetch_registration_file(
     if max_bytes <= 0:
         raise ValueError(f"Invalid max_bytes: expected positive integer, got {max_bytes!r}")
 
-    _check_ssrf(domain)
-
-    url = f"https://{domain}/.well-known/ace.json"
-
+    conn, resp = _urlopen_pinned(domain, timeout)
     try:
-        req = Request(url, headers={"Accept": "application/json"})
-        with urlopen(req, timeout=timeout) as resp:
-            if resp.status != 200:
+        # Do NOT follow redirects — a redirect target would bypass SSRF vetting.
+        if resp.status in _REDIRECT_STATUSES:
+            location = resp.getheader("Location", "") or ""
+            raise ValueError(
+                f"Refusing to follow redirect ({resp.status}) to '{location[:100]}' "
+                f"when fetching registration file"
+            )
+        if resp.status != 200:
+            raise ValueError(
+                f"Failed to fetch registration file: {resp.status} {resp.reason}"
+            )
+
+        content_type = resp.getheader("Content-Type", "") or ""
+        if "application/json" not in content_type:
+            raise ValueError(
+                f"Invalid or missing content-type: expected application/json, got '{content_type}'"
+            )
+
+        content_length = resp.getheader("Content-Length")
+        if content_length is not None:
+            declared_length = int(content_length)
+            if declared_length > max_bytes:
                 raise ValueError(
-                    f"Failed to fetch registration file: {resp.status} {resp.reason}"
+                    f"Registration file too large: {declared_length} bytes exceeds max {max_bytes}"
                 )
 
-            content_type = resp.headers.get("Content-Type", "")
-            if "application/json" not in content_type:
-                raise ValueError(
-                    f"Invalid or missing content-type: expected application/json, got '{content_type}'"
-                )
-
-            content_length = resp.headers.get("Content-Length")
-            if content_length is not None:
-                declared_length = int(content_length)
-                if declared_length > max_bytes:
-                    raise ValueError(
-                        f"Registration file too large: {declared_length} bytes exceeds max {max_bytes}"
-                    )
-
-            raw_bytes = resp.read(max_bytes + 1)
-            if len(raw_bytes) > max_bytes:
-                raise ValueError(
-                    f"Registration file too large: {len(raw_bytes)} bytes exceeds max {max_bytes}"
-                )
-
-            raw = json.loads(raw_bytes)
-    except URLError as exc:
-        raise ValueError(f"Failed to fetch registration file from {url}: {exc}") from exc
+        raw_bytes = resp.read(max_bytes + 1)
+        if len(raw_bytes) > max_bytes:
+            raise ValueError(
+                f"Registration file too large: {len(raw_bytes)} bytes exceeds max {max_bytes}"
+            )
+        raw = json.loads(raw_bytes)
+    finally:
+        conn.close()
 
     reg = _parse_registration_json(raw)
     validate_registration_file(reg)

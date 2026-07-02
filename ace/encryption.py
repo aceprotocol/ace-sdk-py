@@ -62,6 +62,22 @@ def _validate_public_key(pub_key: bytes) -> None:
         raise ValueError("Refusing to use all-zeros X25519 public key (known weak key)")
 
 
+def _reject_degenerate_shared_secret(shared_secret: bytes) -> None:
+    """Root safeguard against small-order public keys.
+
+    X25519 clamps the private scalar to a multiple of the cofactor, so any
+    low-order input point collapses the shared secret to all-zeros. Rejecting an
+    all-zero secret therefore catches *every* small-subgroup case regardless of
+    which points a public-key blocklist happens to enumerate — this is the same
+    root check the Swift and TS SDKs make.
+    """
+    if shared_secret == _ZERO_KEY:
+        raise ValueError(
+            "ECDH produced a degenerate (all-zero) shared secret; refusing to proceed "
+            "(small-order public key)"
+        )
+
+
 def encrypt(
     plaintext: bytes,
     recipient_pub_key: bytes,
@@ -85,6 +101,7 @@ def encrypt(
     # 2. ECDH shared secret
     recipient_key = X25519PublicKey.from_public_bytes(recipient_pub_key)
     shared_secret = ephemeral_priv.exchange(recipient_key)
+    _reject_degenerate_shared_secret(shared_secret)
 
     # 3. HKDF key derivation
     conv_id_bytes = conversation_id.encode("utf-8")
@@ -133,6 +150,7 @@ def decrypt(
     # 1. ECDH shared secret
     ephemeral_key = X25519PublicKey.from_public_bytes(ephemeral_pub_key)
     shared_secret = recipient_priv_key.exchange(ephemeral_key)
+    _reject_degenerate_shared_secret(shared_secret)
 
     # 2. HKDF key derivation
     conv_id_bytes = conversation_id.encode("utf-8")
