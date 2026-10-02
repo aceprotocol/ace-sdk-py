@@ -19,7 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "cryptography>=44.0",
+    "cryptography>=48.0.1",
     "coincurve>=21.0",
     "base58>=2.1",
     "pycryptodome>=3.21",
@@ -27,7 +27,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
+    "pytest>=9.0.3",
     "pytest-asyncio>=1.0",
 ]
 
