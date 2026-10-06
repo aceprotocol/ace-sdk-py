@@ -75,7 +75,7 @@ def test_wrong_length_kem_ciphertext_rejected_before_decapsulation(length, monke
             ThreadStateMachine(), detector,
         )
     # Nothing enters the seen store before the signature verifies.
-    assert detector.accepts(msg.message_id, msg.timestamp) is True
+    assert detector.accepts(msg.message_id, msg.from_id, msg.timestamp) is True
 
 
 def test_untampered_message_still_roundtrips():

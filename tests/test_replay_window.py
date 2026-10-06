@@ -72,6 +72,16 @@ def test_fresh_store_rejects_backlog_it_cannot_vouch_for(clock, agents):
         _parse(agents, _create(agents, T - 3600), ReplayDetector(), T - 7200)
 
 
+def test_flood_from_one_sender_does_not_block_others(clock, agents):
+    mallory, bob = SoftwareIdentity.generate("ed25519"), agents[1]
+    store = ReplayDetector(capacity=3)
+    for _ in range(4):
+        flood = create_message(mallory, bob.get_encryption_public_key(), bob.get_ace_id(), "text",
+                               {"message": "flood"}, ThreadStateMachine(), timestamp=T + 300)
+        parse_message(flood, bob, mallory.get_signing_public_key(), ThreadStateMachine(), store)
+    assert _parse(agents, _create(agents, T), store).body == {"message": "offline"}
+
+
 def test_backlog_evicted_at_capacity_cannot_be_replayed(clock, agents):
     store = _running_store(capacity=1)
     a, b = _create(agents, T - 3600), _create(agents, T - 1800)

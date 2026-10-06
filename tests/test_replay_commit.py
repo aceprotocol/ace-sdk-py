@@ -70,6 +70,6 @@ def test_decryption_failure_after_valid_signature_consumes_message_id():
     detector = ReplayDetector()
     with pytest.raises(Exception):
         _parse(msg, wrong_seed_bob, alice, detector)
-    assert detector.accepts(msg.message_id, msg.timestamp) is False
+    assert detector.accepts(msg.message_id, msg.from_id, msg.timestamp) is False
     with pytest.raises(ValueError, match="Replay detected"):
         _parse(msg, bob, alice, detector)

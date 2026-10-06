@@ -68,7 +68,7 @@ class TestReplayDetectorThreadSafety:
 
         def try_commit():
             barrier.wait()
-            results.append(detector.commit("msg-race", now))
+            results.append(detector.commit("msg-race", "ace:sha256:alice", now))
 
         threads = [threading.Thread(target=try_commit) for _ in range(50)]
         for t in threads:

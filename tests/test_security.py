@@ -40,6 +40,9 @@ def _id(n: int) -> str:
     return f"550e8400-e29b-41d4-a716-4466554400{n:02d}"
 
 
+ALICE, MALLORY = "ace:sha256:alice", "ace:sha256:mallory"
+
+
 @pytest.fixture
 def clock(monkeypatch):
     import types
@@ -56,70 +59,100 @@ def test_replay_starts_with_horizon_now_minus_5_min(clock):
 
 def test_replay_rejects_duplicates_and_timestamps_at_or_below_horizon(clock):
     d = ReplayDetector()
-    assert d.commit(_id(1), T) is True
-    assert d.accepts(_id(1), T) is False
-    assert d.commit(_id(1), T) is False
-    assert d.accepts(_id(2), T - 300) is False
-    assert d.accepts(_id(2), T - 299) is True
+    assert d.commit(_id(1), ALICE, T) is True
+    assert d.accepts(_id(1), ALICE, T) is False
+    assert d.commit(_id(1), ALICE, T) is False
+    assert d.accepts(_id(2), ALICE, T - 300) is False
+    assert d.accepts(_id(2), ALICE, T - 299) is True
 
 
 def test_replay_keeps_entry_until_below_floor_then_raises_horizon(clock):
     d = ReplayDetector()
-    d.commit(_id(1), T + 300)  # max future drift: acceptable until T + 600
+    d.commit(_id(1), ALICE, T + 300)  # max future drift: acceptable until T + 600
     clock.now = T + 450
-    d.commit(_id(2), T + 450)
-    assert d.accepts(_id(1), T + 300) is False
+    d.commit(_id(2), ALICE, T + 450)
+    assert d.accepts(_id(1), ALICE, T + 300) is False
     clock.now = T + 650
-    d.commit(_id(3), T + 650)  # floor T + 350 > T + 300: _id(1) removed
+    d.commit(_id(3), ALICE, T + 650)  # floor T + 350 > T + 300: _id(1) removed
     assert d.horizon == T + 300
-    assert d.accepts(_id(1), T + 300) is False
+    assert d.accepts(_id(1), ALICE, T + 300) is False
 
 
 def test_replay_fixed_earlier_floor_keeps_entries_until_capacity(clock):
     # A store that has been running since before the receiver went offline.
     d = ReplayDetector.from_export({"horizon": T - 7200, "entries": []}, capacity=2)
-    d.commit(_id(1), T - 3000, T - 7200)
-    d.commit(_id(2), T - 1000, T - 7200)
+    d.commit(_id(1), ALICE, T - 3000, T - 7200)
+    d.commit(_id(2), ALICE, T - 1000, T - 7200)
     assert d.horizon == T - 7200  # nothing removed
-    d.commit(_id(3), T - 2000, T - 7200)
-    assert d.horizon == T - 3000
+    d.commit(_id(3), ALICE, T - 2000, T - 7200)
+    assert d.horizon == T - 7200
+    assert d.export()["senderHorizons"] == {ALICE: T - 3000}
 
 
-def test_replay_capacity_removes_smallest_timestamp_not_oldest_insertion(clock):
+def test_replay_capacity_removes_smallest_timestamp_and_raises_only_its_sender_horizon(clock):
     d = ReplayDetector(2)
-    d.commit(_id(1), T - 10)
-    d.commit(_id(2), T - 50)
-    d.commit(_id(3), T - 20)
-    assert d.horizon == T - 50
+    d.commit(_id(1), ALICE, T - 10)
+    d.commit(_id(2), ALICE, T - 50)
+    d.commit(_id(3), ALICE, T - 20)
+    assert d.horizon == T - 300
     for n, ts in [(1, T - 10), (2, T - 50), (3, T - 20)]:
-        assert d.accepts(_id(n), ts) is False
-    assert d.accepts(_id(4), T - 50) is False
-    assert d.accepts(_id(4), T - 49) is True
+        assert d.accepts(_id(n), ALICE, ts) is False
+    assert d.accepts(_id(4), ALICE, T - 50) is False
+    assert d.accepts(_id(4), ALICE, T - 49) is True
+    assert d.accepts(_id(4), MALLORY, T - 50) is True
+
+
+def test_replay_flood_from_one_sender_cannot_block_others(clock):
+    d = ReplayDetector(3)
+    for n in range(1, 5):
+        d.commit(_id(n), MALLORY, T + 300)
+    assert d.horizon == T - 300
+    assert d.accepts(_id(5), MALLORY, T + 300) is False
+    assert d.commit(_id(5), ALICE, T) is True
+
+
+def test_replay_sender_horizons_bounded_by_capacity_folding_lowest_into_horizon(clock):
+    d = ReplayDetector(2)
+    for n in range(1, 7):
+        d.commit(_id(n), f"ace:sha256:s{n}", T + n)
+    assert len(d.export()["senderHorizons"]) <= 2
+    assert d.horizon > T - 300
+    for n in range(1, 5):
+        assert d.accepts(_id(n), f"ace:sha256:s{n}", T + n) is False
 
 
 def test_replay_export_import_round_trip(clock):
-    d = ReplayDetector()
-    d.commit(_id(1), T - 10)
-    d.commit(_id(2), T - 20)
-    restored = ReplayDetector.from_export(d.export())
+    d = ReplayDetector(2)
+    d.commit(_id(1), ALICE, T - 10)
+    d.commit(_id(2), ALICE, T - 20)
+    d.commit(_id(3), MALLORY, T - 5)  # evicts _id(2): ALICE horizon T - 20
+    restored = ReplayDetector.from_export(d.export(), capacity=2)
     assert restored.horizon == d.horizon
-    assert restored.accepts(_id(1), T - 10) is False
-    assert restored.accepts(_id(2), T - 20) is False
-    assert restored.accepts(_id(3), T - 20) is True
+    assert restored.export() == d.export()
+    assert restored.accepts(_id(1), ALICE, T - 10) is False
+    assert restored.accepts(_id(4), ALICE, T - 20) is False
+    assert restored.accepts(_id(4), MALLORY, T - 20) is True
 
 
-def test_replay_from_export_over_capacity_raises_horizon(clock):
-    entries = [[_id(1), T - 30], [_id(2), T - 10], [_id(3), T - 20]]
+def test_replay_from_export_over_capacity_raises_sender_horizon(clock):
+    entries = [[_id(1), ALICE, T - 30], [_id(2), ALICE, T - 10], [_id(3), ALICE, T - 20]]
     restored = ReplayDetector.from_export({"horizon": T - 300, "entries": entries}, capacity=2)
-    assert restored.horizon == T - 30
+    assert restored.horizon == T - 300
+    assert restored.export()["senderHorizons"] == {ALICE: T - 30}
     assert len(restored.export()["entries"]) == 2
 
 
 @pytest.mark.parametrize("state, error", [
     ({"horizon": -1, "entries": []}, "invalid replay state"),
-    ({"horizon": T, "entries": [["msg-1", T + 1]]}, "invalid message_id"),
-    ({"horizon": T, "entries": [[_id(1), T]]}, "invalid entry"),
-    ({"horizon": T, "entries": [[_id(1), T + 1], [_id(1), T + 2]]}, "invalid entry"),
+    ({"horizon": T, "senderHorizons": {"": T}, "entries": []}, "invalid replay state"),
+    ({"horizon": T, "senderHorizons": {ALICE: -1}, "entries": []}, "invalid replay state"),
+    ({"horizon": T, "senderHorizons": [], "entries": []}, "invalid replay state"),
+    ({"horizon": T, "entries": [["msg-1", ALICE, T + 1]]}, "invalid message_id"),
+    ({"horizon": T, "entries": [[_id(1), T + 1]]}, "invalid message_id"),
+    ({"horizon": T, "entries": [[_id(1), "", T + 1]]}, "invalid entry"),
+    ({"horizon": T, "entries": [[_id(1), ALICE, T]]}, "invalid entry"),
+    ({"horizon": T, "senderHorizons": {ALICE: T + 5}, "entries": [[_id(1), ALICE, T + 5]]}, "invalid entry"),
+    ({"horizon": T, "entries": [[_id(1), ALICE, T + 1], [_id(1), ALICE, T + 2]]}, "invalid entry"),
 ])
 def test_replay_from_export_rejects_malformed_state(state, error):
     with pytest.raises(ValueError, match=error):

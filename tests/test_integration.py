@@ -96,8 +96,8 @@ def test_replay_detection():
         state_machine=ThreadStateMachine(),
     )
 
-    assert detector.commit(msg.message_id, msg.timestamp) is True
-    assert detector.commit(msg.message_id, msg.timestamp) is False
+    assert detector.commit(msg.message_id, msg.from_id, msg.timestamp) is True
+    assert detector.commit(msg.message_id, msg.from_id, msg.timestamp) is False
 
 
 def test_cross_scheme_communication():

@@ -294,8 +294,8 @@ def parse_message(
     """Verify signature, decrypt, and validate a received message.
 
     Args:
-        oldest_timestamp: Offline acceptance floor; use the same value for every
-            message of one backlog.
+        oldest_timestamp: Offline acceptance floor; use it for every message, live
+            ones included, until the backlog is done.
         sender_encryption_pub_key: Optional sender X-Wing public key. When
             provided, `conversation_id` is recomputed from the sender and
             recipient encryption keys and must match the envelope value.
@@ -339,7 +339,7 @@ def parse_message(
     replay_error = ValueError(
         f"Replay detected: message {msg.message_id} already processed or below replay horizon"
     )
-    if not replay_detector.accepts(msg.message_id, msg.timestamp):
+    if not replay_detector.accepts(msg.message_id, msg.from_id, msg.timestamp):
         raise replay_error
 
     # 4. Verify signature BEFORE decryption (pipeline step 4).
@@ -367,7 +367,7 @@ def parse_message(
     if not valid:
         raise ValueError("Signature verification failed")
     # Commit now: an authentic message is one-shot, even if a later step fails.
-    if not replay_detector.commit(msg.message_id, msg.timestamp, oldest_timestamp):
+    if not replay_detector.commit(msg.message_id, msg.from_id, msg.timestamp, oldest_timestamp):
         raise replay_error
 
     # 5. Decrypt body (pipeline step 5) — kem_ciphertext is signature-verified
