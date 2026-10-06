@@ -114,6 +114,9 @@ class Outbox:
                 machine, rec = self._threads.machine(conversation_id, thread_id)
                 if rec is not None and rec.pending is not None:
                     raise ACEError("pending_send_conflict", "the thread already has a pending send")
+                # a message that opens a thread is bounded per peer (pre-checked before any crypto)
+                if rec is None and type_ in machine.allowed_types(conversation_id, thread_id, local):
+                    self._threads.check_can_open(recipient.ace_id)
                 env = create_message(self._identity, recipient, type_, body, machine, thread_id=thread_id, timestamp=now)
                 pending = PendingSend(rid, "pending", now, env)
                 snap = machine.get_snapshot(conversation_id, thread_id)
@@ -212,7 +215,7 @@ class Outbox:
                 history.pop()
             snap = rebuild_snapshot(rec.snapshot, history)
             if snap is None:
-                self._threads.delete(rec.snapshot.conversation_id, rec.snapshot.thread_id)
+                self._threads.delete(rec.snapshot)
             else:
                 self._threads.save(ThreadRecord(snap, None))
 

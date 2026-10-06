@@ -16,18 +16,18 @@ EXPECTED = {
     "SoftwareIdentityExport",
     "ACEError", "MESSAGE_TYPES", "ECONOMIC_TYPES", "is_message_type", "is_economic_type",
     "MAX_PLAINTEXT_BYTES", "MAX_PAYLOAD_BYTES", "MAX_ENVELOPE_BYTES", "MAX_JSON_DEPTH", "MAX_THREAD_ID_LENGTH",
-    "TIMESTAMP_WINDOW_SECONDS", "OFFLINE_WINDOW_SECONDS", "MAX_REGISTRATION_FILE_BYTES", "MAX_INBOX_PAGE",
+    "MAX_OPEN_THREADS_PER_PEER", "TIMESTAMP_WINDOW_SECONDS", "OFFLINE_WINDOW_SECONDS", "MAX_REGISTRATION_FILE_BYTES", "MAX_INBOX_PAGE",
     "KEM_SEED_SIZE", "KEM_PUBLIC_KEY_SIZE", "KEM_CIPHERTEXT_SIZE", "DEFAULT_REPLAY_CAPACITY",
     "SoftwareIdentity", "compute_ace_id", "to_base64", "from_base64", "compute_conversation_id",
     "decrypt_with_seed", "kem_public_key_from_seed", "generate_kem_seed", "decode_envelope",
     "verify_envelope_signature", "envelope_fingerprint", "is_ace_id", "is_message_id", "is_thread_id",
     "is_conversation_id", "create_message", "parse_message", "validate_body", "VerifiedPeer",
     "verify_peer_record", "verify_registration_file", "fetch_registration_file", "validate_profile",
-    "create_registration_request", "verify_registration_request", "create_auth_headers", "parse_auth_headers",
+    "create_registration_file", "create_registration_request", "verify_registration_request", "create_auth_headers", "parse_auth_headers",
     "verify_auth_headers", "ReplayDetector", "ThreadStateMachine",
     # pipeline
     "ReceiveSource", "ReceiveOutcome", "PendingSend", "Intent", "ACEStore", "ThreadStore", "PeerStore",
-    "Inbox", "Outbox", "RelayClient", "MemoryStore", "FileStore",
+    "Inbox", "PullResult", "Outbox", "RelayClient", "MemoryStore", "FileStore",
 }
 
 

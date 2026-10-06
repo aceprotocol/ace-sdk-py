@@ -18,13 +18,14 @@ message:
 ```python
 from ace import (
     ReplayDetector, SoftwareIdentity, ThreadStateMachine,
-    create_message, decode_envelope, parse_message, verify_registration_file,
+    create_message, create_registration_file, decode_envelope, parse_message, verify_registration_file,
 )
 
 alice = SoftwareIdentity.generate("ed25519")
 bob = SoftwareIdentity.generate("secp256k1")
-alice_peer = verify_registration_file(alice.to_registration_file(name="Alice", endpoint="https://alice.example/ace"))
-bob_peer = verify_registration_file(bob.to_registration_file(name="Bob", endpoint="https://bob.example/ace"))
+# create_registration_file works for any ACEIdentity (hardware-backed ones included)
+alice_peer = verify_registration_file(create_registration_file(alice, name="Alice", endpoint="https://alice.example/ace"))
+bob_peer = verify_registration_file(create_registration_file(bob, name="Bob", endpoint="https://bob.example/ace"))
 
 envelope = create_message(alice, bob_peer, "rfq", {"need": "translate"},
                           ThreadStateMachine(alice.get_ace_id()), thread_id="deal-1")
@@ -63,9 +64,16 @@ except ACEError as e:
         raise                                      # transient: retry deliver() later
 
 # receive: poll, or stream with SSE (reconnects with backoff)
-result = inbox.pull(relay)                         # PullResult(delivered, duplicates, quarantined, blocked)
-for outcome in inbox.follow(relay, stop=stop_event):
-    ...                                            # ReceiveOutcome(kind="delivered" | "duplicate" | "quarantined")
+result = inbox.pull(relay)                         # PullResult(outcomes, blocked)
+for outcome in result.outcomes:                    # ReceiveOutcome(kind="delivered" | "duplicate" | "quarantined")
+    ...
+if result.blocked:                                 # the retryable error that stopped the drain
+    ...
+# follow yields the initial pull's outcomes, then live ones; on_live runs once caught up and
+# connected, and again after every reconnect
+for outcome in inbox.follow(relay, stop=stop_event, on_live=lambda: print("live")):
+    ...
+print(inbox.cursor(relay))                         # persisted cursor, keyed by relay.base_url
 # direct (HTTP endpoint) delivery: inbox.receive(body["message"], ReceiveSource.direct())
 ```
 
@@ -87,10 +95,15 @@ for outcome in inbox.follow(relay, stop=stop_event):
   `on_message` at least once — exactly once to a host that dedups on `(from_id, message_id)`.
   Permanent failures from the relay are quarantined (`quarantine/`, at most 1000 records);
   `retryable` outcomes (relay down, storage, handler errors) stop `pull` without advancing
-  the cursor.
+  the cursor and are reported as `PullResult.blocked` (`outcomes` holds every other
+  outcome; `messages`, `delivered`, `duplicates` and `quarantined` are convenience views).
+  A message that would open more than `MAX_OPEN_THREADS_PER_PEER` (1000) non-terminal
+  threads with one peer is quarantined `limit_exceeded`; `Outbox.stage` raises it.
+- **`ThreadStore`** keeps a per-peer index of non-terminal threads (`threads/index/`) and
+  prunes threads idle for 30 days that are terminal or hold no local message.
 - **`RelayClient`** implements `08-relay.md`: `register`, `unregister`, `lookup_peer`,
-  `discover`, `send`, `fetch_inbox`, `listen` (SSE generator), `post_intent`,
-  `list_intents`. Auth timestamps are strictly increasing per client and a `409 replay` is
+  `discover`, `send`, `fetch_inbox`, `listen` (SSE generator; `on_open` per connection),
+  `post_intent`, `list_intents`. `base_url` is the normalized URL (the inbox cursor key). Auth timestamps are strictly increasing per client and a `409 replay` is
   retried once. Network errors, 5xx, 408 and 429 are `relay_unavailable` (with
   `retry_after_seconds`).
 
@@ -99,6 +112,9 @@ for outcome in inbox.follow(relay, stop=stop_event):
 - **Errors.** Every SDK failure is an `ACEError` with a stable `code` (e.g. `invalid_envelope`,
   `replay`, `wrong_role`) and a `category`: `permanent`, `transient` or `local`.
   `is_transient` is true for the last two (retry instead of quarantining).
+- **Registration files.** `create_registration_file(identity, *, name, endpoint, ...)` builds
+  the `.well-known/ace.json` document of any `ACEIdentity`;
+  `SoftwareIdentity.to_registration_file` delegates to it.
 - **Peers.** Keys are trusted only through a `VerifiedPeer`, obtained from
   `verify_peer_record` (relay `GET /v1/peer`; the encryption key binding is checked),
   `verify_registration_file` / `fetch_registration_file` (`.well-known/ace.json`, with SSRF

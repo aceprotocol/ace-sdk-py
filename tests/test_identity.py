@@ -7,9 +7,11 @@ import pytest
 from ace import (
     SoftwareIdentity,
     compute_conversation_id,
+    create_registration_file,
     decrypt_with_seed,
     generate_kem_seed,
     kem_public_key_from_seed,
+    verify_registration_file,
 )
 from ace._signing import verify_signature
 from ace.encryption import encrypt
@@ -99,3 +101,41 @@ def test_decapsulation_library_errors_are_decryption_failed():
     ident = SoftwareIdentity.generate("ed25519")
     with raises("decryption_failed"):
         ident.decrypt(ct, bytes(64), "a" * 64)
+
+
+class _WrappedIdentity:
+    """An ACEIdentity that is not a SoftwareIdentity (as a hardware identity would be)."""
+
+    def __init__(self, inner: SoftwareIdentity) -> None:
+        self._inner = inner
+
+    def get_ace_id(self):
+        return self._inner.get_ace_id()
+
+    def get_signing_scheme(self):
+        return self._inner.get_signing_scheme()
+
+    def get_signing_public_key(self):
+        return self._inner.get_signing_public_key()
+
+    def get_encryption_public_key(self):
+        return self._inner.get_encryption_public_key()
+
+    def sign(self, data):
+        return self._inner.sign(data)
+
+    def decrypt(self, kem_ciphertext, payload, conversation_id):
+        return self._inner.decrypt(kem_ciphertext, payload, conversation_id)
+
+
+@pytest.mark.parametrize("scheme", ["ed25519", "secp256k1"])
+def test_create_registration_file_for_any_identity(scheme):
+    sw = SoftwareIdentity.generate(scheme)
+    hw = _WrappedIdentity(sw)
+    opts = dict(name="HW", endpoint="https://hw.example/ace", tier=1, hardware_backing="secure-enclave", settlement=["x402"])
+    reg = create_registration_file(hw, **opts)
+    assert reg == sw.to_registration_file(**opts)
+    assert reg.signing.address == sw.get_address()
+    assert verify_registration_file(reg, pinned_at=1).ace_id == sw.get_ace_id()
+    with raises("invalid_registration"):
+        create_registration_file(hw, name="", endpoint="https://hw.example/ace")

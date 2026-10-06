@@ -25,9 +25,60 @@ from .discovery import (
     validate_profile,
 )
 from .errors import ACEError
-from .identity import compute_ace_id
+from .identity import compute_ace_id, signing_address
 from .limits import KEM_PUBLIC_KEY_SIZE, TIMESTAMP_WINDOW_SECONDS
-from .types import SIGNING_SCHEMES, ACEIdentity, AgentProfile, RegistrationRequest
+from .types import (
+    SIGNING_SCHEMES,
+    ACEIdentity,
+    AgentProfile,
+    Capability,
+    ChainInfo,
+    HardwareBacking,
+    IdentityTier,
+    RegistrationFile,
+    RegistrationRequest,
+    SigningConfig,
+)
+
+
+def create_registration_file(
+    identity: ACEIdentity,
+    *,
+    name: str,
+    endpoint: str,
+    description: str | None = None,
+    tier: IdentityTier = 0,
+    hardware_backing: HardwareBacking | None = None,
+    capabilities: list[Capability] | None = None,
+    settlement: list[str] | None = None,
+    chains: list[ChainInfo] | None = None,
+) -> RegistrationFile:
+    """Build the registration file (02) of any identity, software or hardware-backed;
+    raises ``invalid_registration`` if the inputs are invalid."""
+    from .discovery import verify_registration_file
+
+    scheme = identity.get_signing_scheme()
+    signing_public_key = bytes(identity.get_signing_public_key())
+    reg = RegistrationFile(
+        ace="1.0",
+        id=identity.get_ace_id(),
+        name=name,
+        endpoint=endpoint,
+        tier=tier,
+        signing=SigningConfig(
+            scheme=scheme,
+            address=signing_address(scheme, signing_public_key),
+            encryption_public_key=to_base64(bytes(identity.get_encryption_public_key())),
+            signing_public_key=to_base64(signing_public_key) if scheme == "secp256k1" else None,
+        ),
+        hardware_backing=hardware_backing,
+        description=description,
+        capabilities=capabilities,
+        settlement=settlement,
+        chains=chains,
+    )
+    verify_registration_file(reg, pinned_at=0)
+    return reg
 
 _KEEP = object()
 

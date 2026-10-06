@@ -25,7 +25,7 @@ from .encryption import (
 from .envelope import decode_envelope, envelope_fingerprint, verify_envelope_signature
 from .errors import ACEError, ACEErrorCategory, ACEErrorCode
 from .identity import SoftwareIdentity, compute_ace_id
-from .inbox import Inbox, ReceiveOutcome, ReceiveSource
+from .inbox import Inbox, PullResult, ReceiveOutcome, ReceiveSource
 from .limits import (
     DEFAULT_REPLAY_CAPACITY,
     KEM_CIPHERTEXT_SIZE,
@@ -34,6 +34,7 @@ from .limits import (
     MAX_ENVELOPE_BYTES,
     MAX_INBOX_PAGE,
     MAX_JSON_DEPTH,
+    MAX_OPEN_THREADS_PER_PEER,
     MAX_PAYLOAD_BYTES,
     MAX_PLAINTEXT_BYTES,
     MAX_REGISTRATION_FILE_BYTES,
@@ -44,7 +45,11 @@ from .limits import (
 from .messages import create_message, parse_message, validate_body
 from .outbox import Outbox
 from .peers import PeerStore
-from .registration import create_registration_request, verify_registration_request
+from .registration import (
+    create_registration_file,
+    create_registration_request,
+    verify_registration_request,
+)
 from .relay import Intent, RelayClient
 from .replay import ReplayDetector
 from .state_machine import (
@@ -109,7 +114,7 @@ __all__ = [
     # values
     "ACEError", "MESSAGE_TYPES", "ECONOMIC_TYPES", "is_message_type", "is_economic_type",
     "MAX_PLAINTEXT_BYTES", "MAX_PAYLOAD_BYTES", "MAX_ENVELOPE_BYTES", "MAX_JSON_DEPTH",
-    "MAX_THREAD_ID_LENGTH", "TIMESTAMP_WINDOW_SECONDS", "OFFLINE_WINDOW_SECONDS",
+    "MAX_THREAD_ID_LENGTH", "MAX_OPEN_THREADS_PER_PEER", "TIMESTAMP_WINDOW_SECONDS", "OFFLINE_WINDOW_SECONDS",
     "MAX_REGISTRATION_FILE_BYTES", "MAX_INBOX_PAGE", "KEM_SEED_SIZE", "KEM_PUBLIC_KEY_SIZE",
     "KEM_CIPHERTEXT_SIZE", "DEFAULT_REPLAY_CAPACITY",
     "SoftwareIdentity", "compute_ace_id", "to_base64", "from_base64", "compute_conversation_id",
@@ -118,8 +123,8 @@ __all__ = [
     "is_ace_id", "is_message_id", "is_thread_id", "is_conversation_id",
     "create_message", "parse_message", "validate_body",
     "VerifiedPeer", "verify_peer_record", "verify_registration_file", "fetch_registration_file",
-    "validate_profile", "create_registration_request", "verify_registration_request",
+    "validate_profile", "create_registration_file", "create_registration_request", "verify_registration_request",
     "create_auth_headers", "parse_auth_headers", "verify_auth_headers",
-    "ReplayDetector", "ThreadStateMachine", "ThreadStore", "PeerStore", "Inbox", "Outbox",
+    "ReplayDetector", "ThreadStateMachine", "ThreadStore", "PeerStore", "Inbox", "PullResult", "Outbox",
     "RelayClient", "MemoryStore", "FileStore",
 ]

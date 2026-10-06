@@ -25,7 +25,6 @@ from .types import (
     HardwareBacking,
     IdentityTier,
     RegistrationFile,
-    SigningConfig,
     SigningScheme,
     SoftwareIdentityExport,
 )
@@ -141,26 +140,10 @@ class SoftwareIdentity:
         settlement: list[str] | None = None,
         chains: list[ChainInfo] | None = None,
     ) -> RegistrationFile:
-        """Build this identity's registration file; raises ``invalid_registration`` if invalid."""
-        from .discovery import verify_registration_file
+        """Build this identity's registration file (``create_registration_file(self, ...)``)."""
+        from .registration import create_registration_file
 
-        reg = RegistrationFile(
-            ace="1.0",
-            id=self._ace_id,
-            name=name,
-            endpoint=endpoint,
-            tier=tier,
-            signing=SigningConfig(
-                scheme=self._scheme,
-                address=self.get_address(),
-                encryption_public_key=to_base64(self._encryption_public_key),
-                signing_public_key=to_base64(self._signing_public_key) if self._scheme == "secp256k1" else None,
-            ),
-            hardware_backing=hardware_backing,
-            description=description,
-            capabilities=capabilities,
-            settlement=settlement,
-            chains=chains,
+        return create_registration_file(
+            self, name=name, endpoint=endpoint, description=description, tier=tier,
+            hardware_backing=hardware_backing, capabilities=capabilities, settlement=settlement, chains=chains,
         )
-        verify_registration_file(reg, pinned_at=0)
-        return reg

@@ -15,6 +15,7 @@ from ace import (
     MemoryStore,
     PeerStore,
     ReceiveSource,
+    RelayClient,
     ReplayDetector,
     ThreadStateMachine,
     ThreadStore,
@@ -22,13 +23,14 @@ from ace import (
     envelope_fingerprint,
 )
 from ace.inbox import delivery_key
-from ace.threads import thread_key
+from ace.threads import thread_index_key, thread_key
 
 from .helpers import raises
 from .pipeline import Agent, Clock, CountingStore, clone_memory
 
 RELAY = "https://Relay.Example/"
 SRC = "https://relay.example"
+SRC_RELAY = RelayClient(RELAY)  # base_url == SRC
 
 
 def relay_src(n: int) -> ReceiveSource:
@@ -95,9 +97,10 @@ def test_delivered_commit_order_and_formats(pair):
     assert out.kind == "delivered" and out.message.body == {"need": "translate"}
     dkey = delivery_key(alice.id, env.message_id)
     tkey = thread_key(env.conversation_id, "deal-1")
-    assert counting.writes == [dkey, tkey, "replay.json", dkey, "cursors.json"]
+    # a new open thread is indexed before its record is written
+    assert counting.writes == [dkey, thread_index_key(alice.id), tkey, "replay.json", dkey, "cursors.json"]
     assert bob.host.calls == [(alice.id, env.message_id)]
-    assert inbox.cursor(RELAY) == "7-0"
+    assert inbox.cursor(SRC_RELAY) == "7-0"
     rec = json.loads(bob.store.read(dkey))
     assert set(rec) == {"fingerprint", "message", "receivedAt", "source", "status", "thread", "version"}
     assert rec["status"] == "acked" and rec["source"] == "relay" and rec["fingerprint"] == envelope_fingerprint(env)
@@ -111,9 +114,9 @@ def test_delivered_commit_order_and_formats(pair):
     # duplicate: nothing written, cursor still advances (monotonic)
     counting.writes.clear()
     assert inbox.receive(env.to_dict(), relay_src(9)).kind == "duplicate"
-    assert counting.writes == ["cursors.json"] and inbox.cursor(SRC) == "9-0"
+    assert counting.writes == ["cursors.json"] and inbox.cursor(SRC_RELAY) == "9-0"
     assert inbox.receive(env.to_dict(), relay_src(8)).kind == "duplicate"
-    assert inbox.cursor(SRC) == "9-0"
+    assert inbox.cursor(SRC_RELAY) == "9-0"
     assert ThreadStore(bob.store, bob.id).get(env.conversation_id, "deal-1").state == "rfq"
     assert bob.host.calls == [(alice.id, env.message_id)]
 
@@ -143,7 +146,7 @@ def test_decode_failure_and_unknown_peer_quarantine(pair):
     inbox = bob.open()
     out = inbox.receive({"ace": "1.0"}, relay_src(1))
     assert out.kind == "quarantined" and out.fingerprint is None and out.error.code == "invalid_envelope"
-    assert inbox.cursor(SRC) == "1-0" and bob.store.list("quarantine/") == []
+    assert inbox.cursor(SRC_RELAY) == "1-0" and bob.store.list("quarantine/") == []
     stranger = Agent("eve", "ed25519", clock)
     stranger.pin(bob)
     env = stranger.outbox.stage(stranger.peers.get(bob.id), "text", {"message": "x"}).message
@@ -173,7 +176,7 @@ def test_wrong_role_quarantined_and_one_shot(pair):
     out = inbox.receive(offer.to_dict(), relay_src(2))
     assert out.kind == "quarantined" and out.error.code == "wrong_role"
     assert bob.store.read(f"quarantine/{out.fingerprint}.json") is not None
-    assert inbox.cursor(SRC) == "2-0"
+    assert inbox.cursor(SRC_RELAY) == "2-0"
     assert inbox.receive(offer.to_dict(), relay_src(3)).kind == "duplicate"  # replay persisted
     inbox.close()
     inbox = bob.open()
@@ -209,7 +212,7 @@ def test_retryable_peer_error_does_not_advance_cursor(pair):
     inbox = Inbox.open(bob.identity, store, PeerStore(store, relay=Down(), clock=clock), bob.host, clock=clock)
     out = inbox.receive(rfq(alice, bob).to_dict(), relay_src(5))
     assert out.kind == "retryable" and out.error.code == "relay_unavailable"
-    assert inbox.cursor(SRC) is None and store.list("deliveries/") == []
+    assert inbox.cursor(SRC_RELAY) is None and store.list("deliveries/") == []
 
 
 def test_handler_failure_then_redelivery(pair):
@@ -218,10 +221,10 @@ def test_handler_failure_then_redelivery(pair):
     env = rfq(alice, bob)
     bob.host.fail = True
     out = inbox.receive(env.to_dict(), relay_src(1))
-    assert out.kind == "retryable" and out.error.code == "handler_failed" and inbox.cursor(SRC) is None
+    assert out.kind == "retryable" and out.error.code == "handler_failed" and inbox.cursor(SRC_RELAY) is None
     bob.host.fail = False
     out = inbox.receive(env.to_dict(), relay_src(1))
-    assert out.kind == "delivered" and inbox.cursor(SRC) == "1-0"
+    assert out.kind == "delivered" and inbox.cursor(SRC_RELAY) == "1-0"
     assert bob.host.calls == [(alice.id, env.message_id)]
 
 
@@ -340,7 +343,7 @@ def test_crash_injection(fail_at, backend, tmp_path):
         assert threads.load(conv, "d").pending is None  # delivery proven by the offer
     out = inbox.receive(offer.to_dict(), relay_src(3))  # the relay redelivers (cursor not advanced)
     assert out.kind == ("delivered" if fail_at == 1 else "duplicate")
-    assert inbox.cursor(SRC) == "3-0"
+    assert inbox.cursor(SRC_RELAY) == "3-0"
     assert threads.get(conv, "d").state == "offered"
     assert list(bob.host.effects) == [(offer.from_id, offer.message_id)]  # nothing lost, no duplicate effect
     # on_message itself runs twice only if the crash hit the ack write after the handover
@@ -362,7 +365,7 @@ def test_crash_during_quarantine_write(pair):
     inbox = bob.open(store=CountingStore(bob.store, fail_at=1))
     out = inbox.receive(env.to_dict(), relay_src(1))
     assert out.kind == "retryable" and out.error.code == "storage_failed"
-    assert inbox.cursor(SRC) is None and bob.store.list("quarantine/") == []
+    assert inbox.cursor(SRC_RELAY) is None and bob.store.list("quarantine/") == []
 
 
 # --- lead amendments ---------------------------------------------------------------------

@@ -136,6 +136,9 @@ def _map_status(status: int, body: bytes, retry_after: int | None) -> ACEError:
     return _protocol(f"unexpected {text}")
 
 
+_CONNECTED = object()  # internal listen marker: a connection was established
+
+
 class RelayClient:
     """Synchronous client for one relay (``http.client``; one connection per request).
 
@@ -155,6 +158,7 @@ class RelayClient:
         max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
         clock: Callable[[], int] | None = None,
     ) -> None:
+        #: The normalized relay URL; also the key of this relay's persisted inbox cursor.
         self.base_url = normalize_relay_url(base_url)
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not timeout > 0:
             raise ACEError("invalid_argument", "timeout must be positive")
@@ -377,6 +381,7 @@ class RelayClient:
         since: str | None = None,
         stop: threading.Event | None = None,
         idle_timeout: float = 90.0,
+        on_open: Callable[[], None] | None = None,
     ) -> Iterator[RelayEntry]:
         """``GET /v1/listen`` as a generator of ``RelayEntry`` (catchup, then live).
 
@@ -386,14 +391,22 @@ class RelayClient:
         raises the mapped error (``relay_rejected`` etc.); a frame larger than
         ``MAX_ENVELOPE_BYTES + 512`` raises ``relay_protocol_error``. Setting ``stop`` (or
         closing the generator) ends the stream; a connection idle for ``idle_timeout``
-        seconds is treated as dropped.
+        seconds is treated as dropped. ``on_open`` runs each time a connection is established
+        (the first and every reconnect); an exception from it ends the stream as is.
         """
         resume = since or "-"
         RelayAuthRequest.listen(resume)  # validate
         failures = 0
+        in_hook = False
         while stop is None or not stop.is_set():
             try:
                 for entry in self._listen_once(identity, resume, stop, idle_timeout):
+                    if entry is _CONNECTED:
+                        if on_open is not None:
+                            in_hook = True
+                            on_open()
+                            in_hook = False
+                        continue
                     failures = 0
                     if entry is None:
                         continue  # connected / heartbeat-level progress
@@ -405,6 +418,8 @@ class RelayClient:
                 failures = 0
                 continue
             except ACEError as exc:
+                if in_hook:
+                    raise
                 if stop is not None and stop.is_set():
                     return
                 if exc.code != "relay_unavailable":
@@ -423,7 +438,7 @@ class RelayClient:
 
     def _listen_once(
         self, identity: ACEIdentity, since: str, stop: threading.Event | None, idle_timeout: float,
-    ) -> Iterator[RelayEntry | None]:
+    ) -> Iterator[RelayEntry | object | None]:
         conn = self._connection(max(self._timeout, idle_timeout))
         done = threading.Event()
         watcher = None
@@ -465,6 +480,7 @@ class RelayClient:
 
                 watcher = threading.Thread(target=watch, daemon=True)
                 watcher.start()
+            yield _CONNECTED
             yield from self._parse_sse(resp, stop)
         finally:
             done.set()

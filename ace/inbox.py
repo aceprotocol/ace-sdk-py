@@ -6,7 +6,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, Literal, NamedTuple
+from typing import Any, Callable, Generator, Iterator, Literal
 
 from ._encoding import is_ace_id, is_conversation_id, is_message_id, is_thread_id, wire_int
 from .encryption import compute_conversation_id
@@ -77,11 +77,30 @@ class ReceiveOutcome:
     message_id: str | None = None
 
 
-class PullResult(NamedTuple):
-    delivered: int
-    duplicates: int
-    quarantined: int
+@dataclass(frozen=True)
+class PullResult:
+    """The result of ``Inbox.pull``: every non-retryable outcome in relay order, and the error
+    that stopped the drain (a retryable outcome or a fetch error), or None when drained."""
+
+    outcomes: list[ReceiveOutcome]
     blocked: ACEError | None
+
+    @property
+    def messages(self) -> list[ParsedMessage]:
+        """The delivered messages, in order."""
+        return [o.message for o in self.outcomes if o.kind == "delivered" and o.message is not None]
+
+    @property
+    def delivered(self) -> int:
+        return sum(o.kind == "delivered" for o in self.outcomes)
+
+    @property
+    def duplicates(self) -> int:
+        return sum(o.kind == "duplicate" for o in self.outcomes)
+
+    @property
+    def quarantined(self) -> int:
+        return sum(o.kind == "quarantined" for o in self.outcomes)
 
 
 def delivery_key(from_id: str, message_id: str) -> str:
@@ -322,8 +341,9 @@ class Inbox:
 
     # --- public ---
 
-    def cursor(self, relay_url: str) -> str | None:
-        return self._cursors.get(normalize_relay_url(relay_url))
+    def cursor(self, relay: RelayClient) -> str | None:
+        """The persisted cursor for ``relay`` (keyed by its normalized ``base_url``), or None."""
+        return self._cursors.get(relay.base_url)
 
     def close(self) -> None:
         with self._mutex:
@@ -513,6 +533,9 @@ class Inbox:
         # 6. parse
         try:
             parsed = parse_message(env, self._identity, peer, threads=machine, replay=tr, floor=floor, clock=self._clock)
+            # a verified message that opens a thread is bounded per peer (04 § Open-thread bound)
+            if economic and rec is None:
+                self._threads.check_can_open(env.from_id)
         except ACEError as exc:
             if exc.code == "replay":
                 return ReceiveOutcome("duplicate", **ids)
@@ -560,37 +583,55 @@ class Inbox:
     # --- relay drivers ---
 
     def pull(self, relay: RelayClient, *, limit: int = MAX_INBOX_PAGE) -> PullResult:
-        """Fetch and receive queued messages from the cursor; stops at the first retryable."""
+        """Fetch and receive queued messages from the cursor. Stops at the first retryable
+        outcome (or fetch error) and returns its error as ``blocked``; ``outcomes`` holds
+        every other outcome."""
+        outcomes: list[ReceiveOutcome] = []
+        drain = self._drain(relay, limit)
+        while True:
+            try:
+                outcome = next(drain)
+            except StopIteration as done:
+                return PullResult(outcomes, done.value)
+            if outcome.kind != "retryable":
+                outcomes.append(outcome)
+
+    def _drain(self, relay: RelayClient, limit: int) -> Generator[ReceiveOutcome, None, ACEError | None]:
+        """Yield each outcome of a drain (a retryable one last); return the blocking error."""
         url = relay.base_url
-        delivered = duplicates = quarantined = 0
-        since = self.cursor(url) or "-"
+        since = self.cursor(relay) or "-"
         while True:
             try:
                 page = relay.fetch_inbox(self._identity, since=since, limit=limit)
             except ACEError as exc:
-                return PullResult(delivered, duplicates, quarantined, exc)
+                return exc
             for entry in page.entries:
                 outcome = self.receive(entry.message, ReceiveSource.relay(url, entry.stream_id))
+                yield outcome
                 if outcome.kind == "retryable":
-                    return PullResult(delivered, duplicates, quarantined, outcome.error)
-                delivered += outcome.kind == "delivered"
-                duplicates += outcome.kind == "duplicate"
-                quarantined += outcome.kind == "quarantined"
+                    return outcome.error
             if len(page.entries) < limit:
-                return PullResult(delivered, duplicates, quarantined, None)
+                return None
             since = page.entries[-1].stream_id
 
-    def follow(self, relay: RelayClient, *, stop: threading.Event | None = None) -> Iterator[ReceiveOutcome]:
-        """``pull``, then receive live SSE events and yield each outcome.
+    def follow(
+        self,
+        relay: RelayClient,
+        *,
+        stop: threading.Event | None = None,
+        on_live: Callable[[], None] | None = None,
+    ) -> Iterator[ReceiveOutcome]:
+        """Yield the outcomes of an initial ``pull``, then of live SSE events.
 
-        Raises the blocking error of the initial pull, or of a ``retryable`` outcome right
-        after yielding it. Set ``stop`` (or close the generator) to end.
+        ``on_live`` runs once the initial pull is done and the event stream is connected, and
+        again after each reconnect. A ``retryable`` outcome is yielded, then its error raised;
+        a failed inbox fetch is raised. Set ``stop`` (or close the generator) to end.
         """
-        result = self.pull(relay)
-        if result.blocked is not None:
-            raise result.blocked
+        blocked = yield from self._drain(relay, MAX_INBOX_PAGE)
+        if blocked is not None:
+            raise blocked
         url = relay.base_url
-        for entry in relay.listen(self._identity, since=self.cursor(url) or "-", stop=stop):
+        for entry in relay.listen(self._identity, since=self.cursor(relay) or "-", stop=stop, on_open=on_live):
             outcome = self.receive(entry.message, ReceiveSource.relay(url, entry.stream_id))
             yield outcome
             if outcome.kind == "retryable":

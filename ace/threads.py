@@ -10,6 +10,7 @@ from typing import Any, Callable, Literal
 from ._encoding import is_ace_id, wire_int
 from .envelope import decode_envelope
 from .errors import ACEError
+from .limits import MAX_OPEN_THREADS_PER_PEER
 from .state_machine import (
     TERMINAL_STATES,
     TRANSITIONS,
@@ -79,6 +80,22 @@ def thread_key(conversation_id: str, thread_id: str) -> str:
     return f"threads/{sha256_hex(conversation_id, thread_id)}.json"
 
 
+_INDEX_PREFIX = "threads/index/"
+
+
+def thread_index_key(peer_ace_id: str) -> str:
+    """The per-peer open-thread index: ``threads/index/<sha256(peerAceId)>.json``."""
+    return f"{_INDEX_PREFIX}{sha256_hex(peer_ace_id)}.json"
+
+
+def _is_record_key(key: str) -> bool:
+    return not key.startswith(_INDEX_PREFIX)
+
+
+def _index_entry(record_key: str) -> str:
+    return record_key[: -len(".json")]
+
+
 def snapshot_from_dict(d: object, local_ace_id: str, code: str = "storage_failed") -> ThreadSnapshot:
     """Parse and replay-validate a snapshot (``ThreadStateMachine.from_state``)."""
     try:
@@ -111,8 +128,13 @@ class ThreadStore:
 
     Each record is re-validated on load by replaying its history
     (``ThreadStateMachine.from_state``); a record that fails is ``storage_failed`` and is
-    never reset. Terminal threads without a pending send whose last entry is older than
-    30 days are pruned on writes (at most once per hour of clock time per instance).
+    never reset. Threads without a pending send whose last entry is older than 30 days are
+    pruned on writes (at most once per hour of clock time per instance) when they are
+    terminal, or non-terminal without any local entry (04 § Retention).
+
+    A per-peer index of non-terminal threads (``threads/index/``) bounds the open threads
+    per peer at ``MAX_OPEN_THREADS_PER_PEER``. It is written so that a crash can only leave
+    extra entries, which are reconciled when the bound is reached.
     """
 
     def __init__(self, store: ACEStore, local_ace_id: str, *, clock: Callable[[], int] | None = None) -> None:
@@ -130,15 +152,22 @@ class ThreadStore:
         return rec.snapshot if rec else None
 
     def list(self) -> list[ThreadSnapshot]:
-        snaps = [self._load_key(k).snapshot for k in self._store.list("threads/")]
+        snaps = [self._load_key(k).snapshot for k in self._store.list("threads/") if _is_record_key(k)]
         return sorted(snaps, key=lambda s: (s.conversation_id, s.thread_id))
 
     def remove(self, conversation_id: str, thread_id: str) -> bool:
         with self.locked():
             key = thread_key(conversation_id, thread_id)
-            existed = self._store.read(key) is not None
+            if self._store.read(key) is None:
+                return False
+            try:
+                peer: str | None = self._load_key(key).snapshot.peer_ace_id
+            except ACEError:
+                peer = None  # a corrupt record leaves at most an extra index entry
             self._store.delete(key)
-            return existed
+            if peer is not None:
+                self._set_open(peer, key, False)
+            return True
 
     def allowed_types(self, conversation_id: str, thread_id: str, sender_ace_id: str) -> list[str]:
         machine, _ = self.machine(conversation_id, thread_id)
@@ -178,14 +207,74 @@ class ThreadStore:
 
     def save(self, record: ThreadRecord) -> None:
         snap = record.snapshot
-        self._store.write(thread_key(snap.conversation_id, snap.thread_id), dump_record(record.to_dict()))
+        key = thread_key(snap.conversation_id, snap.thread_id)
+        is_open = snap.state not in TERMINAL_STATES
+        if is_open:
+            self._set_open(snap.peer_ace_id, key, True)  # index first: a crash leaves only an extra entry
+        self._store.write(key, dump_record(record.to_dict()))
+        if not is_open:
+            self._set_open(snap.peer_ace_id, key, False)
         self._maybe_prune()
 
-    def delete(self, conversation_id: str, thread_id: str) -> None:
-        self._store.delete(thread_key(conversation_id, thread_id))
+    def delete(self, snapshot: ThreadSnapshot) -> None:
+        key = thread_key(snapshot.conversation_id, snapshot.thread_id)
+        self._store.delete(key)
+        self._set_open(snapshot.peer_ace_id, key, False)
 
     def records(self) -> list[ThreadRecord]:
-        return [self._load_key(k) for k in self._store.list("threads/")]
+        return [self._load_key(k) for k in self._store.list("threads/") if _is_record_key(k)]
+
+    def open_thread_count(self, peer_ace_id: str) -> int:
+        """Non-terminal threads held with ``peer_ace_id`` (caller holds the lock). At the bound
+        the index is reconciled against the records first, dropping stale entries."""
+        entries = self._read_index(peer_ace_id)
+        if len(entries) < MAX_OPEN_THREADS_PER_PEER:
+            return len(entries)
+        live = []
+        for entry in entries:
+            key = f"{entry}.json"
+            if self._store.read(key) is None:
+                continue
+            try:
+                snap = self._load_key(key).snapshot
+                if snap.peer_ace_id != peer_ace_id or snap.state in TERMINAL_STATES:
+                    continue
+            except ACEError:
+                pass  # a corrupt record still counts: it is never reset or discarded
+            live.append(entry)
+        if len(live) != len(entries):
+            self._write_index(peer_ace_id, live)
+        return len(live)
+
+    def check_can_open(self, peer_ace_id: str) -> None:
+        """``limit_exceeded`` if a new thread with ``peer_ace_id`` would exceed
+        ``MAX_OPEN_THREADS_PER_PEER`` (caller holds the lock)."""
+        if self.open_thread_count(peer_ace_id) >= MAX_OPEN_THREADS_PER_PEER:
+            raise ACEError("limit_exceeded", f"open thread limit {MAX_OPEN_THREADS_PER_PEER} reached for this peer")
+
+    def _read_index(self, peer_ace_id: str) -> list[str]:
+        key = thread_index_key(peer_ace_id)
+        d = load_record(self._store, key)
+        if d is None:
+            return []
+        entries = d.get("open")
+        if not isinstance(entries, list) or not all(isinstance(e, str) and e.startswith("threads/") for e in entries):
+            raise ACEError("storage_failed", f"{key}: invalid open-thread index")
+        return entries
+
+    def _write_index(self, peer_ace_id: str, entries: list[str]) -> None:
+        key = thread_index_key(peer_ace_id)
+        if entries:
+            self._store.write(key, dump_record({"open": sorted(entries), "version": 1}))
+        else:
+            self._store.delete(key)
+
+    def _set_open(self, peer_ace_id: str, record_key: str, is_open: bool) -> None:
+        entry = _index_entry(record_key)
+        cur = self._read_index(peer_ace_id)
+        if (entry in cur) == is_open:
+            return
+        self._write_index(peer_ace_id, [*cur, entry] if is_open else [e for e in cur if e != entry])
 
     def _maybe_prune(self) -> None:
         now = _now(self._clock)
@@ -194,10 +283,15 @@ class ThreadStore:
         self._last_prune = now
         cutoff = now - THREAD_RETENTION_SECONDS
         for key in self._store.list("threads/"):
+            if not _is_record_key(key):
+                continue
             try:
                 rec = self._load_key(key)
             except ACEError:
                 continue  # corrupt records are reported on access, never deleted
             snap = rec.snapshot
-            if rec.pending is None and snap.state in TERMINAL_STATES and snap.history[-1].timestamp < cutoff:
-                self._store.delete(key)
+            if rec.pending is not None or snap.history[-1].timestamp >= cutoff:
+                continue
+            # terminal, or non-terminal with no local entry (no local obligation exists)
+            if snap.state in TERMINAL_STATES or all(h.from_id != self.local_ace_id for h in snap.history):
+                self.delete(snap)

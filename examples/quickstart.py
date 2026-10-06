@@ -9,6 +9,7 @@ from ace import (
     ThreadStateMachine,
     ThreadStore,
     create_message,
+    create_registration_file,
     decode_envelope,
     parse_message,
     verify_registration_file,
@@ -21,12 +22,11 @@ bob = SoftwareIdentity.generate("secp256k1")
 
 # Each side verifies the other's registration file (normally fetched with
 # fetch_registration_file or resolved from a relay with verify_peer_record).
-alice_peer = verify_registration_file(
-    alice.to_registration_file(name="Alice", endpoint="https://alice.example/ace")
-)
-bob_peer = verify_registration_file(
-    bob.to_registration_file(name="Bob", endpoint="https://bob.example/ace")
-)
+# create_registration_file works for any ACEIdentity, hardware-backed ones included.
+alice_reg = create_registration_file(alice, name="Alice", endpoint="https://alice.example/ace")
+bob_reg = create_registration_file(bob, name="Bob", endpoint="https://bob.example/ace")
+alice_peer = verify_registration_file(alice_reg)
+bob_peer = verify_registration_file(bob_reg)
 
 envelope = create_message(
     alice,
@@ -49,11 +49,13 @@ print(bob_threads.allowed_types(parsed.conversation_id, "translation-1", bob.get
 
 # Use FileStore("~/.ace/state") for real agents. With a relay:
 #   relay = RelayClient("https://relay.example"); relay.register(identity)
-#   peers = PeerStore(store, relay=relay); outbox.deliver(id, relay.send); inbox.pull(relay)
+#   peers = PeerStore(store, relay=relay); outbox.deliver(id, relay.send)
+#   result = inbox.pull(relay)  # result.outcomes (ReceiveOutcome list), result.blocked
+#   for outcome in inbox.follow(relay, stop=stop, on_live=lambda: print("live")): ...
 alice_store, bob_store = MemoryStore(), MemoryStore()
 alice_peers, bob_peers = PeerStore(alice_store), PeerStore(bob_store)
-alice_peers.pin_registration_file(bob.to_registration_file(name="Bob", endpoint="https://bob.example/ace"))
-bob_peers.pin_registration_file(alice.to_registration_file(name="Alice", endpoint="https://alice.example/ace"))
+alice_peers.pin_registration_file(bob_reg)
+bob_peers.pin_registration_file(alice_reg)
 
 received = {}  # the host's own durable, idempotent store keyed by (from, messageId)
 

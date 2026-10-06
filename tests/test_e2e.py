@@ -79,39 +79,65 @@ def test_full_deal_rfq_to_confirm(world):
         snap = ThreadStore(agent.store, agent.id).get(rfq.conversation_id, t)
         assert snap.state == "confirmed" and len(snap.history) == 7
         assert agent.outbox.pending() == []
-        assert agent.inbox.pull(client) == (0, 0, 0, None)
+        empty = agent.inbox.pull(client)
+        assert empty.outcomes == [] and empty.blocked is None
     assert ThreadStore(bob.store, bob.id).allowed_types(rfq.conversation_id, t, alice.id) == []
-    assert bob.inbox.cursor(client.base_url) is not None
+    assert bob.inbox.cursor(client) is not None
 
 
-def test_follow_streams_live_messages(world):
+def test_pull_returns_outcomes_in_order(world):
     clock, relay, client, alice, bob = world
-    first = send(alice, client, bob, "text", {"message": "queued"}, None)
+    sent = [send(alice, client, bob, "text", {"message": f"m{i}"}, None) for i in range(3)]
+    result = bob.inbox.pull(client, limit=2)
+    assert result.blocked is None
+    assert [o.kind for o in result.outcomes] == ["delivered"] * 3
+    assert [m.message_id for m in result.messages] == [e.message_id for e in sent]
+    assert (result.delivered, result.duplicates, result.quarantined) == (3, 0, 0)
+
+
+def test_follow_yields_initial_pull_then_live_with_on_live(world):
+    clock, relay, client, alice, bob = world
+    for m in ("q0", "q1"):
+        send(alice, client, bob, "text", {"message": m}, None)
     stop = threading.Event()
-    outcomes = []
-    got_live = threading.Event()
+    events: list[str] = []
+    errors: list[BaseException] = []
+
+    def on_live():
+        events.append("live")
+        if events.count("live") == 1:
+            send(alice, client, bob, "rfq", {"need": "live"}, "live-1")
 
     def run():
-        for o in bob.inbox.follow(client, stop=stop):
-            outcomes.append(o)
-            if len(outcomes) == 1:
-                got_live.set()
+        try:
+            for o in bob.inbox.follow(client, stop=stop, on_live=on_live):
+                m = o.message
+                events.append(f"{m.type}:{m.body.get('message', m.body.get('need'))}" if o.kind == "delivered" else o.kind)
+                if o.kind == "delivered" and m.type == "rfq":
+                    relay.drain_after = 0  # the next event drains the stream: a reconnect
+                    send(alice, client, bob, "text", {"message": "after"}, None)
+                if o.kind == "delivered" and m.body.get("message") == "after":
+                    stop.set()
+        except BaseException as exc:  # surfaced below
+            errors.append(exc)
 
     th = threading.Thread(target=run)
     th.start()
-    deadline = threading.Event()
-    for _ in range(50):
-        if bob.host.calls:
-            break
-        deadline.wait(0.05)
-    assert bob.host.calls == [(alice.id, first.message_id)]  # via the initial pull
-    live = send(alice, client, bob, "rfq", {"need": "live"}, "live-1")
-    assert got_live.wait(5)
+    th.join(10)
     stop.set()
-    th.join(5)
-    assert not th.is_alive()
-    assert outcomes[0].kind == "delivered" and outcomes[0].message.message_id == live.message_id
-    assert bob.inbox.cursor(client.base_url) == relay.streams[bob.id][-1][0]
+    assert not th.is_alive() and errors == []
+    assert events == ["text:q0", "text:q1", "live", "rfq:live", "live", "text:after"]
+    assert bob.inbox.cursor(client) == relay.streams[bob.id][-1][0]
+
+
+def test_follow_raises_failed_initial_pull_without_on_live(world):
+    clock, relay, client, alice, bob = world
+    relay.inject.append(("/v1/inbox", 503, "down", {}))
+    live = []
+    with raises("relay_unavailable"):
+        for _ in bob.inbox.follow(client, on_live=lambda: live.append(1)):
+            pass
+    assert live == []
 
 
 def test_role_violation_is_quarantined(world):
@@ -125,11 +151,13 @@ def test_role_violation_is_quarantined(world):
                          ThreadStateMachine.from_state([fake], alice.id), thread_id="d", timestamp=clock.t)
     client.send(env)
     result = bob.inbox.pull(client)
-    assert result == (0, 0, 1, None)
+    assert [o.kind for o in result.outcomes] == ["quarantined"] and result.blocked is None
+    assert (result.delivered, result.duplicates, result.quarantined) == (0, 0, 1)
+    assert result.outcomes[0].error.code == "wrong_role"
     (qkey,) = bob.store.list("quarantine/")
     assert bob.store.read(qkey) is not None
     assert ThreadStore(bob.store, bob.id).get(rfq.conversation_id, "d").state == "rfq"
-    assert bob.inbox.cursor(client.base_url) == relay.streams[bob.id][-1][0]
+    assert bob.inbox.cursor(client) == relay.streams[bob.id][-1][0]
     assert len(bob.host.calls) == 1
 
 
@@ -153,9 +181,12 @@ def test_retryable_blocks_pull_and_cursor(world):
     bob.host.fail = True
     result = bob.inbox.pull(client)
     assert result.blocked is not None and result.blocked.code == "handler_failed"
-    assert bob.inbox.cursor(client.base_url) is None
+    assert bob.inbox.cursor(client) is None
+    seen = []
     with raises("handler_failed"):
-        next(bob.inbox.follow(client))
+        for o in bob.inbox.follow(client):
+            seen.append(o.kind)
+    assert seen == ["retryable"]  # yielded, then raised
     bob.host.fail = False
     assert bob.inbox.pull(client).delivered == 1
     relay.inject.append(("/v1/inbox", 503, "down", {}))

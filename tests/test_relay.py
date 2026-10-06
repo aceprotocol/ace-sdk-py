@@ -9,6 +9,7 @@ import pytest
 
 import ace.relay as relay_mod
 from ace import (
+    ACEError,
     AgentProfile,
     DiscoverQuery,
     RelayClient,
@@ -181,9 +182,11 @@ def test_listen_catchup_live_and_drain(relay, ids):
     relay.drain_after = 1
     stop = threading.Event()
     got = []
-    gen = client.listen(bob, stop=stop)
+    opens = []
+    gen = client.listen(bob, stop=stop, on_open=lambda: opens.append(1))
     entry = next(gen)
     got.append(entry)
+    assert opens == [1]
     assert entry.catchup and entry.message["messageId"] == first.message_id
     second = _rfq(alice, bob, thread_id="b")
     client.send(second)
@@ -191,8 +194,28 @@ def test_listen_catchup_live_and_drain(relay, ids):
     assert entry.message["messageId"] == second.message_id
     assert compare_stream_ids(entry.stream_id, got[0].stream_id) > 0
     assert relay.requests.count(("GET", "/v1/listen")) == 2
+    assert opens == [1, 1]  # on_open runs again after the reconnect
     stop.set()
     assert list(gen) == []
+
+
+def test_listen_on_open_exception_ends_the_stream(relay, ids):
+    _, bob = ids
+    client = RelayClient(relay.url)
+    client.register(bob)
+
+    def boom():
+        raise RuntimeError("host hook failed")
+
+    with pytest.raises(RuntimeError):
+        next(client.listen(bob, on_open=boom))
+
+    def transient():
+        raise ACEError("relay_unavailable", "from the hook")
+
+    with raises("relay_unavailable"):  # not mistaken for a connection failure: no retry
+        next(client.listen(bob, on_open=transient))
+    assert relay.requests.count(("GET", "/v1/listen")) == 2
 
 
 def test_listen_stop_unblocks(relay, ids):
