@@ -1,18 +1,22 @@
-import json
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from threading import Thread
-from unittest.mock import patch
-
 import pytest
-from ace import SoftwareIdentity
+
+from ace import SoftwareIdentity, discovery
 from ace._utils import to_base64
-from ace import discovery
 from ace.discovery import (
-    validate_ace_id, validate_registration_file, verify_registration_id,
-    get_registration_signing_public_key, get_registration_encryption_public_key,
-    fetch_registration_file, _parse_registration_json, _resolve_and_check_ssrf,
+    _parse_registration_json,
+    _resolve_and_check_ssrf,
+    fetch_registration_file,
+    get_registration_encryption_public_key,
+    get_registration_signing_public_key,
+    validate_ace_id,
+    validate_registration_file,
+    verify_registration_id,
 )
 from ace.types import RegistrationFile, SigningConfig
+
+# A syntactically valid (right-length) X-Wing public key; validation only checks length.
+_ENC_PUB_B64 = to_base64(b"\x00" * 1216)
+_32_BYTE_KEY_B64 = to_base64(b"\x00" * 32)
 
 
 def test_validate_ace_id_valid():
@@ -35,13 +39,38 @@ def _make_valid_reg() -> RegistrationFile:
         signing=SigningConfig(
             scheme="ed25519",
             address="5Ht7RkVSupHeNbGWiHfwJ3RYn4RZfpAv5tk2UrQKbkWR",
-            encryption_public_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            encryption_public_key=_ENC_PUB_B64,
         ),
     )
 
 
 def test_validate_reg_valid():
     validate_registration_file(_make_valid_reg())
+
+
+def test_validate_reg_rejects_32_byte_encryption_key():
+    """A registration whose encryption key is a 32-byte key must fail with a length error."""
+    reg = _make_valid_reg()
+    reg.signing.encryption_public_key = _32_BYTE_KEY_B64
+    with pytest.raises(ValueError, match="1216"):
+        validate_registration_file(reg)
+    with pytest.raises(ValueError, match="1216"):
+        get_registration_encryption_public_key(reg)
+
+
+@pytest.mark.parametrize("length", [1215, 1217])
+def test_validate_reg_rejects_off_by_one_encryption_key(length):
+    reg = _make_valid_reg()
+    reg.signing.encryption_public_key = to_base64(b"\x01" * length)
+    with pytest.raises(ValueError, match="1216"):
+        validate_registration_file(reg)
+
+
+def test_validate_reg_rejects_non_base64_encryption_key():
+    reg = _make_valid_reg()
+    reg.signing.encryption_public_key = "!!!not-base64!!!"
+    with pytest.raises(ValueError, match="Base64"):
+        validate_registration_file(reg)
 
 
 def test_validate_reg_rejects_short_ed25519_address():
@@ -73,7 +102,7 @@ def test_validate_reg_secp256k1_requires_signing_key():
     reg.signing = SigningConfig(
         scheme="secp256k1",
         address="0x" + "a" * 40,
-        encryption_public_key="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        encryption_public_key=_ENC_PUB_B64,
     )
     with pytest.raises(ValueError, match="signingPublicKey"):
         validate_registration_file(reg)

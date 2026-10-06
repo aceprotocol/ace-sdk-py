@@ -7,10 +7,9 @@ import uuid
 import pytest
 
 from ace.state_machine import (
-    ThreadStateMachine,
     InvalidTransitionError,
+    ThreadStateMachine,
     validate_thread_id,
-    TRANSITIONS,
 )
 from ace.types import ECONOMIC_TYPES
 

@@ -1,26 +1,31 @@
-"""Encryption-key binding: a relay must not be able to substitute an X25519 key.
+"""Encryption-key binding: a relay must not be able to substitute an encryption key.
 
 These tests pin the fix for the E2E-MITM finding — the ace_id self-certifies only
 the signing key, so the encryption key must be verified against a signature by that
 signing key before any message is encrypted to it.
 """
 
-import copy
 
 import pytest
 
 from ace import (
-    SoftwareIdentity, VerifiedPeer, verify_encryption_key_binding,
-    ThreadStateMachine, ReplayDetector,
-    create_message, parse_message_from_peer,
+    ReplayDetector,
+    SoftwareIdentity,
+    ThreadStateMachine,
+    VerifiedPeer,
+    create_message,
+    parse_message_from_peer,
+    verify_encryption_key_binding,
 )
-from ace.signing import build_sign_data, encode_payload, encode_signature
 from ace._utils import to_base64
+from ace.signing import build_sign_data, encode_payload, encode_signature
 
 
-def _relay_peer_response(identity: SoftwareIdentity, registered_at: int = 1741000000) -> dict:
+def _relay_peer_response(
+    identity: SoftwareIdentity, registered_at: int = 1741000000, enc_pub: bytes | None = None,
+) -> dict:
     """Reproduce exactly what the relay stores/serves for GET /v1/peer."""
-    enc_b64 = to_base64(identity.get_encryption_public_key())
+    enc_b64 = to_base64(enc_pub if enc_pub is not None else identity.get_encryption_public_key())
     sign_b64 = to_base64(identity.get_signing_public_key())
     sign_data = build_sign_data(
         "register", identity.get_ace_id(), registered_at,
@@ -51,7 +56,7 @@ def test_verified_peer_accepts_genuine_binding(scheme):
 
 @pytest.mark.parametrize("scheme", ["ed25519", "secp256k1"])
 def test_verified_peer_rejects_substituted_encryption_key(scheme):
-    """The core MITM: relay keeps the real signing key/aceId but swaps the X25519 key."""
+    """The core MITM: relay keeps the real signing key/aceId but swaps the X-Wing key."""
     victim = SoftwareIdentity.generate(scheme)
     attacker = SoftwareIdentity.generate(scheme)
 
@@ -68,6 +73,23 @@ def test_verified_peer_rejects_substituted_encryption_key(scheme):
 
     with pytest.raises(ValueError, match="binding failed verification"):
         VerifiedPeer.from_relay_response(poisoned)
+
+
+def test_verified_peer_rejects_32_byte_encryption_key_even_if_signed():
+    """A genuinely signed binding over a 32-byte key is still rejected.
+
+    The binding only verifies for a well-formed 1216-byte X-Wing key, so a signed
+    32-byte key surfaces as a binding failure.
+    """
+    identity = SoftwareIdentity.generate("ed25519")
+    resp = _relay_peer_response(identity, enc_pub=b"\x07" * 32)
+
+    assert verify_encryption_key_binding(
+        resp["aceId"], resp["scheme"], resp["encryptionPublicKey"],
+        resp["signingPublicKey"], resp["registeredAt"], resp["registrationSignature"],
+    ) is False
+    with pytest.raises(ValueError, match="binding failed verification"):
+        VerifiedPeer.from_relay_response(resp)
 
 
 def test_verified_peer_rejects_missing_binding_signature():

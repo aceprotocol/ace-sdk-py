@@ -48,7 +48,7 @@ class ACEIdentity(Protocol):
     def get_signing_scheme(self) -> SigningScheme: ...
     def get_tier(self) -> IdentityTier: ...
     def get_ace_id(self) -> str: ...
-    def decrypt_payload(self, ephemeral_pub_key: bytes, payload: bytes, conversation_id: str) -> bytes: ...
+    def decrypt_payload(self, kem_ciphertext: bytes, payload: bytes, conversation_id: str) -> bytes: ...
 
 
 @dataclass
@@ -90,7 +90,7 @@ class ChainInfo:
 class SigningConfig:
     scheme: SigningScheme
     address: str
-    encryption_public_key: str  # Base64
+    encryption_public_key: str  # Base64 of the 1216-byte X-Wing public key
     signing_public_key: str | None = None  # Base64, required for secp256k1
 
 
@@ -138,8 +138,8 @@ class RegistrationFile:
 
 @dataclass
 class EncryptionEnvelope:
-    ephemeral_pub_key: str  # Base64
-    payload: str  # Base64
+    kem_ciphertext: str  # Base64 of the 1120-byte X-Wing ciphertext (wire: kemCiphertext)
+    payload: str  # Base64 of nonce[12] || ciphertext || tag[16]
 
 
 @dataclass
@@ -171,7 +171,7 @@ class ACEMessage:
             "type": self.type,
             "timestamp": self.timestamp,
             "encryption": {
-                "ephemeralPubKey": self.encryption.ephemeral_pub_key,
+                "kemCiphertext": self.encryption.kem_ciphertext,
                 "payload": self.encryption.payload,
             },
             "signature": {
@@ -191,8 +191,8 @@ class ACEMessage:
             raise ValueError(f"ACEMessage missing required fields: {missing}")
 
         enc = d["encryption"]
-        if not isinstance(enc, dict) or "ephemeralPubKey" not in enc or "payload" not in enc:
-            raise ValueError("ACEMessage.encryption must contain 'ephemeralPubKey' and 'payload'")
+        if not isinstance(enc, dict) or "kemCiphertext" not in enc or "payload" not in enc:
+            raise ValueError("ACEMessage.encryption must contain 'kemCiphertext' and 'payload'")
 
         sig = d["signature"]
         if not isinstance(sig, dict) or "scheme" not in sig or "value" not in sig:
@@ -207,7 +207,7 @@ class ACEMessage:
             type=d["type"],
             timestamp=d["timestamp"],
             encryption=EncryptionEnvelope(
-                ephemeral_pub_key=enc["ephemeralPubKey"],
+                kem_ciphertext=enc["kemCiphertext"],
                 payload=enc["payload"],
             ),
             signature=SignatureEnvelope(

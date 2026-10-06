@@ -1,4 +1,5 @@
 import re
+
 from ace import SoftwareIdentity
 
 
@@ -7,7 +8,8 @@ def test_ed25519_generate():
     assert id_.get_signing_scheme() == "ed25519"
     assert id_.get_tier() == 0
     assert len(id_.get_signing_public_key()) == 32
-    assert len(id_.get_encryption_public_key()) == 32
+    assert len(id_.get_encryption_public_key()) == 1216
+    assert len(id_.get_encryption_seed()) == 32
 
 
 def test_ed25519_ace_id():
@@ -43,6 +45,29 @@ def test_ed25519_export_import():
     restored = SoftwareIdentity.from_dict(d)
     assert restored.get_ace_id() == id_.get_ace_id()
     assert restored.get_address() == id_.get_address()
+    assert restored.get_encryption_public_key() == id_.get_encryption_public_key()
+
+
+def test_export_encryption_private_key_is_32_byte_seed():
+    import base64
+    id_ = SoftwareIdentity.generate("ed25519")
+    d = id_.to_dict(include_private_keys=True)
+    seed = base64.b64decode(d["encryptionPrivateKey"])
+    assert len(seed) == 32
+    assert seed == id_.get_encryption_seed()
+
+
+def test_constructor_rejects_wrong_length_encryption_seed():
+    import pytest
+    with pytest.raises(ValueError, match="seed must be exactly 32 bytes, got 31"):
+        SoftwareIdentity("ed25519", b"\x01" * 32, b"\x02" * 31)
+
+
+def test_registration_file_carries_1216_byte_encryption_key():
+    import base64
+    id_ = SoftwareIdentity.generate("secp256k1")
+    reg = id_.to_registration_file(name="T", endpoint="https://t.example.com/ace")
+    assert len(base64.b64decode(reg.signing.encryption_public_key)) == 1216
 
 
 def test_ed25519_registration_file():
@@ -59,7 +84,7 @@ def test_secp256k1_generate():
     id_ = SoftwareIdentity.generate("secp256k1")
     assert id_.get_signing_scheme() == "secp256k1"
     assert len(id_.get_signing_public_key()) == 33  # compressed
-    assert len(id_.get_encryption_public_key()) == 32
+    assert len(id_.get_encryption_public_key()) == 1216
 
 
 def test_secp256k1_address():
@@ -103,6 +128,6 @@ def test_decrypt_payload():
         sender.get_encryption_public_key(), receiver.get_encryption_public_key()
     )
     plaintext = b"test payload"
-    eph_pub, payload = encrypt(plaintext, receiver.get_encryption_public_key(), conv_id)
-    decrypted = receiver.decrypt_payload(eph_pub, payload, conv_id)
+    kem_ct, payload = encrypt(plaintext, receiver.get_encryption_public_key(), conv_id)
+    decrypted = receiver.decrypt_payload(kem_ct, payload, conv_id)
     assert decrypted == plaintext

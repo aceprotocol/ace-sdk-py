@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import threading
+
 import pytest
 
-from ace import SoftwareIdentity, ReplayDetector, create_message, parse_message, ThreadStateMachine
+from ace import ReplayDetector, SoftwareIdentity, ThreadStateMachine, create_message, parse_message
 from ace.encryption import (
-    encrypt, decrypt, compute_conversation_id,
-    _MIN_PAYLOAD_LEN, MAX_PAYLOAD_SIZE,
+    compute_conversation_id,
+    decrypt,
+    encrypt,
 )
-from ace.signing import build_sign_data, encode_payload, verify_signature, decode_signature
-
+from ace.signing import build_sign_data, encode_payload, verify_signature
 
 # ============================================================================
 # C1: Payload length validation in decrypt
@@ -27,27 +28,27 @@ class TestDecryptPayloadValidation:
         )
 
     def test_empty_payload_rejected(self):
-        eph_pub, _ = encrypt(b"x", self.receiver.get_encryption_public_key(), self.conv_id)
+        kem_ct, _ = encrypt(b"x", self.receiver.get_encryption_public_key(), self.conv_id)
         with pytest.raises(ValueError, match="too short"):
-            decrypt(eph_pub, b"", self.receiver.get_encryption_private_key(), self.conv_id)
+            decrypt(kem_ct, b"", self.receiver.get_encryption_seed(), self.conv_id)
 
     def test_short_payload_rejected(self):
-        eph_pub, _ = encrypt(b"x", self.receiver.get_encryption_public_key(), self.conv_id)
+        kem_ct, _ = encrypt(b"x", self.receiver.get_encryption_public_key(), self.conv_id)
         with pytest.raises(ValueError, match="too short"):
-            decrypt(eph_pub, b"\x00" * 27, self.receiver.get_encryption_private_key(), self.conv_id)
+            decrypt(kem_ct, b"\x00" * 27, self.receiver.get_encryption_seed(), self.conv_id)
 
     def test_minimum_valid_payload_length(self):
         """28 bytes (nonce + tag) should not trigger the length error."""
-        eph_pub, _ = encrypt(b"x", self.receiver.get_encryption_public_key(), self.conv_id)
+        kem_ct, _ = encrypt(b"x", self.receiver.get_encryption_public_key(), self.conv_id)
         # 28 bytes will fail GCM auth (wrong data), but should NOT raise "too short"
         with pytest.raises(Exception) as exc_info:
-            decrypt(eph_pub, b"\x00" * 28, self.receiver.get_encryption_private_key(), self.conv_id)
+            decrypt(kem_ct, b"\x00" * 28, self.receiver.get_encryption_seed(), self.conv_id)
         assert "too short" not in str(exc_info.value)
 
     def test_empty_plaintext_roundtrip(self):
         """Empty plaintext should encrypt and decrypt correctly."""
-        eph_pub, payload = encrypt(b"", self.receiver.get_encryption_public_key(), self.conv_id)
-        decrypted = decrypt(eph_pub, payload, self.receiver.get_encryption_private_key(), self.conv_id)
+        kem_ct, payload = encrypt(b"", self.receiver.get_encryption_public_key(), self.conv_id)
+        decrypted = decrypt(kem_ct, payload, self.receiver.get_encryption_seed(), self.conv_id)
         assert decrypted == b""
 
 
@@ -142,10 +143,8 @@ class TestParseMessageReplayIntegration:
 
 class TestSchemeValidation:
     def test_invalid_scheme_init(self):
-        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-        enc_priv = X25519PrivateKey.generate()
         with pytest.raises(ValueError, match="Unsupported signing scheme"):
-            SoftwareIdentity("none", b"\x00" * 32, enc_priv)
+            SoftwareIdentity("none", b"\x00" * 32, b"\x00" * 32)
 
     def test_invalid_scheme_generate(self):
         with pytest.raises(ValueError, match="Unsupported signing scheme"):
@@ -178,30 +177,6 @@ class TestVerifySignaturePrecision:
         sign_data = build_sign_data("message", id_.get_ace_id(), 1741000000, payload)
         # Wrong signature length should be explicitly rejected
         assert verify_signature(sign_data, b"\x00" * 64, "secp256k1", id_.get_signing_public_key()) is False
-
-
-# ============================================================================
-# I3: X25519 public key validation
-# ============================================================================
-
-class TestPublicKeyValidation:
-    def test_zero_key_rejected_encrypt(self):
-        with pytest.raises(ValueError, match="all-zeros"):
-            encrypt(b"test", b"\x00" * 32, "a" * 64)
-
-    def test_wrong_length_key_rejected_encrypt(self):
-        with pytest.raises(ValueError, match="exactly 32 bytes"):
-            encrypt(b"test", b"\x00" * 16, "a" * 64)
-
-    def test_zero_key_rejected_decrypt(self):
-        receiver = SoftwareIdentity.generate("ed25519")
-        with pytest.raises(ValueError, match="all-zeros"):
-            decrypt(b"\x00" * 32, b"\x00" * 28, receiver.get_encryption_private_key(), "a" * 64)
-
-    def test_wrong_length_key_rejected_decrypt(self):
-        receiver = SoftwareIdentity.generate("ed25519")
-        with pytest.raises(ValueError, match="exactly 32 bytes"):
-            decrypt(b"\x00" * 10, b"\x00" * 28, receiver.get_encryption_private_key(), "a" * 64)
 
 
 # ============================================================================
@@ -242,10 +217,10 @@ class TestACEMessageFromDictValidation:
         d = {
             "ace": "1.0", "messageId": "m", "from": "f", "to": "t",
             "conversationId": "c", "type": "text", "timestamp": 0,
-            "encryption": {"payload": "x"},  # missing ephemeralPubKey
+            "encryption": {"payload": "x"},  # missing kemCiphertext
             "signature": {"scheme": "ed25519", "value": "v"},
         }
-        with pytest.raises(ValueError, match="ephemeralPubKey"):
+        with pytest.raises(ValueError, match="kemCiphertext"):
             ACEMessage.from_dict(d)
 
     def test_missing_signature_fields(self):
@@ -253,7 +228,7 @@ class TestACEMessageFromDictValidation:
         d = {
             "ace": "1.0", "messageId": "m", "from": "f", "to": "t",
             "conversationId": "c", "type": "text", "timestamp": 0,
-            "encryption": {"ephemeralPubKey": "k", "payload": "p"},
+            "encryption": {"kemCiphertext": "k", "payload": "p"},
             "signature": {"scheme": "ed25519"},  # missing value
         }
         with pytest.raises(ValueError, match="value"):

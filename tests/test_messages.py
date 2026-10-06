@@ -1,10 +1,17 @@
 import re
 import time
+
 import pytest
-from ace import SoftwareIdentity, ThreadStateMachine, ReplayDetector
-from ace.messages import create_message, validate_body, parse_message, parse_message_from_registration
+
+from ace import ReplayDetector, SoftwareIdentity, ThreadStateMachine
 from ace._utils import to_base64
 from ace.encryption import encrypt
+from ace.messages import (
+    create_message,
+    parse_message,
+    parse_message_from_registration,
+    validate_body,
+)
 from ace.signing import build_sign_data, encode_payload, encode_signature
 from ace.types import ACEMessage, EncryptionEnvelope, SignatureEnvelope
 
@@ -184,14 +191,16 @@ class TestParseMessage:
         receiver = SoftwareIdentity.generate("ed25519")
         bogus_conversation_id = "b" * 64
         body_bytes = b'{"message":"bound check"}'
-        ephemeral_pub_key, payload = encrypt(
+        kem_ciphertext, payload = encrypt(
             body_bytes,
             receiver.get_encryption_public_key(),
             bogus_conversation_id,
         )
         message_id = "550e8400-e29b-41d4-a716-446655440000"
         timestamp = int(time.time())
-        message_payload = encode_payload("text", receiver.get_ace_id(), bogus_conversation_id, message_id, "", payload)
+        message_payload = encode_payload(
+            "text", receiver.get_ace_id(), bogus_conversation_id, message_id, "", kem_ciphertext, payload
+        )
         sign_data = build_sign_data("message", sender.get_ace_id(), timestamp, message_payload)
         signature, scheme = sender.sign(sign_data)
         msg = ACEMessage(
@@ -203,7 +212,7 @@ class TestParseMessage:
             type="text",
             timestamp=timestamp,
             encryption=EncryptionEnvelope(
-                ephemeral_pub_key=to_base64(ephemeral_pub_key),
+                kem_ciphertext=to_base64(kem_ciphertext),
                 payload=to_base64(payload),
             ),
             signature=SignatureEnvelope(
@@ -271,7 +280,7 @@ class TestParseMessage:
             type="text",
             timestamp=int(time.time()),
             encryption=EncryptionEnvelope(
-                ephemeral_pub_key="AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                kem_ciphertext=to_base64(b"\xaa" * 1120),
                 payload=oversized_payload,
             ),
             signature=SignatureEnvelope(

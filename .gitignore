@@ -6,3 +6,6 @@ build/
 .venv/
 *.log
 .idea/
+
+# SwiftPM / other tool build dirs
+.build/

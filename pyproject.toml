@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ace-sdk"
-version = "0.1.5"
+version = "0.2.0"
 description = "ACE Protocol SDK — Agent Commerce Engine"
 license = "Apache-2.0"
 requires-python = ">=3.10"
@@ -29,8 +29,19 @@ dependencies = [
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.0",
+    "ruff>=0.16.10",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+# E501: the codebase predates the formatter gate; ~45 lines exceed 100 columns and
+# rewrapping them is unrelated churn. Flagged rule set is pyflakes + import order.
+ignore = ["E501"]

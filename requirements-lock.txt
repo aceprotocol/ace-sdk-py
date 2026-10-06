@@ -1,5 +1,5 @@
-# Pinned dependency versions for ace-sdk v0.1.5
-# Generated: 2026-10-02
+# Pinned dependency versions for ace-sdk v0.2.0
+# Generated: 2026-10-06
 # Python: 3.13
 #
 # Regenerate: pip install -e ".[dev]" && pip freeze --exclude ace-sdk > requirements-lock.txt
@@ -18,3 +18,4 @@ pluggy==1.6.0
 pygments==2.21.0
 pytest==9.1.1
 pytest-asyncio==1.4.0
+ruff==0.16.10

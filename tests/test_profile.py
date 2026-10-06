@@ -2,8 +2,8 @@
 
 import pytest
 
-from ace.types import AgentProfile, ProfilePricing
 from ace.discovery import validate_profile
+from ace.types import AgentProfile, ProfilePricing
 
 
 class TestValidateProfileValid:

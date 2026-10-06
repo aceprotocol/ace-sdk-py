@@ -1,8 +1,9 @@
+from coincurve import PublicKey
+
+from ace._utils import secp_pubkey_to_address
 from ace.encryption import compute_conversation_id
 from ace.identity import compute_ace_id
 from ace.signing import build_sign_data, encode_payload
-from ace._utils import secp_pubkey_to_address
-from coincurve import PublicKey
 
 
 def test_ace_id_golden_vector():
@@ -13,11 +14,12 @@ def test_ace_id_golden_vector():
 
 
 def test_conversation_id_golden_vector():
-    pub_a = bytes(range(1, 33))
-    pub_b = bytes(255 - i for i in range(32))
-    assert compute_conversation_id(pub_a, pub_b) == (
-        "fcdad8d0e1cbe6726f86938e504f6a7290c6d458181ced3e199cd25bf694cb40"
-    )
+    """conversationId = hex(SHA-256(sort_bytes(pkA[1216], pkB[1216])))."""
+    pub_a = bytes((i * 7 + 1) % 256 for i in range(1216))   # starts 0x01 -> sorts first
+    pub_b = bytes((255 - i) % 256 for i in range(1216))     # starts 0xff
+    expected = "96e3714205aa25cb793377ac8c374c35634654c0417a308a13a5500e80e7bcc0"
+    assert compute_conversation_id(pub_a, pub_b) == expected
+    assert compute_conversation_id(pub_b, pub_a) == expected  # order-independent
 
 
 def test_sign_data_golden_vector():

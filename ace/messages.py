@@ -6,23 +6,36 @@ import json
 import time
 import uuid
 
-from .types import (
-    ACEIdentity, ACEMessage, EncryptionEnvelope, SignatureEnvelope,
-    MessageType, ParsedMessage, RegistrationFile, is_economic_type,
-)
-from ._utils import to_base64, from_base64
-from .encryption import compute_conversation_id, encrypt, MAX_PAYLOAD_SIZE
-from .identity import compute_ace_id
-from .signing import build_sign_data, encode_payload, verify_signature, encode_signature, decode_signature
-from .security import check_timestamp_freshness, validate_message_id, ReplayDetector
+from ._utils import from_base64, to_base64
 from .discovery import (
+    VerifiedPeer,
+    get_registration_encryption_public_key,
+    get_registration_signing_public_key,
     validate_registration_file,
     verify_registration_id,
-    get_registration_signing_public_key,
-    get_registration_encryption_public_key,
-    VerifiedPeer,
 )
-from .state_machine import ThreadStateMachine, validate_thread_id, InvalidTransitionError
+from .encryption import MAX_PAYLOAD_SIZE, compute_conversation_id, decode_kem_ciphertext, encrypt
+from .identity import compute_ace_id
+from .security import ReplayDetector, check_timestamp_freshness, validate_message_id
+from .signing import (
+    build_sign_data,
+    decode_signature,
+    encode_payload,
+    encode_signature,
+    verify_signature,
+)
+from .state_machine import InvalidTransitionError, ThreadStateMachine, validate_thread_id
+from .types import (
+    ACEIdentity,
+    ACEMessage,
+    EncryptionEnvelope,
+    MessageType,
+    ParsedMessage,
+    RegistrationFile,
+    SignatureEnvelope,
+    is_economic_type,
+)
+
 
 def _estimate_base64_decoded_length(encoded: str) -> int:
     full_blocks = len(encoded) // 4
@@ -44,16 +57,16 @@ def _build_signed_message_payload(
     conversation_id: str,
     message_id: str,
     thread_id: str | None,
-    ephemeral_pub_key: bytes,
+    kem_ciphertext: bytes,
     payload: bytes,
 ) -> bytes:
-    # ephemeral_pub_key is signed too: it is what the recipient uses to derive the
-    # decryption key, so it is part of the sender's commitment. Omitting it would
-    # let a relay swap the ephemeral key (garbling the message) without breaking
-    # the signature.
+    # kem_ciphertext is signed too: it is what the recipient decapsulates to derive
+    # the decryption key, so it is part of the sender's commitment. Omitting it
+    # would let a relay swap the KEM ciphertext (garbling the message) without
+    # breaking the signature.
     return encode_payload(
         type_, to_id, conversation_id, message_id, _normalize_thread_id(thread_id),
-        ephemeral_pub_key, payload,
+        kem_ciphertext, payload,
     )
 
 
@@ -245,11 +258,11 @@ def create_message(
 
     # 2. Encrypt body
     body_json = json.dumps(body, separators=(",", ":")).encode("utf-8")
-    ephemeral_pub_key, payload = encrypt(body_json, recipient_pub_key, conversation_id)
+    kem_ciphertext, payload = encrypt(body_json, recipient_pub_key, conversation_id)
 
     # 3. Build sign data and sign
     message_payload = _build_signed_message_payload(
-        type_, to_id, conversation_id, message_id, thread_id, ephemeral_pub_key, payload
+        type_, to_id, conversation_id, message_id, thread_id, kem_ciphertext, payload
     )
     sign_data = build_sign_data("message", from_id, ts, message_payload)
     signature, scheme = sender.sign(sign_data)
@@ -266,7 +279,7 @@ def create_message(
         type=type_,
         timestamp=ts,
         encryption=EncryptionEnvelope(
-            ephemeral_pub_key=to_base64(ephemeral_pub_key),
+            kem_ciphertext=to_base64(kem_ciphertext),
             payload=to_base64(payload),
         ),
         signature=SignatureEnvelope(
@@ -293,7 +306,7 @@ def parse_message(
         replay_detector: Optional ReplayDetector instance. When provided, the
             message will be checked for replay attacks and automatically reserved.
             Strongly recommended for production use.
-        sender_encryption_pub_key: Optional sender X25519 public key. When
+        sender_encryption_pub_key: Optional sender X-Wing public key. When
             provided, `conversation_id` is recomputed from the sender and
             recipient encryption keys and must match the envelope value.
     """
@@ -309,7 +322,7 @@ def parse_message(
     validate_message_id(msg.message_id)
 
     # Validate encryption and signature sub-envelopes
-    if not msg.encryption or not msg.encryption.payload or not msg.encryption.ephemeral_pub_key:
+    if not msg.encryption or not msg.encryption.payload or not msg.encryption.kem_ciphertext:
         raise ValueError("Missing required encryption fields")
     if not msg.signature or not msg.signature.scheme or not msg.signature.value:
         raise ValueError("Missing required signature fields")
@@ -345,72 +358,63 @@ def parse_message(
         if not replay_detector.check_and_reserve(msg.message_id):
             raise ValueError(f"Replay detected: message {msg.message_id} already processed")
 
-    # 4. Verify signature BEFORE decryption (pipeline step 4)
-    estimated_payload_bytes = _estimate_base64_decoded_length(msg.encryption.payload)
-    if estimated_payload_bytes > MAX_PAYLOAD_SIZE:
-        if replay_detector is not None:
-            replay_detector.release(msg.message_id)
-        raise ValueError(
-            f"Payload too large: estimated decoded size {estimated_payload_bytes} "
-            f"bytes exceeds max {MAX_PAYLOAD_SIZE}"
-        )
-    payload_bytes = from_base64(msg.encryption.payload)
-    ephemeral_pub_key = from_base64(msg.encryption.ephemeral_pub_key)
-    message_payload = _build_signed_message_payload(
-        msg.type,
-        msg.to_id,
-        msg.conversation_id,
-        msg.message_id,
-        msg.thread_id,
-        ephemeral_pub_key,
-        payload_bytes,
-    )
-    sign_data = build_sign_data("message", msg.from_id, msg.timestamp, message_payload)
-
-    sig_bytes = decode_signature(msg.signature.value, msg.signature.scheme)
+    # Replay rule: a failure BEFORE the signature verifies releases the reservation
+    # (a forged envelope must not burn a messageId), but once the signature has
+    # verified the reservation is kept on ANY later failure — an authentic message
+    # is one-shot regardless of outcome.
+    authenticated = False
     try:
-        valid = verify_signature(
-            sign_data, sig_bytes, msg.signature.scheme,
-            sender_signing_pub_key,
+        # 4. Verify signature BEFORE decryption (pipeline step 4).
+        estimated_payload_bytes = _estimate_base64_decoded_length(msg.encryption.payload)
+        if estimated_payload_bytes > MAX_PAYLOAD_SIZE:
+            raise ValueError(
+                f"Payload too large: estimated decoded size {estimated_payload_bytes} "
+                f"bytes exceeds max {MAX_PAYLOAD_SIZE}"
+            )
+        payload_bytes = from_base64(msg.encryption.payload)
+        # Length-checked before any signature or KEM work: a relay cannot make us
+        # decapsulate a malformed ciphertext.
+        kem_ciphertext = decode_kem_ciphertext(msg.encryption.kem_ciphertext)
+        message_payload = _build_signed_message_payload(
+            msg.type,
+            msg.to_id,
+            msg.conversation_id,
+            msg.message_id,
+            msg.thread_id,
+            kem_ciphertext,
+            payload_bytes,
+        )
+        sign_data = build_sign_data("message", msg.from_id, msg.timestamp, message_payload)
+        sig_bytes = decode_signature(msg.signature.value, msg.signature.scheme)
+        valid = False
+        try:
+            valid = verify_signature(
+                sign_data, sig_bytes, msg.signature.scheme, sender_signing_pub_key,
+            )
+        except Exception:
+            pass
+        if not valid:
+            raise ValueError("Signature verification failed")
+        authenticated = True
+
+        # 5. Decrypt body (pipeline step 5) — kem_ciphertext is signature-verified
+        # above, so decapsulation uses the authenticated ciphertext.
+        decrypted = receiver.decrypt_payload(kem_ciphertext, payload_bytes, msg.conversation_id)
+        body = json.loads(decrypted.decode("utf-8"))
+
+        # 6. Validate body schema (pipeline step 6)
+        validate_body(msg.type, body)
+        thread_key = _normalize_thread_id(msg.thread_id)
+        _validate_thread_references(msg.type, body, state_machine, msg.conversation_id, thread_key)
+
+        # 7. State machine validation (pipeline step 7)
+        state_machine.transition(
+            msg.conversation_id, thread_key, msg.type, msg.message_id, msg.timestamp,
         )
     except Exception:
-        if replay_detector is not None:
-            replay_detector.release(msg.message_id)
-        raise ValueError("Signature verification failed")
-
-    if not valid:
-        if replay_detector is not None:
-            replay_detector.release(msg.message_id)
-        raise ValueError("Signature verification failed")
-
-    # 5. Decrypt body (pipeline step 5) — ephemeral_pub_key was decoded and
-    # signature-verified above, so decryption uses the authenticated key.
-    try:
-        decrypted = receiver.decrypt_payload(ephemeral_pub_key, payload_bytes, msg.conversation_id)
-    except Exception:
-        if replay_detector is not None:
+        if replay_detector is not None and not authenticated:
             replay_detector.release(msg.message_id)
         raise
-    body = json.loads(decrypted.decode("utf-8"))
-
-    # 6. Validate body schema (pipeline step 6)
-    validate_body(msg.type, body)
-    _validate_thread_references(
-        msg.type,
-        body,
-        state_machine,
-        msg.conversation_id,
-        _normalize_thread_id(msg.thread_id),
-    )
-
-    # 7. State machine validation (pipeline step 7)
-    state_machine.transition(
-        msg.conversation_id,
-        _normalize_thread_id(msg.thread_id),
-        msg.type,
-        msg.message_id,
-        msg.timestamp,
-    )
 
     return ParsedMessage(
         message_id=msg.message_id,
@@ -457,7 +461,7 @@ def parse_message_from_peer(
 
     ``sender`` must be a :class:`VerifiedPeer` — obtainable only after the sender's
     encryption-key binding was verified — so the recipient never encrypts against
-    or trusts a relay-substituted X25519 key.  ``conversation_id`` is recomputed
+    or trusts a relay-substituted encryption key.  ``conversation_id`` is recomputed
     from the verified encryption keys and must match the envelope.
     """
     return parse_message(

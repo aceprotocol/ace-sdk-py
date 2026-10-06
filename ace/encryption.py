@@ -1,22 +1,41 @@
-"""ACE Protocol E2E encryption: X25519 ECDH + HKDF-SHA256 + AES-256-GCM."""
+"""ACE Protocol E2E encryption: X-Wing hybrid KEM + HKDF-SHA256 + AES-256-GCM.
+
+Pipeline:
+    (ss, kem_ciphertext) = XWing.Encapsulate(recipient_public_key)
+    aes_key = HKDF-SHA256(ikm = ss, salt = ACE_KEM_SALT, info = UTF-8(conversationId), L = 32)
+    payload = nonce[12] || AES-256-GCM(aes_key, nonce, plaintext, aad = UTF-8(conversationId))
+
+The recipient's static key is an X-Wing public key (``xwing.PUBLIC_KEY_SIZE`` =
+1216 bytes) whose private key is a 32-byte seed. Each message carries a fresh KEM
+ciphertext (``xwing.CIPHERTEXT_SIZE`` = 1120 bytes). Byte-length validation of
+those values lives in :mod:`ace.xwing`; this module only checks the AEAD payload.
+
+Security note (no forward secrecy on the recipient side): compromise of a sender
+reveals nothing about past messages, but compromise of a recipient's static seed
+reveals every past and future message encrypted to that key.
+"""
 
 from __future__ import annotations
 
 import hashlib
 import os
+from typing import Callable
 
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from cryptography.hazmat.primitives import hashes
 
-# Pre-computed: SHA-256("ace.protocol.dh.v1")
-_ace_dh_salt = hashlib.sha256(b"ace.protocol.dh.v1").digest()
+from . import xwing
+from ._utils import from_base64
+
+# ACE_KEM_SALT = SHA-256("ace.protocol.kem.v1")
+_ace_kem_salt = hashlib.sha256(b"ace.protocol.kem.v1").digest()
 
 
-def get_ace_dh_salt() -> bytes:
-    """Return the ACE DH salt (SHA-256 of 'ace.protocol.dh.v1')."""
-    return _ace_dh_salt
+def get_ace_kem_salt() -> bytes:
+    """Return the ACE KEM salt (SHA-256 of 'ace.protocol.kem.v1')."""
+    return _ace_kem_salt
+
 
 # AES-256-GCM: 12-byte nonce + 16-byte authentication tag
 _NONCE_LEN = 12
@@ -27,55 +46,67 @@ _MIN_PAYLOAD_LEN = _NONCE_LEN + _GCM_TAG_LEN  # 28 bytes
 MAX_PAYLOAD_SIZE = 10 * 1024 * 1024
 _MAX_PLAINTEXT_SIZE = MAX_PAYLOAD_SIZE - _MIN_PAYLOAD_LEN
 
-_ZERO_KEY = b"\x00" * 32
+
+def _padded_base64_length(n_bytes: int) -> int:
+    """Length of the padded Base64 encoding of ``n_bytes`` bytes."""
+    return 4 * ((n_bytes + 2) // 3)
+
+
+_MAX_PUBLIC_KEY_B64_LEN = _padded_base64_length(xwing.PUBLIC_KEY_SIZE)  # 1624
+_MAX_CIPHERTEXT_B64_LEN = _padded_base64_length(xwing.CIPHERTEXT_SIZE)  # 1496
+
+
+def _decode_fixed_size(
+    b64: str, max_b64_len: int, check: Callable[[bytes], None], what: str
+) -> bytes:
+    if not isinstance(b64, str):
+        raise ValueError(f"{what} must be a Base64 string")
+    # Cheap pre-check: refuse to decode anything longer than the encoding of a
+    # correctly sized value.
+    if len(b64) > max_b64_len:
+        raise ValueError(f"{what} Base64 is too long ({len(b64)} chars, max {max_b64_len})")
+    raw = from_base64(b64)
+    check(raw)
+    return raw
+
+
+def decode_kem_public_key(b64: str) -> bytes:
+    """Decode a Base64 X-Wing public key and enforce its length (1216 bytes)."""
+    return _decode_fixed_size(
+        b64, _MAX_PUBLIC_KEY_B64_LEN, xwing.check_public_key, "X-Wing public key"
+    )
+
+
+def decode_kem_ciphertext(b64: str) -> bytes:
+    """Decode a Base64 X-Wing KEM ciphertext and enforce its length (1120 bytes)."""
+    return _decode_fixed_size(
+        b64, _MAX_CIPHERTEXT_B64_LEN, xwing.check_ciphertext, "X-Wing ciphertext"
+    )
 
 
 def _derive_aes_key(shared_secret: bytes, conv_id_bytes: bytes) -> bytes:
-    """Derive AES-256 key from shared secret via HKDF-SHA256."""
+    """Derive AES-256 key from the KEM shared secret via HKDF-SHA256."""
     hkdf = HKDF(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=_ace_dh_salt,
+        salt=_ace_kem_salt,
         info=conv_id_bytes,
     )
     return hkdf.derive(shared_secret)
 
 
 def compute_conversation_id(pub_a: bytes, pub_b: bytes) -> str:
-    """Compute deterministic conversation ID from two X25519 public keys.
+    """Compute deterministic conversation ID from two X-Wing public keys.
 
     conversationId = hex(SHA-256(sort_bytes(pubA, pubB)))
     """
+    xwing.check_public_key(pub_a)
+    xwing.check_public_key(pub_b)
     if pub_a <= pub_b:
         first, second = pub_a, pub_b
     else:
         first, second = pub_b, pub_a
-    combined = first + second
-    return hashlib.sha256(combined).hexdigest()
-
-
-def _validate_public_key(pub_key: bytes) -> None:
-    """Validate X25519 public key: must be 32 bytes, non-zero."""
-    if len(pub_key) != 32:
-        raise ValueError(f"X25519 public key must be exactly 32 bytes, got {len(pub_key)}")
-    if pub_key == _ZERO_KEY:
-        raise ValueError("Refusing to use all-zeros X25519 public key (known weak key)")
-
-
-def _reject_degenerate_shared_secret(shared_secret: bytes) -> None:
-    """Root safeguard against small-order public keys.
-
-    X25519 clamps the private scalar to a multiple of the cofactor, so any
-    low-order input point collapses the shared secret to all-zeros. Rejecting an
-    all-zero secret therefore catches *every* small-subgroup case regardless of
-    which points a public-key blocklist happens to enumerate — this is the same
-    root check the Swift and TS SDKs make.
-    """
-    if shared_secret == _ZERO_KEY:
-        raise ValueError(
-            "ECDH produced a degenerate (all-zero) shared secret; refusing to proceed "
-            "(small-order public key)"
-        )
+    return hashlib.sha256(first + second).hexdigest()
 
 
 def encrypt(
@@ -85,35 +116,29 @@ def encrypt(
 ) -> tuple[bytes, bytes]:
     """Encrypt plaintext for a recipient.
 
-    Returns (ephemeral_pub_key, payload) where payload = nonce[12] || ciphertext || tag[16].
+    Returns (kem_ciphertext, payload) where kem_ciphertext is the 1120-byte X-Wing
+    ciphertext and payload = nonce[12] || ciphertext || tag[16].
     """
-    # 0. Validate inputs
-    _validate_public_key(recipient_pub_key)
+    # 0. Validate payload size (the public key length is checked by xwing.encapsulate)
     if len(plaintext) > _MAX_PLAINTEXT_SIZE:
         raise ValueError(
             f"Plaintext too large ({len(plaintext)} bytes): maximum is {_MAX_PLAINTEXT_SIZE}"
         )
 
-    # 1. Generate ephemeral X25519 key pair
-    ephemeral_priv = X25519PrivateKey.generate()
-    ephemeral_pub = ephemeral_priv.public_key().public_bytes_raw()
+    # 1. KEM encapsulation
+    shared_secret, kem_ciphertext = xwing.encapsulate(recipient_pub_key)
 
-    # 2. ECDH shared secret
-    recipient_key = X25519PublicKey.from_public_bytes(recipient_pub_key)
-    shared_secret = ephemeral_priv.exchange(recipient_key)
-    _reject_degenerate_shared_secret(shared_secret)
-
-    # 3. HKDF key derivation
+    # 2. HKDF key derivation
     conv_id_bytes = conversation_id.encode("utf-8")
     aes_key = _derive_aes_key(shared_secret, conv_id_bytes)
 
-    # 4. AES-256-GCM encryption
+    # 3. AES-256-GCM encryption
     nonce = os.urandom(_NONCE_LEN)
     aad = conv_id_bytes
     aesgcm = AESGCM(aes_key)
     ciphertext_and_tag = aesgcm.encrypt(nonce, plaintext, aad)
 
-    # 5. Payload = nonce[12] || ciphertext || tag[16]
+    # 4. Payload = nonce[12] || ciphertext || tag[16]
     payload = nonce + ciphertext_and_tag
     if len(payload) > MAX_PAYLOAD_SIZE:
         raise ValueError(
@@ -123,20 +148,23 @@ def encrypt(
     # NOTE: `del` only removes the Python reference; the key material remains in
     # memory until garbage-collected.  True zeroization is not possible in pure
     # Python.  For production use, prefer Tier 1/2 identities (HSM / TEE).
-    del ephemeral_priv, shared_secret, aes_key
+    del shared_secret, aes_key
 
-    return ephemeral_pub, payload
+    return kem_ciphertext, payload
 
 
 def decrypt(
-    ephemeral_pub_key: bytes,
+    kem_ciphertext: bytes,
     payload: bytes,
-    recipient_priv_key: X25519PrivateKey,
+    private_seed: bytes,
     conversation_id: str,
 ) -> bytes:
-    """Decrypt a message using own private key."""
-    # 0. Validate inputs
-    _validate_public_key(ephemeral_pub_key)
+    """Decrypt a message using own X-Wing private seed (32 bytes).
+
+    All length checks run before any decapsulation.
+    """
+    # 0. Validate payload size (kem_ciphertext / seed lengths are checked by
+    #    xwing.decapsulate before any KEM work)
     if len(payload) < _MIN_PAYLOAD_LEN:
         raise ValueError(
             f"Payload too short ({len(payload)} bytes): "
@@ -147,10 +175,9 @@ def decrypt(
             f"Payload too large ({len(payload)} bytes): maximum is {MAX_PAYLOAD_SIZE}"
         )
 
-    # 1. ECDH shared secret
-    ephemeral_key = X25519PublicKey.from_public_bytes(ephemeral_pub_key)
-    shared_secret = recipient_priv_key.exchange(ephemeral_key)
-    _reject_degenerate_shared_secret(shared_secret)
+    # 1. KEM decapsulation (implicit rejection: a bad ciphertext yields an
+    #    unrelated secret, caught by the GCM tag below)
+    shared_secret = xwing.decapsulate(kem_ciphertext, private_seed)
 
     # 2. HKDF key derivation
     conv_id_bytes = conversation_id.encode("utf-8")

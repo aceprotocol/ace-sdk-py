@@ -1,7 +1,11 @@
 import pytest
+
 from ace import (
-    SoftwareIdentity, create_message, parse_message,
-    ReplayDetector, ThreadStateMachine,
+    ReplayDetector,
+    SoftwareIdentity,
+    ThreadStateMachine,
+    create_message,
+    parse_message,
 )
 
 

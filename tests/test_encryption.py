@@ -1,13 +1,23 @@
+import hashlib
 import re
+
 import pytest
-from ace import SoftwareIdentity
-from ace.encryption import compute_conversation_id, encrypt, decrypt, get_ace_dh_salt, MAX_PAYLOAD_SIZE
+
+from ace import SoftwareIdentity, xwing
+from ace.encryption import (
+    MAX_PAYLOAD_SIZE,
+    compute_conversation_id,
+    decrypt,
+    encrypt,
+    get_ace_kem_salt,
+)
 
 
-def test_get_ace_dh_salt():
-    salt = get_ace_dh_salt()
+def test_get_ace_kem_salt():
+    salt = get_ace_kem_salt()
     assert len(salt) == 32
-    assert salt == get_ace_dh_salt()  # Deterministic
+    assert salt == get_ace_kem_salt()  # Deterministic
+    assert salt == hashlib.sha256(b"ace.protocol.kem.v1").digest()
 
 
 def test_conversation_id_deterministic():
@@ -40,12 +50,12 @@ def test_encrypt_decrypt_roundtrip():
         sender.get_encryption_public_key(), receiver.get_encryption_public_key()
     )
     plaintext = b"Hello ACE!"
-    eph_pub, payload = encrypt(plaintext, receiver.get_encryption_public_key(), conv_id)
+    kem_ct, payload = encrypt(plaintext, receiver.get_encryption_public_key(), conv_id)
 
-    assert len(eph_pub) == 32
-    assert len(payload) > len(plaintext)
+    assert len(kem_ct) == xwing.CIPHERTEXT_SIZE == 1120
+    assert len(payload) == len(plaintext) + 28
 
-    decrypted = decrypt(eph_pub, payload, receiver.get_encryption_private_key(), conv_id)
+    decrypted = decrypt(kem_ct, payload, receiver.get_encryption_seed(), conv_id)
     assert decrypted == plaintext
 
 
@@ -56,10 +66,10 @@ def test_decrypt_wrong_key_fails():
     conv_id = compute_conversation_id(
         sender.get_encryption_public_key(), receiver.get_encryption_public_key()
     )
-    eph_pub, payload = encrypt(b"Secret", receiver.get_encryption_public_key(), conv_id)
+    kem_ct, payload = encrypt(b"Secret", receiver.get_encryption_public_key(), conv_id)
 
     with pytest.raises(Exception):
-        decrypt(eph_pub, payload, wrong.get_encryption_private_key(), conv_id)
+        decrypt(kem_ct, payload, wrong.get_encryption_seed(), conv_id)
 
 
 def test_decrypt_wrong_conv_id_fails():
@@ -68,20 +78,25 @@ def test_decrypt_wrong_conv_id_fails():
     conv_id = compute_conversation_id(
         sender.get_encryption_public_key(), receiver.get_encryption_public_key()
     )
-    eph_pub, payload = encrypt(b"Secret", receiver.get_encryption_public_key(), conv_id)
+    kem_ct, payload = encrypt(b"Secret", receiver.get_encryption_public_key(), conv_id)
 
     with pytest.raises(Exception):
-        decrypt(eph_pub, payload, receiver.get_encryption_private_key(), "wrong-conv-id")
+        decrypt(kem_ct, payload, receiver.get_encryption_seed(), "wrong-conv-id")
 
 
-def test_ephemeral_keys_differ():
+def test_kem_ciphertexts_differ():
     receiver = SoftwareIdentity.generate("ed25519")
     conv_id = "a" * 64
     plaintext = b"Same message"
-    eph1, pay1 = encrypt(plaintext, receiver.get_encryption_public_key(), conv_id)
-    eph2, pay2 = encrypt(plaintext, receiver.get_encryption_public_key(), conv_id)
-    assert eph1 != eph2
+    ct1, pay1 = encrypt(plaintext, receiver.get_encryption_public_key(), conv_id)
+    ct2, pay2 = encrypt(plaintext, receiver.get_encryption_public_key(), conv_id)
+    assert ct1 != ct2
     assert pay1 != pay2
+
+
+def test_encryption_public_key_is_1216_bytes():
+    idn = SoftwareIdentity.generate("ed25519")
+    assert len(idn.get_encryption_public_key()) == xwing.PUBLIC_KEY_SIZE == 1216
 
 
 def test_maximum_plaintext_roundtrip():
@@ -91,9 +106,9 @@ def test_maximum_plaintext_roundtrip():
         sender.get_encryption_public_key(), receiver.get_encryption_public_key()
     )
     plaintext = b"\x5a" * (MAX_PAYLOAD_SIZE - 28)
-    eph_pub, payload = encrypt(plaintext, receiver.get_encryption_public_key(), conv_id)
+    kem_ct, payload = encrypt(plaintext, receiver.get_encryption_public_key(), conv_id)
     assert len(payload) <= MAX_PAYLOAD_SIZE
-    decrypted = decrypt(eph_pub, payload, receiver.get_encryption_private_key(), conv_id)
+    decrypted = decrypt(kem_ct, payload, receiver.get_encryption_seed(), conv_id)
     assert decrypted == plaintext
 
 

@@ -10,8 +10,8 @@ from coincurve import PublicKey as SecpPublicKey
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
+from ._utils import from_base64, to_base64
 from .types import SigningScheme
-from ._utils import to_base64, from_base64
 
 # Maximum valid Unix timestamp: 2^53 - 1 (safe integer range)
 _MAX_TIMESTAMP = (1 << 53) - 1

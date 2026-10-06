@@ -10,19 +10,25 @@ import socket
 import ssl
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import base58
 from coincurve import PublicKey as SecpPublicKey
 
-from urllib.parse import urlparse
-
-from .types import (
-    RegistrationFile, SigningConfig, SigningScheme, IdentityTier,
-    Capability, PricingInfo, ChainInfo, ProfilePricing,
-)
+from ._utils import CONTROL_CHAR_RE, from_base64, secp_pubkey_to_address
+from .encryption import decode_kem_public_key
 from .identity import compute_ace_id
-from .signing import build_sign_data, encode_payload, verify_signature, decode_signature
-from ._utils import from_base64, secp_pubkey_to_address, CONTROL_CHAR_RE
+from .signing import build_sign_data, decode_signature, encode_payload, verify_signature
+from .types import (
+    AgentProfile,
+    Capability,
+    ChainInfo,
+    PricingInfo,
+    ProfilePricing,
+    RegistrationFile,
+    SigningConfig,
+    SigningScheme,
+)
 
 _VALID_SCHEMES: frozenset[str] = frozenset({"ed25519", "secp256k1"})
 
@@ -103,6 +109,7 @@ def validate_registration_file(reg: RegistrationFile) -> None:
         raise ValueError("Missing required field: signing.address")
     if not reg.signing.encryption_public_key:
         raise ValueError("Missing required field: signing.encryptionPublicKey")
+    decode_kem_public_key(reg.signing.encryption_public_key)
     if reg.signing.scheme == "ed25519":
         address_pub_key = _decode_ed25519_address(reg.signing.address)
         if reg.signing.signing_public_key:
@@ -148,16 +155,16 @@ def get_registration_signing_public_key(reg: RegistrationFile) -> bytes:
 
 
 def get_registration_encryption_public_key(reg: RegistrationFile) -> bytes:
-    """Extract the X25519 encryption public key from a validated registration file."""
-    return from_base64(reg.signing.encryption_public_key)
+    """Extract the X-Wing encryption public key (1216 bytes) from a validated registration file."""
+    return decode_kem_public_key(reg.signing.encryption_public_key)
 
 
 # === Encryption-key binding (relay-sourced peer keys) ===
 #
 # ``ace_id`` self-certifies only the *signing* key (ace_id == sha256(signingKey)).
-# The X25519 *encryption* key is a separate key; on its own it is an unauthenticated
+# The X-Wing *encryption* key is a separate key; on its own it is an unauthenticated
 # claim.  A relay that routes ciphertext is untrusted by design, so a relay could
-# hand a client its own X25519 key and read messages the client believes are E2E
+# hand a client its own encryption key and read messages the client believes are E2E
 # encrypted.  The binding below is the proof that closes that gap: it is the very
 # same signature the relay requires at registration, so verifying it needs no new
 # trust anchor — just the identity's own signing key.
@@ -182,7 +189,7 @@ def verify_encryption_key_binding(
 
     signed by the identity's signing key.  This function also re-checks that
     ``ace_id == sha256(signingPublicKey)``, so a ``True`` result means: *this exact
-    X25519 key was signed by the key that defines this identity*.
+    encryption key was signed by the key that defines this identity*.
 
     ``encryption_public_key`` and ``signing_public_key`` MUST be the Base64 wire
     strings (the signature commits to those strings, not to raw bytes).  Returns
@@ -200,6 +207,8 @@ def verify_encryption_key_binding(
     if not isinstance(timestamp, int):
         return False
     try:
+        # The bound key must be a well-formed X-Wing public key.
+        decode_kem_public_key(encryption_public_key)
         signing_pub_bytes = from_base64(signing_public_key)
     except (ValueError, TypeError):
         return False
@@ -223,7 +232,7 @@ class VerifiedPeer:
     """A peer's public keys AFTER verifying its identity and encryption-key binding.
 
     Holding an instance is proof that ``ace_id`` matches the signing key AND that
-    the X25519 ``encryption_public_key`` was signed by that identity.  Construct
+    the X-Wing ``encryption_public_key`` was signed by that identity.  Construct
     ONLY via :meth:`from_relay_response`; the bare constructor bypasses verification
     and must never be fed untrusted data.
     """
@@ -238,7 +247,7 @@ class VerifiedPeer:
         """Build a verified peer from a relay ``GET /v1/peer`` or ``/v1/discover`` entry.
 
         Raises ``ValueError`` if the binding signature is absent or fails — a relay
-        that substitutes an X25519 key cannot produce a passing binding, so an
+        that substitutes an encryption key cannot produce a passing binding, so an
         instance can only be obtained for a genuine key.
         """
         if not isinstance(data, dict):
@@ -260,7 +269,7 @@ class VerifiedPeer:
             raise ValueError(
                 "Peer response is missing the encryption-key binding "
                 "(registrationSignature/registeredAt); its encryptionPublicKey cannot be "
-                "trusted.  Without the binding a relay could substitute its own X25519 key "
+                "trusted.  Without the binding a relay could substitute its own encryption key "
                 "and read messages meant to be end-to-end encrypted."
             )
         if not verify_encryption_key_binding(
@@ -270,11 +279,13 @@ class VerifiedPeer:
                 "Peer encryption-key binding failed verification: the encryptionPublicKey is "
                 "not signed by this identity's signing key (possible key substitution / relay MITM)."
             )
+        # The binding check above already validated both Base64 strings and the
+        # X-Wing length; decode once here for the verified instance.
         return cls(
             ace_id=ace_id,
             scheme=scheme,  # type: ignore[arg-type]
             signing_public_key=from_base64(sign_pub_b64),
-            encryption_public_key=from_base64(enc_pub_b64),
+            encryption_public_key=decode_kem_public_key(enc_pub_b64),
         )
 
 

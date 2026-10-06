@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import base64
 import binascii
+import re
 
 from Crypto.Hash import keccak as keccak_mod
-
-import re
 
 __all__ = ["keccak256", "to_base64", "from_base64", "secp_pubkey_to_address", "eip55_checksum", "CONTROL_CHAR_RE"]
 

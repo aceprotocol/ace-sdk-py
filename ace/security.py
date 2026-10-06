@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import re
 import threading
 import time
 from collections import OrderedDict
-import re
 
 MAX_DRIFT_SECONDS = 300  # 5 minutes
 _MESSAGE_ID_V4_PATTERN = re.compile(

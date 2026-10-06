@@ -11,18 +11,22 @@ Security note on key material lifetime:
 from __future__ import annotations
 
 import hashlib
-import warnings
+import os
 from typing import Any
 
 import base58
 from coincurve import PrivateKey as SecpPrivateKey
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
+from . import xwing
+from ._utils import from_base64, secp_pubkey_to_address, to_base64
 from .types import (
-    SigningScheme, IdentityTier, HardwareBacking, RegistrationFile, SigningConfig,
+    HardwareBacking,
+    IdentityTier,
+    RegistrationFile,
+    SigningConfig,
+    SigningScheme,
 )
-from ._utils import to_base64, from_base64, secp_pubkey_to_address
 
 _VALID_SCHEMES: frozenset[str] = frozenset({"ed25519", "secp256k1"})
 
@@ -40,14 +44,21 @@ class SoftwareIdentity:
         self,
         scheme: SigningScheme,
         signing_private_key: bytes,
-        encryption_private_key: X25519PrivateKey,
+        encryption_seed: bytes,
     ) -> None:
+        """
+        Args:
+            scheme: ``"ed25519"`` or ``"secp256k1"``.
+            signing_private_key: 32-byte signing private key.
+            encryption_seed: 32-byte X-Wing private seed (the encryption private key).
+        """
         if scheme not in _VALID_SCHEMES:
             raise ValueError(f"Unsupported signing scheme: '{scheme}' (expected one of {sorted(_VALID_SCHEMES)})")
+        xwing.check_seed(encryption_seed)
 
         self._scheme = scheme
         self._signing_private_key = signing_private_key
-        self._encryption_private_key = encryption_private_key
+        self._encryption_seed = bytes(encryption_seed)
 
         # Derive public keys and address
         if scheme == "ed25519":
@@ -62,7 +73,7 @@ class SoftwareIdentity:
             uncompressed = sk.public_key.format(compressed=False)
             self._address = secp_pubkey_to_address(uncompressed)
 
-        self._encryption_public_key = encryption_private_key.public_key().public_bytes_raw()
+        self._encryption_public_key = xwing.public_key_from_seed(self._encryption_seed)
         self._ace_id = compute_ace_id(self._signing_public_key)
 
     @classmethod
@@ -71,35 +82,23 @@ class SoftwareIdentity:
         if scheme not in _VALID_SCHEMES:
             raise ValueError(f"Unsupported signing scheme: '{scheme}' (expected one of {sorted(_VALID_SCHEMES)})")
 
-        encryption_private_key = X25519PrivateKey.generate()
-        enc_pub = encryption_private_key.public_key().public_bytes_raw()
-
+        encryption_seed = os.urandom(xwing.SEED_SIZE)
         if scheme == "ed25519":
-            ed_priv = Ed25519PrivateKey.generate()
-            signing_pub = ed_priv.public_key().public_bytes_raw()
-            obj = cls.__new__(cls)
-            obj._scheme = scheme
-            obj._signing_private_key = ed_priv.private_bytes_raw()
-            obj._encryption_private_key = encryption_private_key
-            obj._ed_private_key = ed_priv
-            obj._signing_public_key = signing_pub
-            obj._address = base58.b58encode(signing_pub).decode("ascii")
-            obj._encryption_public_key = enc_pub
-            obj._ace_id = compute_ace_id(signing_pub)
-            return obj
+            signing_private_key = Ed25519PrivateKey.generate().private_bytes_raw()
         else:
-            sk = SecpPrivateKey()
-            return cls(scheme, sk.secret, encryption_private_key)
+            signing_private_key = SecpPrivateKey().secret
+        return cls(scheme, signing_private_key, encryption_seed)
 
     def get_encryption_public_key(self) -> bytes:
+        """Return the 1216-byte X-Wing encryption public key."""
         return self._encryption_public_key
 
     def get_signing_public_key(self) -> bytes:
         return self._signing_public_key
 
-    def get_encryption_private_key(self) -> X25519PrivateKey:
-        """Internal — used by encryption module."""
-        return self._encryption_private_key
+    def get_encryption_seed(self) -> bytes:
+        """Return the 32-byte X-Wing private seed (the encryption private key)."""
+        return self._encryption_seed
 
     def sign(self, data: bytes) -> tuple[bytes, SigningScheme]:
         """Sign data and return (signature, scheme). Data must be pre-hashed (32 bytes)."""
@@ -136,10 +135,10 @@ class SoftwareIdentity:
     def get_ace_id(self) -> str:
         return self._ace_id
 
-    def decrypt_payload(self, ephemeral_pub_key: bytes, payload: bytes, conversation_id: str) -> bytes:
-        """Decrypt an encrypted payload using this identity's private key."""
+    def decrypt_payload(self, kem_ciphertext: bytes, payload: bytes, conversation_id: str) -> bytes:
+        """Decrypt an encrypted payload using this identity's X-Wing private seed."""
         from .encryption import decrypt
-        return decrypt(ephemeral_pub_key, payload, self._encryption_private_key, conversation_id)
+        return decrypt(kem_ciphertext, payload, self._encryption_seed, conversation_id)
 
     def to_dict(self, *, include_private_keys: bool = False) -> dict[str, Any]:
         """Export identity for persistence.
@@ -157,9 +156,7 @@ class SoftwareIdentity:
         return {
             "scheme": self._scheme,
             "signingPrivateKey": to_base64(self._signing_private_key),
-            "encryptionPrivateKey": to_base64(
-                self._encryption_private_key.private_bytes_raw()
-            ),
+            "encryptionPrivateKey": to_base64(self._encryption_seed),
         }
 
     @classmethod
@@ -167,9 +164,8 @@ class SoftwareIdentity:
         """Restore identity from exported dict."""
         scheme = d["scheme"]
         signing_priv = from_base64(d["signingPrivateKey"])
-        enc_priv_bytes = from_base64(d["encryptionPrivateKey"])
-        enc_priv = X25519PrivateKey.from_private_bytes(enc_priv_bytes)
-        return cls(scheme, signing_priv, enc_priv)
+        encryption_seed = from_base64(d["encryptionPrivateKey"])
+        return cls(scheme, signing_priv, encryption_seed)
 
     def to_registration_file(
         self,

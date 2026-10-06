@@ -1,8 +1,19 @@
 from ace.types import (
-    is_economic_type, is_system_type, is_social_type,
-    ACEMessage, EncryptionEnvelope, SignatureEnvelope,
-    RegistrationFile, SigningConfig, Capability, PricingInfo, ChainInfo,
-    AgentProfile, ProfilePricing, DiscoverAgent, DiscoverResult,
+    ACEMessage,
+    AgentProfile,
+    Capability,
+    ChainInfo,
+    DiscoverAgent,
+    DiscoverResult,
+    EncryptionEnvelope,
+    PricingInfo,
+    ProfilePricing,
+    RegistrationFile,
+    SignatureEnvelope,
+    SigningConfig,
+    is_economic_type,
+    is_social_type,
+    is_system_type,
 )
 
 
@@ -34,13 +45,15 @@ def test_ace_message_to_dict_no_plaintext_body():
         conversation_id="c" * 64,
         type="text",
         timestamp=1741000000,
-        encryption=EncryptionEnvelope(ephemeral_pub_key="AAAA", payload="BBBB"),
+        encryption=EncryptionEnvelope(kem_ciphertext="AAAA", payload="BBBB"),
         signature=SignatureEnvelope(scheme="ed25519", value="CCCC"),
     )
     d = msg.to_dict()
     assert "body" not in d
     assert "encryption" in d
     assert d["encryption"]["payload"] == "BBBB"
+    assert d["encryption"]["kemCiphertext"] == "AAAA"
+    assert set(d["encryption"]) == {"kemCiphertext", "payload"}
 
 
 def test_ace_message_roundtrip():
@@ -53,7 +66,7 @@ def test_ace_message_roundtrip():
         conversation_id="c" * 64,
         type="rfq",
         timestamp=1741000000,
-        encryption=EncryptionEnvelope(ephemeral_pub_key="AAAA", payload="BBBB"),
+        encryption=EncryptionEnvelope(kem_ciphertext="AAAA", payload="BBBB"),
         signature=SignatureEnvelope(scheme="ed25519", value="CCCC"),
         thread_id="deal-001",
     )
@@ -65,7 +78,7 @@ def test_ace_message_roundtrip():
     assert restored.conversation_id == msg.conversation_id
     assert restored.type == msg.type
     assert restored.timestamp == msg.timestamp
-    assert restored.encryption.ephemeral_pub_key == msg.encryption.ephemeral_pub_key
+    assert restored.encryption.kem_ciphertext == msg.encryption.kem_ciphertext
     assert restored.encryption.payload == msg.encryption.payload
     assert restored.signature.scheme == msg.signature.scheme
     assert restored.signature.value == msg.signature.value
