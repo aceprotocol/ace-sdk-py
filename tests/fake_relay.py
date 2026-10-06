@@ -39,6 +39,8 @@ class FakeRelay:
         self._seq = 0
         self.cond = threading.Condition()
         self.stopping = False
+        self.heartbeat = 0.2  # live-phase heartbeat interval, seconds
+        self.open_listens = 0  # listen handlers still writing (a client disconnect ends one)
         relay = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -240,6 +242,15 @@ class FakeRelay:
             h.wfile.flush()
 
         frame("event: connected\ndata: {}\n\n: heartbeat\n\n")
+        with self.cond:
+            self.open_listens += 1
+        try:
+            self._listen_loop(h, ace_id, since, frame)
+        finally:
+            with self.cond:
+                self.open_listens -= 1
+
+    def _listen_loop(self, h, ace_id, since, frame):
         sent = 0
         last = since
         catchup = True
@@ -247,7 +258,7 @@ class FakeRelay:
             with self.cond:
                 entries = self._after(ace_id, last)
                 while not entries and not self.stopping:
-                    if not self.cond.wait(0.2):
+                    if not self.cond.wait(self.heartbeat):
                         break
                     entries = self._after(ace_id, last)
                 if self.stopping:

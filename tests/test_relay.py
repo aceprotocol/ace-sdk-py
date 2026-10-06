@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -206,6 +207,62 @@ def test_listen_stop_unblocks(relay, ids):
     stop.set()
     t.join(5)
     assert not t.is_alive() and out == []
+
+
+def _until(cond, timeout=3.0):
+    end = time.monotonic() + timeout
+    while not cond():
+        assert time.monotonic() < end, "condition not met in time"
+        time.sleep(0.01)
+
+
+def test_listen_stop_during_heartbeats_is_prompt(relay, ids):
+    _, bob = ids
+    relay.heartbeat = 0.01
+    client = RelayClient(relay.url)
+    client.register(bob)
+    stop = threading.Event()
+    out = []
+    t = threading.Thread(target=lambda: out.extend(client.listen(bob, stop=stop)))
+    t.start()
+    _until(lambda: relay.open_listens == 1)
+    time.sleep(0.1)  # several heartbeats
+    t0 = time.monotonic()
+    stop.set()
+    t.join(5)
+    assert not t.is_alive() and out == []
+    assert time.monotonic() - t0 < 0.5
+    _until(lambda: relay.open_listens == 0)
+
+
+def test_listen_generator_close_closes_connection(relay, ids):
+    _, bob = ids
+    relay.heartbeat = 0.01
+    client = RelayClient(relay.url)
+    client.register(bob)
+    relay.enqueue_raw(bob.get_ace_id(), {"n": 0})
+    gen = client.listen(bob)
+    assert next(gen).message == {"n": 0}
+    assert relay.open_listens == 1
+    gen.close()
+    _until(lambda: relay.open_listens == 0)
+
+
+def test_listen_stop_during_backoff_is_prompt(relay, ids):
+    _, bob = ids
+    client = RelayClient(relay.url)
+    client.register(bob)
+    relay.inject.append(("/v1/listen", 503, "down", {"Retry-After": "30"}))
+    stop = threading.Event()
+    t = threading.Thread(target=lambda: list(client.listen(bob, stop=stop)))
+    t.start()
+    _until(lambda: ("GET", "/v1/listen") in relay.requests)
+    time.sleep(0.05)
+    t0 = time.monotonic()
+    stop.set()
+    t.join(5)
+    assert not t.is_alive() and time.monotonic() - t0 < 0.5
+    assert relay.requests.count(("GET", "/v1/listen")) == 1
 
 
 def test_listen_backoff_and_retry_after(relay, ids, monkeypatch):

@@ -427,8 +427,8 @@ class RelayClient:
         conn = self._connection(max(self._timeout, idle_timeout))
         done = threading.Event()
         watcher = None
+        resp: http.client.HTTPResponse | None = None
         try:
-            resp = None
             for attempt in (0, 1):
                 req = RelayAuthRequest.listen(since)
                 headers = {**create_auth_headers(identity, req, self._next_ts()), "Accept": "text/event-stream"}
@@ -468,6 +468,10 @@ class RelayClient:
             yield from self._parse_sse(resp, stop)
         finally:
             done.set()
+            # A response that will close owns the socket after getresponse(); closing only the
+            # connection would leave it to the GC, so close the response explicitly as well.
+            if resp is not None:
+                resp.close()
             conn.close()
 
     @staticmethod
