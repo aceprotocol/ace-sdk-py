@@ -1,0 +1,210 @@
+"""Sender durability (06-security "Durable Delivery", Sender)."""
+
+from __future__ import annotations
+
+import dataclasses
+import time
+import uuid
+from typing import Callable
+
+from ._encoding import CONTROL_CHAR_RE, encode_signature
+from .discovery import VerifiedPeer
+from .encryption import compute_conversation_id
+from .envelope import message_sign_data
+from .errors import ACEError
+from .messages import create_message
+from .state_machine import ThreadHistoryEntry, ThreadStateMachine
+from .store import ACEStore, dump_record, load_record
+from .threads import PendingSend, ThreadRecord, ThreadStore, rebuild_snapshot, sha256_hex
+from .types import ACEIdentity, ACEMessage, MessageType, SignatureEnvelope, is_economic_type
+
+
+def _outbox_key(request_id: str) -> str:
+    return f"outbox/{sha256_hex(request_id)}.json"
+
+
+def _check_request_id(request_id: object) -> str:
+    if not isinstance(request_id, str) or not 1 <= len(request_id) <= 256 or CONTROL_CHAR_RE.search(request_id):
+        raise ACEError("invalid_argument", "request_id must be 1-256 characters without control characters")
+    return request_id
+
+
+class Outbox:
+    """Stage signed envelopes durably before sending them.
+
+    - ``stage`` signs the message and persists it with its resulting thread state in one
+      write (economic: in the thread record; otherwise ``outbox/<sha256(requestId)>.json``).
+      Staging an existing ``request_id`` returns the pending send unchanged.
+    - ``deliver(request_id, transport)`` calls ``transport(message)``; success clears the
+      pending send, ``envelope_expired`` marks it ``expired``, other errors leave it as is.
+      A pending send is never abandoned automatically.
+    - ``resign`` re-signs an ``expired`` send with the same ``messageId`` and a fresh
+      timestamp (the ciphertext is kept: the AEAD binds only the conversation ID).
+    - ``abandon`` drops a pending send (economic: and its thread head entry).
+    """
+
+    def __init__(self, identity: ACEIdentity, store: ACEStore, *, clock: Callable[[], int] | None = None) -> None:
+        self._identity = identity
+        self._store = store
+        self._clock = clock
+        self._threads = ThreadStore(store, identity.get_ace_id(), clock=clock)
+
+    def _now(self) -> int:
+        return int(self._clock()) if self._clock is not None else int(time.time())
+
+    # --- lookup ---
+
+    def _find(self, request_id: str) -> tuple[PendingSend, ThreadRecord | None] | None:
+        """Caller holds the ``threads`` lock."""
+        d = load_record(self._store, _outbox_key(request_id))
+        if d is not None:
+            p = PendingSend.from_dict(d)
+            if p.request_id != request_id:
+                raise ACEError("storage_failed", "outbox record does not match its requestId")
+            return p, None
+        for rec in self._threads.records():
+            if rec.pending is not None and rec.pending.request_id == request_id:
+                return rec.pending, rec
+        return None
+
+    def _write_outbox(self, p: PendingSend) -> None:
+        d = p.to_dict()
+        d["version"] = 1
+        self._store.write(_outbox_key(p.request_id), dump_record(d))
+
+    # --- API ---
+
+    def stage(
+        self,
+        recipient: VerifiedPeer,
+        type_: MessageType,
+        body: dict,
+        *,
+        thread_id: str | None = None,
+        request_id: str | None = None,
+    ) -> PendingSend:
+        rid = str(uuid.uuid4()) if request_id is None else _check_request_id(request_id)
+        if not isinstance(recipient, VerifiedPeer):
+            raise ACEError("invalid_argument", "recipient must be a VerifiedPeer")
+        local = self._identity.get_ace_id()
+        with self._threads.locked():
+            found = self._find(rid)
+            if found is not None:
+                return found[0]
+            now = self._now()
+            if is_economic_type(type_) and thread_id is not None:
+                conversation_id = compute_conversation_id(
+                    self._identity.get_encryption_public_key(), recipient.encryption_public_key,
+                )
+                machine, rec = self._threads.machine(conversation_id, thread_id)
+                if rec is not None and rec.pending is not None:
+                    raise ACEError("pending_send_conflict", "the thread already has a pending send")
+                env = create_message(self._identity, recipient, type_, body, machine, thread_id=thread_id, timestamp=now)
+                pending = PendingSend(rid, "pending", now, env)
+                snap = machine.get_snapshot(conversation_id, thread_id)
+                assert snap is not None
+                self._threads.save(ThreadRecord(snap, pending))
+                return pending
+            env = create_message(
+                self._identity, recipient, type_, body, ThreadStateMachine(local), thread_id=thread_id, timestamp=now,
+            )
+            pending = PendingSend(rid, "pending", now, env)
+            self._write_outbox(pending)
+            return pending
+
+    def deliver(self, request_id: str, transport: Callable[[ACEMessage], None]) -> None:
+        rid = _check_request_id(request_id)
+        with self._threads.locked():
+            found = self._find(rid)
+        if found is None:
+            raise ACEError("invalid_argument", "no pending send with this request_id")
+        message = found[0].message
+        try:
+            transport(message)
+        except ACEError as exc:
+            if exc.code == "envelope_expired":
+                self._update(rid, message.message_id, lambda p: dataclasses.replace(p, status="expired"))
+            raise
+        self._acknowledge(rid, message.message_id)
+
+    def _update(self, rid: str, message_id: str, change: Callable[[PendingSend], PendingSend]) -> PendingSend | None:
+        with self._threads.locked():
+            found = self._find(rid)
+            if found is None or found[0].message.message_id != message_id:
+                return None
+            p, rec = found
+            new = change(p)
+            if rec is None:
+                self._write_outbox(new)
+            else:
+                self._threads.save(ThreadRecord(rec.snapshot, new))
+            return new
+
+    def _acknowledge(self, rid: str, message_id: str) -> None:
+        with self._threads.locked():
+            found = self._find(rid)
+            if found is None or found[0].message.message_id != message_id:
+                return
+            _, rec = found
+            if rec is None:
+                self._store.delete(_outbox_key(rid))
+            else:
+                self._threads.save(ThreadRecord(rec.snapshot, None))
+
+    def resign(self, request_id: str) -> PendingSend:
+        rid = _check_request_id(request_id)
+        with self._threads.locked():
+            found = self._find(rid)
+            if found is None:
+                raise ACEError("invalid_argument", "no pending send with this request_id")
+            p, rec = found
+            if p.status != "expired":
+                raise ACEError("invalid_argument", "only an expired pending send can be re-signed")
+            now = self._now()
+            old = p.message
+            scheme = self._identity.get_signing_scheme()
+            env = dataclasses.replace(
+                old, timestamp=now, signature=SignatureEnvelope(scheme, ""),
+                encryption=dataclasses.replace(old.encryption),
+            )
+            env.signature.value = encode_signature(self._identity.sign(message_sign_data(env)), scheme)
+            new = PendingSend(rid, "pending", p.staged_at, env)
+            if rec is None:
+                self._write_outbox(new)
+                return new
+            history = list(rec.snapshot.history)
+            if not history or history[-1].message_id != old.message_id:
+                raise ACEError("storage_failed", "the pending send is not the thread head")
+            history[-1] = ThreadHistoryEntry(history[-1].type, old.message_id, now, history[-1].from_id)
+            snap = rebuild_snapshot(rec.snapshot, history)
+            assert snap is not None
+            self._threads.save(ThreadRecord(snap, new))
+            return new
+
+    def abandon(self, request_id: str) -> None:
+        """Drop a pending send; a missing ``request_id`` is a no-op."""
+        rid = _check_request_id(request_id)
+        with self._threads.locked():
+            found = self._find(rid)
+            if found is None:
+                return
+            p, rec = found
+            if rec is None:
+                self._store.delete(_outbox_key(rid))
+                return
+            history = list(rec.snapshot.history)
+            if history and history[-1].message_id == p.message.message_id:
+                history.pop()
+            snap = rebuild_snapshot(rec.snapshot, history)
+            if snap is None:
+                self._threads.delete(rec.snapshot.conversation_id, rec.snapshot.thread_id)
+            else:
+                self._threads.save(ThreadRecord(snap, None))
+
+    def pending(self) -> list[PendingSend]:
+        out = [rec.pending for rec in self._threads.records() if rec.pending is not None]
+        for key in self._store.list("outbox/"):
+            d = load_record(self._store, key)
+            if d is not None:
+                out.append(PendingSend.from_dict(d))
+        return sorted(out, key=lambda p: (p.staged_at, p.request_id))

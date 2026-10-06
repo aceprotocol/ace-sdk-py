@@ -12,7 +12,8 @@ Requires Python 3.10+ and `cryptography>=48` (ML-KEM-768 support). Everything is
 
 ## Quick start
 
-`examples/quickstart.py` is the tested end-to-end example:
+`examples/quickstart.py` is the tested example. The low-level API creates and parses one
+message:
 
 ```python
 from ace import (
@@ -30,6 +31,68 @@ envelope = create_message(alice, bob_peer, "rfq", {"need": "translate"},
 parsed = parse_message(decode_envelope(envelope.to_dict()), bob, alice_peer,
                        threads=ThreadStateMachine(bob.get_ace_id()), replay=ReplayDetector())
 ```
+
+## Pipeline (store, peers, relay, outbox, inbox)
+
+Real agents use the durable pipeline, which persists peers, threads, the replay store,
+pending sends and delivery records, and survives crashes at any point:
+
+```python
+from ace import ACEError, FileStore, Inbox, Outbox, PeerStore, ReceiveSource, RelayClient
+
+store = FileStore("/home/agent/.ace/state")        # or MemoryStore(), or your own ACEStore
+relay = RelayClient("https://relay.example")
+relay.register(identity)                           # signed registration request
+peers = PeerStore(store, relay=relay)              # pinned bindings + rollback barrier
+
+def on_message(m):                                 # persist durably, idempotent on (from_id, message_id)
+    db.save_inbound(m.from_id, m.message_id, m.type, m.body)
+
+inbox = Inbox.open(identity, store, peers, on_message)   # holds the "receive" lock until close()
+outbox = Outbox(identity, store)
+
+# send: stage (signed + persisted with its thread state), then deliver
+pending = outbox.stage(peers.resolve(seller_id), "rfq", {"need": "translate"}, thread_id="deal-1")
+try:
+    outbox.deliver(pending.request_id, relay.send)
+except ACEError as e:
+    if e.code == "envelope_expired":               # offline too long: re-sign, same messageId
+        outbox.resign(pending.request_id)
+        outbox.deliver(pending.request_id, relay.send)
+    elif not e.is_transient:
+        raise                                      # transient: retry deliver() later
+
+# receive: poll, or stream with SSE (reconnects with backoff)
+result = inbox.pull(relay)                         # PullResult(delivered, duplicates, quarantined, blocked)
+for outcome in inbox.follow(relay, stop=stop_event):
+    ...                                            # ReceiveOutcome(kind="delivered" | "duplicate" | "quarantined")
+# direct (HTTP endpoint) delivery: inbox.receive(body["message"], ReceiveSource.direct())
+```
+
+- **`ACEStore`** is a small synchronous key-value protocol (`read`, `write`, `delete`, `list`,
+  `lock`). `MemoryStore` is in-process; `FileStore(root)` writes atomically (temp file with
+  `O_EXCL|O_NOFOLLOW`, fsync, rename, directory fsync), uses 0700/0600 permissions, refuses
+  symlinks and uses lock files that are taken over from dead processes. The persisted JSON
+  layout is the one in `ace-spec/06-security.md` Appendix A, so other SDKs can read it.
+- **`PeerStore`** pins each peer's keys. A pin younger than `ttl_seconds` is used as is;
+  otherwise it is refreshed from the relay. A different encryption key is only adopted from
+  a relay-signed binding with a newer `registeredAt` (`stale_peer_binding` otherwise); a
+  registration file never rotates a pin. `VerifiedPeer.profile` is relay metadata
+  (self-asserted, unverified): only the keys are verified.
+- **`Outbox`** keeps one pending send per thread (`pending_send_conflict`). Retries reuse the
+  same envelope; a pending send is cleared on acknowledgement or when a later inbound message
+  on the thread proves delivery. It is never abandoned automatically (`abandon` drops it).
+- **`Inbox`** commits each message in the 06 order (delivery record, thread state, replay
+  state, `on_message`, ack, cursor), recovers on `open`, and hands every message to
+  `on_message` at least once — exactly once to a host that dedups on `(from_id, message_id)`.
+  Permanent failures from the relay are quarantined (`quarantine/`, at most 1000 records);
+  `retryable` outcomes (relay down, storage, handler errors) stop `pull` without advancing
+  the cursor.
+- **`RelayClient`** implements `08-relay.md`: `register`, `unregister`, `lookup_peer`,
+  `discover`, `send`, `fetch_inbox`, `listen` (SSE generator), `post_intent`,
+  `list_intents`. Auth timestamps are strictly increasing per client and a `409 replay` is
+  retried once. Network errors, 5xx, 408 and 429 are `relay_unavailable` (with
+  `retry_after_seconds`).
 
 ## Concepts
 

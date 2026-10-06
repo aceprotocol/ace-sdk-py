@@ -25,6 +25,9 @@ EXPECTED = {
     "verify_peer_record", "verify_registration_file", "fetch_registration_file", "validate_profile",
     "create_registration_request", "verify_registration_request", "create_auth_headers", "parse_auth_headers",
     "verify_auth_headers", "ReplayDetector", "ThreadStateMachine",
+    # pipeline
+    "ReceiveSource", "ReceiveOutcome", "PendingSend", "Intent", "ACEStore", "ThreadStore", "PeerStore",
+    "Inbox", "Outbox", "RelayClient", "MemoryStore", "FileStore",
 }
 
 

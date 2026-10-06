@@ -41,7 +41,12 @@ _DOMAIN_RE = re.compile(
 @dataclass(frozen=True)
 class VerifiedPeer:
     """A peer whose keys were verified. Obtain only from ``verify_peer_record``,
-    ``verify_registration_file`` or ``verify_registration_request``."""
+    ``verify_registration_file`` or ``verify_registration_request``.
+
+    Only the identity and keys are verified. ``profile`` is unverified relay metadata: it is
+    self-asserted by the peer and served by the relay, so never treat it as authenticated
+    (name, endpoint, pricing, etc. may be anything the peer chose to publish).
+    """
 
     ace_id: str
     scheme: SigningScheme

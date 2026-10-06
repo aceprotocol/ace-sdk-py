@@ -25,6 +25,7 @@ from .encryption import (
 from .envelope import decode_envelope, envelope_fingerprint, verify_envelope_signature
 from .errors import ACEError, ACEErrorCategory, ACEErrorCode
 from .identity import SoftwareIdentity, compute_ace_id
+from .inbox import Inbox, ReceiveOutcome, ReceiveSource
 from .limits import (
     DEFAULT_REPLAY_CAPACITY,
     KEM_CIPHERTEXT_SIZE,
@@ -41,7 +42,10 @@ from .limits import (
     TIMESTAMP_WINDOW_SECONDS,
 )
 from .messages import create_message, parse_message, validate_body
+from .outbox import Outbox
+from .peers import PeerStore
 from .registration import create_registration_request, verify_registration_request
+from .relay import Intent, RelayClient
 from .replay import ReplayDetector
 from .state_machine import (
     ThreadEvent,
@@ -50,6 +54,8 @@ from .state_machine import (
     ThreadState,
     ThreadStateMachine,
 )
+from .store import ACEStore, FileStore, MemoryStore
+from .threads import PendingSend, ThreadStore
 from .types import (
     ECONOMIC_TYPES,
     MESSAGE_TYPES,
@@ -98,8 +104,8 @@ __all__ = [
     "SignatureEnvelope", "RfqBody", "OfferBody", "AcceptBody", "RejectBody", "InvoiceBody",
     "ReceiptBody", "DeliverBody", "ConfirmBody", "InfoBody", "TextBody", "JSONValue", "JSONObject",
     "ParsedMessage", "ThreadState", "ThreadSnapshot", "ThreadHistoryEntry", "ThreadEvent",
-    "ReplayState", "RegistrationRequest", "RelayAuthRequest", "ACEErrorCode", "ACEErrorCategory",
-    "SoftwareIdentityExport",
+    "ReplayState", "RegistrationRequest", "RelayAuthRequest", "ReceiveSource", "ReceiveOutcome",
+    "PendingSend", "Intent", "ACEStore", "ACEErrorCode", "ACEErrorCategory", "SoftwareIdentityExport",
     # values
     "ACEError", "MESSAGE_TYPES", "ECONOMIC_TYPES", "is_message_type", "is_economic_type",
     "MAX_PLAINTEXT_BYTES", "MAX_PAYLOAD_BYTES", "MAX_ENVELOPE_BYTES", "MAX_JSON_DEPTH",
@@ -114,5 +120,6 @@ __all__ = [
     "VerifiedPeer", "verify_peer_record", "verify_registration_file", "fetch_registration_file",
     "validate_profile", "create_registration_request", "verify_registration_request",
     "create_auth_headers", "parse_auth_headers", "verify_auth_headers",
-    "ReplayDetector", "ThreadStateMachine",
+    "ReplayDetector", "ThreadStateMachine", "ThreadStore", "PeerStore", "Inbox", "Outbox",
+    "RelayClient", "MemoryStore", "FileStore",
 ]
