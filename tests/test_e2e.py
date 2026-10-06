@@ -8,6 +8,7 @@ import pytest
 
 from ace import (
     FileStore,
+    Inbox,
     MemoryStore,
     RelayClient,
     ThreadHistoryEntry,
@@ -93,6 +94,33 @@ def test_pull_returns_outcomes_in_order(world):
     assert [o.kind for o in result.outcomes] == ["delivered"] * 3
     assert [m.message_id for m in result.messages] == [e.message_id for e in sent]
     assert (result.delivered, result.duplicates, result.quarantined) == (3, 0, 0)
+
+
+def test_pull_max_pages_stop_and_invalid_arguments(world):
+    clock, relay, client, alice, bob = world
+    for i in range(6):
+        send(alice, client, bob, "text", {"message": f"m{i}"}, None)
+    stop = threading.Event()
+    handed: list[str] = []
+
+    def on_message(m):
+        handed.append(m.message_id)
+        if len(handed) == 4:
+            stop.set()
+
+    bob.inbox.close()
+    inbox = bob.inbox = Inbox.open(bob.identity, bob.store, bob.peers, on_message, clock=clock)
+    for bad in ({"max_pages": 0}, {"max_pages": True}, {"limit": 0}, {"limit": 101}):
+        r = inbox.pull(client, **bad)
+        assert (r.blocked.code, r.outcomes, r.has_more) == ("invalid_argument", [], False)
+    first = inbox.pull(client, limit=3, max_pages=1)
+    assert (first.delivered, first.blocked, first.has_more) == (3, None, True)
+    assert [m.body["message"] for m in first.messages] == ["m0", "m1", "m2"]
+    assert first.outcomes[0].message is first.messages[0]
+    stopped = inbox.pull(client, stop=stop)
+    assert (stopped.delivered, stopped.blocked, stopped.has_more) == (1, None, True)
+    rest = inbox.pull(client, limit=3)
+    assert (rest.delivered, rest.duplicates, rest.blocked, rest.has_more) == (2, 0, None, False)
 
 
 def test_follow_yields_initial_pull_then_live_with_on_live(world):

@@ -64,10 +64,12 @@ except ACEError as e:
         raise                                      # transient: retry deliver() later
 
 # receive: poll, or stream with SSE (reconnects with backoff)
-result = inbox.pull(relay)                         # PullResult(outcomes, blocked)
+result = inbox.pull(relay, max_pages=10)           # PullResult(outcomes, blocked, has_more)
 for outcome in result.outcomes:                    # ReceiveOutcome(kind="delivered" | "duplicate" | "quarantined")
     ...
 if result.blocked:                                 # the retryable error that stopped the drain
+    ...                                            # (invalid limit / max_pages: invalid_argument; pull never raises)
+if result.has_more:                                # max_pages or stop= ended it early: pull again
     ...
 # follow yields the initial pull's outcomes, then live ones; on_live runs once caught up and
 # connected, and again after every reconnect

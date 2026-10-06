@@ -79,11 +79,13 @@ class ReceiveOutcome:
 
 @dataclass(frozen=True)
 class PullResult:
-    """The result of ``Inbox.pull``: every non-retryable outcome in relay order, and the error
-    that stopped the drain (a retryable outcome or a fetch error), or None when drained."""
+    """The result of ``Inbox.pull``: every non-retryable outcome in relay order, the error that
+    stopped the drain (a retryable outcome, a fetch error or an invalid argument) or None, and
+    ``has_more`` when ``max_pages`` or ``stop`` ended it before the inbox was drained."""
 
     outcomes: list[ReceiveOutcome]
     blocked: ACEError | None
+    has_more: bool = False
 
     @property
     def messages(self) -> list[ParsedMessage]:
@@ -252,6 +254,7 @@ class Inbox:
         self._mutex = threading.RLock()
         self._failed = False
         self._closed = False
+        self._quarantine_count: int | None = None
         self._delivered_since_sweep = 0
         self._held_threads: Any = None
         lock = store.lock("receive", 0)
@@ -408,9 +411,15 @@ class Inbox:
         }))
         if existed:
             return
-        keys = self._store.list("quarantine/")
-        if len(keys) <= QUARANTINE_CAP:
+        # O(1) per insert: listed once per Inbox (it holds ``receive``, so it is the only
+        # writer); records are listed and read only when the cap is crossed (trim to 900).
+        if self._quarantine_count is None:
+            self._quarantine_count = len(self._store.list("quarantine/"))
+        else:
+            self._quarantine_count += 1
+        if self._quarantine_count <= QUARANTINE_CAP:
             return
+        keys = self._store.list("quarantine/")
         aged = []
         for k in keys:
             try:
@@ -422,6 +431,7 @@ class Inbox:
         aged.sort()
         for _, _, k in aged[: len(aged) - QUARANTINE_KEEP]:
             self._store.delete(k)
+        self._quarantine_count = min(len(keys), QUARANTINE_KEEP)
 
     def _hand_over(self, rec: _Delivery) -> ReceiveOutcome:
         """Steps 4-5 for a stored pending delivery."""
@@ -582,36 +592,61 @@ class Inbox:
 
     # --- relay drivers ---
 
-    def pull(self, relay: RelayClient, *, limit: int = MAX_INBOX_PAGE) -> PullResult:
-        """Fetch and receive queued messages from the cursor. Stops at the first retryable
-        outcome (or fetch error) and returns its error as ``blocked``; ``outcomes`` holds
-        every other outcome."""
+    def pull(
+        self,
+        relay: RelayClient,
+        *,
+        limit: int = MAX_INBOX_PAGE,
+        max_pages: int | None = None,
+        stop: threading.Event | None = None,
+    ) -> PullResult:
+        """Fetch and receive queued messages from the cursor, page by page. Stops at the first
+        retryable outcome (or fetch error) and returns its error as ``blocked``; ``outcomes``
+        holds every other outcome. ``max_pages`` bounds the pages fetched and ``stop`` ends the
+        pull before the next entry; both set ``has_more``. Never raises: an invalid ``limit``
+        (1-100) or ``max_pages`` (>= 1) is ``blocked`` with ``invalid_argument``. ``outcomes``
+        grows with the backlog; use ``max_pages`` or ``follow`` to bound memory."""
+        if type(limit) is not int or not 1 <= limit <= MAX_INBOX_PAGE:
+            return PullResult([], ACEError("invalid_argument", f"limit must be an integer in 1..{MAX_INBOX_PAGE}"))
+        if max_pages is not None and (type(max_pages) is not int or max_pages < 1):
+            return PullResult([], ACEError("invalid_argument", "max_pages must be an integer >= 1"))
         outcomes: list[ReceiveOutcome] = []
-        drain = self._drain(relay, limit)
+        drain = self._drain(relay, limit, max_pages, stop)
         while True:
             try:
                 outcome = next(drain)
             except StopIteration as done:
-                return PullResult(outcomes, done.value)
+                blocked, has_more = done.value
+                return PullResult(outcomes, blocked, has_more)
             if outcome.kind != "retryable":
                 outcomes.append(outcome)
 
-    def _drain(self, relay: RelayClient, limit: int) -> Generator[ReceiveOutcome, None, ACEError | None]:
-        """Yield each outcome of a drain (a retryable one last); return the blocking error."""
+    def _drain(
+        self, relay: RelayClient, limit: int, max_pages: int | None = None, stop: threading.Event | None = None,
+    ) -> Generator[ReceiveOutcome, None, tuple[ACEError | None, bool]]:
+        """Yield each outcome of a drain (a retryable one last); return the blocking error and
+        ``has_more``."""
         url = relay.base_url
         since = self.cursor(relay) or "-"
+        pages = 0
         while True:
+            if (max_pages is not None and pages >= max_pages) or (stop is not None and stop.is_set()):
+                return None, True
+            pages += 1
             try:
                 page = relay.fetch_inbox(self._identity, since=since, limit=limit)
             except ACEError as exc:
-                return exc
+                return exc, False
             for entry in page.entries:
+                # a stopped caller ends before the next entry; the cursor marks the spot
+                if stop is not None and stop.is_set():
+                    return None, True
                 outcome = self.receive(entry.message, ReceiveSource.relay(url, entry.stream_id))
                 yield outcome
                 if outcome.kind == "retryable":
-                    return outcome.error
+                    return outcome.error, False
             if len(page.entries) < limit:
-                return None
+                return None, False
             since = page.entries[-1].stream_id
 
     def follow(
@@ -625,11 +660,14 @@ class Inbox:
 
         ``on_live`` runs once the initial pull is done and the event stream is connected, and
         again after each reconnect. A ``retryable`` outcome is yielded, then its error raised;
-        a failed inbox fetch is raised. Set ``stop`` (or close the generator) to end.
+        a failed inbox fetch is raised. Set ``stop`` (or close the generator) to end. Outcomes
+        are streamed, not retained: the consumer's pace is the backpressure.
         """
-        blocked = yield from self._drain(relay, MAX_INBOX_PAGE)
+        blocked, has_more = yield from self._drain(relay, MAX_INBOX_PAGE, None, stop)
         if blocked is not None:
             raise blocked
+        if has_more:  # stopped
+            return
         url = relay.base_url
         for entry in relay.listen(self._identity, since=self.cursor(relay) or "-", stop=stop, on_open=on_live):
             outcome = self.receive(entry.message, ReceiveSource.relay(url, entry.stream_id))

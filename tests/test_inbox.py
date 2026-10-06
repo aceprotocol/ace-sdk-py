@@ -201,6 +201,31 @@ def test_quarantine_cap(pair, monkeypatch):
     assert sorted(bob.store.list("quarantine/")) == sorted(f"quarantine/{fp}.json" for fp in fps[3:])
 
 
+def test_quarantine_count_is_listed_once(pair):
+    clock, alice, bob = pair
+    inner = MemoryStore()
+    lists = [0]
+
+    class Counting(CountingStore):
+        def list(self, prefix):
+            if prefix == "quarantine/":
+                lists[0] += 1
+            return self.inner.list(prefix)
+
+    store = Counting(inner)
+    inbox = Inbox.open(bob.identity, store, PeerStore(store, clock=clock), bob.host, clock=clock)
+    PeerStore(store, clock=clock).pin_registration_file(alice.registration(), pinned_at=0)
+    env = rfq(alice, bob).to_dict()
+    for n in range(inbox_mod.QUARANTINE_CAP + 1):
+        # a fresh messageId under the old signature: invalid_signature, a new fingerprint
+        forged = {**env, "messageId": f"00000000-0000-4000-8000-{n:012d}"}
+        out = inbox.receive(forged, relay_src(n + 1))
+        assert out.kind == "quarantined" and out.error.code == "invalid_signature"
+    assert len(inner.list("quarantine/")) == inbox_mod.QUARANTINE_KEEP
+    assert lists[0] <= 2  # the first insert and the trim
+    inbox.close()
+
+
 def test_retryable_peer_error_does_not_advance_cursor(pair):
     clock, alice, bob = pair
 
