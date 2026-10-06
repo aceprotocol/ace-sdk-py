@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -58,16 +59,18 @@ class TestDecryptPayloadValidation:
 
 class TestReplayDetectorThreadSafety:
     def test_concurrent_replay_detection(self):
-        """Concurrent check_and_reserve for the same ID must accept exactly once."""
+        """Concurrent commit for the same ID must accept exactly once."""
         detector = ReplayDetector(100_000)
         results: list[bool] = []
         barrier = threading.Barrier(50)
 
-        def try_reserve():
-            barrier.wait()
-            results.append(detector.check_and_reserve("msg-race"))
+        now = int(time.time())
 
-        threads = [threading.Thread(target=try_reserve) for _ in range(50)]
+        def try_commit():
+            barrier.wait()
+            results.append(detector.commit("msg-race", now))
+
+        threads = [threading.Thread(target=try_commit) for _ in range(50)]
         for t in threads:
             t.start()
         for t in threads:
@@ -113,28 +116,6 @@ class TestParseMessageReplayIntegration:
                 state_machine=sm,
                 replay_detector=detector,
             )
-
-    def test_parse_without_detector_still_works(self):
-        sender = SoftwareIdentity.generate("ed25519")
-        receiver = SoftwareIdentity.generate("ed25519")
-        sm = ThreadStateMachine()
-
-        msg = create_message(
-            sender=sender,
-            recipient_pub_key=receiver.get_encryption_public_key(),
-            recipient_ace_id=receiver.get_ace_id(),
-            type_="text",
-            body={"message": "hello"},
-            state_machine=sm,
-        )
-
-        # Should work without replay_detector
-        parsed = parse_message(
-            msg, receiver,
-            sender.get_signing_public_key(),
-            state_machine=sm,
-        )
-        assert parsed.body["message"] == "hello"
 
 
 # ============================================================================

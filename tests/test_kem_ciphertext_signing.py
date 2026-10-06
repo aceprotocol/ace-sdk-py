@@ -74,8 +74,8 @@ def test_wrong_length_kem_ciphertext_rejected_before_decapsulation(length, monke
             msg, receiver, sender.get_signing_public_key(),
             ThreadStateMachine(), detector,
         )
-    # The reservation is released so a corrected message with this id can be parsed.
-    assert detector.check_and_reserve(msg.message_id) is True
+    # Nothing enters the seen store before the signature verifies.
+    assert detector.accepts(msg.message_id, msg.timestamp) is True
 
 
 def test_untampered_message_still_roundtrips():

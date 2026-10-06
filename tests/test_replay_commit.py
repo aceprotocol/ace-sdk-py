@@ -1,9 +1,9 @@
-"""Replay reservation lifecycle in parse_message.
+"""Replay commit rule in parse_message.
 
-A failure BEFORE the signature verifies releases the reservation: a forged
+Nothing enters the seen store before the signature verifies: a forged
 envelope that reuses a victim's messageId with a malformed kemCiphertext /
 payload / signature must not make the genuine message look like a replay later.
-Once the signature has verified, the reservation is kept on any later failure:
+Once the signature has verified, the entry is kept on any later failure:
 an authentic message is one-shot regardless of outcome, so a captured message
 that was rejected (e.g. by decryption or the state machine) cannot be replayed.
 """
@@ -31,7 +31,7 @@ def _parse(msg, bob, alice, detector):
 
 
 @pytest.mark.parametrize("field", ["kemCiphertext", "payload"])
-def test_invalid_base64_releases_reservation(field):
+def test_invalid_base64_leaves_seen_store_untouched(field):
     alice, bob, msg = _pair()
     d = msg.to_dict()
     d["encryption"][field] = "!!!not-base64!!!"
@@ -39,11 +39,11 @@ def test_invalid_base64_releases_reservation(field):
     detector = ReplayDetector()
     with pytest.raises(Exception):
         _parse(forged, bob, alice, detector)
-    # Reservation released: the genuine message with this id still parses.
+    # Not committed: the genuine message with this id still parses.
     assert _parse(msg, bob, alice, detector).body == {"message": "hi"}
 
 
-def test_invalid_signature_encoding_releases_reservation():
+def test_invalid_signature_encoding_leaves_seen_store_untouched():
     alice, bob, msg = _pair()
     d = msg.to_dict()
     d["signature"]["value"] = "!!!not-base64!!!"
@@ -59,7 +59,7 @@ def test_decryption_failure_after_valid_signature_consumes_message_id():
 
     The receiver shares Bob's signing key (so ``to`` and the signature check out)
     but holds a different X-Wing seed, so AES-GCM authentication fails after the
-    signature verified. The messageId stays reserved: the authentic message is
+    signature verified. The messageId stays committed: the authentic message is
     one-shot and cannot be presented again.
     """
     alice, bob, msg = _pair()
@@ -70,6 +70,6 @@ def test_decryption_failure_after_valid_signature_consumes_message_id():
     detector = ReplayDetector()
     with pytest.raises(Exception):
         _parse(msg, wrong_seed_bob, alice, detector)
-    assert detector.check_and_reserve(msg.message_id) is False
+    assert detector.accepts(msg.message_id, msg.timestamp) is False
     with pytest.raises(ValueError, match="Replay detected"):
         _parse(msg, bob, alice, detector)

@@ -33,47 +33,99 @@ def test_validate_message_id_rejects_non_uuid():
         validate_message_id("msg-001")
 
 
-def test_replay_accept_new():
-    d = ReplayDetector(100)
-    assert d.check_and_reserve("msg-001") is True
-    assert d.check_and_reserve("msg-002") is True
+T = 1_800_000_000
 
 
-def test_replay_reject_duplicate():
-    d = ReplayDetector(100)
-    assert d.check_and_reserve("msg-001") is True
-    assert d.check_and_reserve("msg-001") is False
+def _id(n: int) -> str:
+    return f"550e8400-e29b-41d4-a716-4466554400{n:02d}"
 
 
-def test_replay_eviction():
-    d = ReplayDetector(3)
-    d.check_and_reserve("a")
-    d.check_and_reserve("b")
-    d.check_and_reserve("c")
-    d.check_and_reserve("d")
-    assert d.check_and_reserve("a") is True  # evicted
+@pytest.fixture
+def clock(monkeypatch):
+    import types
+
+    from ace import security
+    c = types.SimpleNamespace(now=T)
+    monkeypatch.setattr(security, "time", types.SimpleNamespace(time=lambda: c.now))
+    return c
 
 
-def test_replay_export_import():
-    d = ReplayDetector(100)
-    d.check_and_reserve("msg-001")
-    d.check_and_reserve("msg-002")
-
-    exported = d.export()
-    assert "msg-001" in exported
-
-    restored = ReplayDetector.from_export(exported, 100)
-    assert restored.check_and_reserve("msg-001") is False
-    assert restored.check_and_reserve("msg-003") is True
+def test_replay_starts_with_horizon_now_minus_5_min(clock):
+    assert ReplayDetector().horizon == T - 300
 
 
-def test_replay_from_export_respects_capacity():
-    """from_export with small capacity should only keep the most recent entries."""
-    ids = [f"msg-{i:03d}" for i in range(10)]
-    restored = ReplayDetector.from_export(ids, capacity=3)
-    # Only the last 3 should be retained
-    assert restored.check_and_reserve("msg-007") is False  # retained
-    assert restored.check_and_reserve("msg-008") is False  # retained
-    assert restored.check_and_reserve("msg-009") is False  # retained
-    assert restored.check_and_reserve("msg-000") is True   # evicted
-    assert restored.check_and_reserve("msg-006") is True   # evicted
+def test_replay_rejects_duplicates_and_timestamps_at_or_below_horizon(clock):
+    d = ReplayDetector()
+    assert d.commit(_id(1), T) is True
+    assert d.accepts(_id(1), T) is False
+    assert d.commit(_id(1), T) is False
+    assert d.accepts(_id(2), T - 300) is False
+    assert d.accepts(_id(2), T - 299) is True
+
+
+def test_replay_keeps_entry_until_below_floor_then_raises_horizon(clock):
+    d = ReplayDetector()
+    d.commit(_id(1), T + 300)  # max future drift: acceptable until T + 600
+    clock.now = T + 450
+    d.commit(_id(2), T + 450)
+    assert d.accepts(_id(1), T + 300) is False
+    clock.now = T + 650
+    d.commit(_id(3), T + 650)  # floor T + 350 > T + 300: _id(1) removed
+    assert d.horizon == T + 300
+    assert d.accepts(_id(1), T + 300) is False
+
+
+def test_replay_fixed_earlier_floor_keeps_entries_until_capacity(clock):
+    # A store that has been running since before the receiver went offline.
+    d = ReplayDetector.from_export({"horizon": T - 7200, "entries": []}, capacity=2)
+    d.commit(_id(1), T - 3000, T - 7200)
+    d.commit(_id(2), T - 1000, T - 7200)
+    assert d.horizon == T - 7200  # nothing removed
+    d.commit(_id(3), T - 2000, T - 7200)
+    assert d.horizon == T - 3000
+
+
+def test_replay_capacity_removes_smallest_timestamp_not_oldest_insertion(clock):
+    d = ReplayDetector(2)
+    d.commit(_id(1), T - 10)
+    d.commit(_id(2), T - 50)
+    d.commit(_id(3), T - 20)
+    assert d.horizon == T - 50
+    for n, ts in [(1, T - 10), (2, T - 50), (3, T - 20)]:
+        assert d.accepts(_id(n), ts) is False
+    assert d.accepts(_id(4), T - 50) is False
+    assert d.accepts(_id(4), T - 49) is True
+
+
+def test_replay_export_import_round_trip(clock):
+    d = ReplayDetector()
+    d.commit(_id(1), T - 10)
+    d.commit(_id(2), T - 20)
+    restored = ReplayDetector.from_export(d.export())
+    assert restored.horizon == d.horizon
+    assert restored.accepts(_id(1), T - 10) is False
+    assert restored.accepts(_id(2), T - 20) is False
+    assert restored.accepts(_id(3), T - 20) is True
+
+
+def test_replay_from_export_over_capacity_raises_horizon(clock):
+    entries = [[_id(1), T - 30], [_id(2), T - 10], [_id(3), T - 20]]
+    restored = ReplayDetector.from_export({"horizon": T - 300, "entries": entries}, capacity=2)
+    assert restored.horizon == T - 30
+    assert len(restored.export()["entries"]) == 2
+
+
+@pytest.mark.parametrize("state, error", [
+    ({"horizon": -1, "entries": []}, "invalid replay state"),
+    ({"horizon": T, "entries": [["msg-1", T + 1]]}, "invalid message_id"),
+    ({"horizon": T, "entries": [[_id(1), T]]}, "invalid entry"),
+    ({"horizon": T, "entries": [[_id(1), T + 1], [_id(1), T + 2]]}, "invalid entry"),
+])
+def test_replay_from_export_rejects_malformed_state(state, error):
+    with pytest.raises(ValueError, match=error):
+        ReplayDetector.from_export(state)
+
+
+def test_replay_rejects_non_positive_capacity():
+    with pytest.raises(ValueError, match="capacity"):
+        ReplayDetector(0)

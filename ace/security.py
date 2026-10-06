@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
+import heapq
 import re
 import threading
 import time
-from collections import OrderedDict
 
 MAX_DRIFT_SECONDS = 300  # 5 minutes
 _MESSAGE_ID_V4_PATTERN = re.compile(
@@ -20,93 +20,104 @@ def validate_message_id(message_id: str) -> None:
         raise ValueError(f"Invalid message_id: expected UUID v4, got '{message_id[:50]}'")
 
 
-def check_timestamp_freshness(timestamp: int) -> None:
-    """Check that a timestamp is within the 5-minute freshness window."""
+def check_timestamp_freshness(timestamp: int, oldest_timestamp: int | None = None) -> None:
+    """Check ``floor <= timestamp <= now + 5 min``.
+
+    The floor is ``now - 5 min``, or ``oldest_timestamp`` for offline delivery.
+    """
+    if not _is_timestamp(timestamp):
+        raise ValueError("Invalid timestamp: must be a non-negative integer")
     now = int(time.time())
-    drift = abs(now - timestamp)
-    if drift > MAX_DRIFT_SECONDS:
+    if oldest_timestamp is not None and (not _is_timestamp(oldest_timestamp) or oldest_timestamp > now):
+        raise ValueError("Invalid offline timestamp floor")
+    floor = now - MAX_DRIFT_SECONDS if oldest_timestamp is None else oldest_timestamp
+    if timestamp < floor or timestamp > now + MAX_DRIFT_SECONDS:
+        drift = abs(now - timestamp)
         raise ValueError(
             f"Timestamp not fresh: drift {drift}s exceeds max {MAX_DRIFT_SECONDS}s"
         )
 
 
+def _is_timestamp(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 class ReplayDetector:
-    """Thread-safe in-memory replay detector with TTL-based eviction.
+    """Thread-safe seen store with a replay horizon (06-security § Replay Protection).
 
-    Messages are evicted after ``ttl_seconds`` (default: matches the freshness
-    window of 300 s).  A hard ``capacity`` cap prevents unbounded memory growth
-    under burst traffic — when reached, the oldest entry is evicted regardless
-    of TTL.
+    Holds ``(message_id, timestamp)`` for every message whose signature verified.
+    Rejects any message with ``timestamp <= horizon``, so an entry can be removed
+    once the horizon covers it: only the smallest-timestamp entry is removed, and
+    the horizon moves up to its timestamp. Removal happens when the entry falls
+    below the acceptance floor or the store exceeds ``capacity``.
 
-    Callers SHOULD persist state via ``export()`` / ``from_export()`` across
-    restarts to avoid a replay window during the freshness period after restart.
+    Callers MUST persist state via ``export()`` / ``from_export()`` across restarts.
     """
 
-    def __init__(
-        self,
-        capacity: int = 100_000,
-        ttl_seconds: int = MAX_DRIFT_SECONDS,
-    ) -> None:
+    def __init__(self, capacity: int = 100_000) -> None:
+        if not _is_timestamp(capacity) or capacity < 1:
+            raise ValueError("ReplayDetector capacity must be a positive integer")
         self._capacity = capacity
-        self._ttl = ttl_seconds
-        # Stores message_id -> insertion_timestamp (monotonic)
-        self._seen: OrderedDict[str, float] = OrderedDict()
+        self._ids: set[str] = set()
+        self._heap: list[tuple[int, str]] = []  # min-heap of (timestamp, message_id)
+        self._horizon = int(time.time()) - MAX_DRIFT_SECONDS
         self._lock = threading.Lock()
 
-    def _evict_expired(self) -> None:
-        """Remove entries older than TTL.  Caller must hold ``_lock``."""
-        cutoff = time.monotonic() - self._ttl
-        while self._seen:
-            # Peek at the oldest entry
-            _, ts = next(iter(self._seen.items()))
-            if ts <= cutoff:
-                self._seen.popitem(last=False)
-            else:
-                break
+    @property
+    def horizon(self) -> int:
+        return self._horizon
 
-    def check_and_reserve(self, message_id: str) -> bool:
-        """Atomically check if a messageId has been seen and reserve it.
-
-        Returns True if the message is new (accepted), False if duplicate (rejected).
-        Thread-safe: uses a lock to prevent TOCTOU race conditions.
-        """
+    def accepts(self, message_id: str, timestamp: int) -> bool:
+        """Pipeline steps 2–3: timestamp above the horizon and message_id unseen."""
         with self._lock:
-            self._evict_expired()
+            return self._accepts(message_id, timestamp)
 
-            if message_id in self._seen:
+    def commit(self, message_id: str, timestamp: int, floor: int | None = None) -> bool:
+        """Pipeline step 4: record a message whose signature has verified.
+
+        Returns False if it is a duplicate or at/below the horizon. ``floor`` is
+        the acceptance floor (default ``now - 5 min``).
+        """
+        if floor is None:
+            floor = int(time.time()) - MAX_DRIFT_SECONDS
+        with self._lock:
+            if not self._accepts(message_id, timestamp):
                 return False
-
-            # Hard capacity cap — evict oldest regardless of TTL
-            if len(self._seen) >= self._capacity:
-                self._seen.popitem(last=False)
-
-            self._seen[message_id] = time.monotonic()
+            self._ids.add(message_id)
+            heapq.heappush(self._heap, (timestamp, message_id))
+            self._evict(floor)
             return True
 
-    def release(self, message_id: str) -> None:
-        """Release a previously reserved message ID after processing failure."""
+    def export(self) -> dict:
         with self._lock:
-            self._seen.pop(message_id, None)
-
-    def has_seen(self, message_id: str) -> bool:
-        with self._lock:
-            self._evict_expired()
-            return message_id in self._seen
-
-    def export(self) -> list[str]:
-        with self._lock:
-            self._evict_expired()
-            return list(self._seen.keys())
+            return {"horizon": self._horizon, "entries": [[mid, ts] for ts, mid in self._heap]}
 
     @classmethod
-    def from_export(
-        cls,
-        message_ids: list[str],
-        capacity: int = 100_000,
-        ttl_seconds: int = MAX_DRIFT_SECONDS,
-    ) -> "ReplayDetector":
-        detector = cls(capacity, ttl_seconds)
-        now = time.monotonic()
-        for mid in message_ids[-capacity:]:
-            detector._seen[mid] = now
+    def from_export(cls, data: dict, capacity: int = 100_000) -> "ReplayDetector":
+        detector = cls(capacity)
+        horizon = data.get("horizon") if isinstance(data, dict) else None
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not _is_timestamp(horizon) or not isinstance(entries, list):
+            raise ValueError("from_export: invalid replay state")
+        detector._horizon = horizon
+        for entry in entries:
+            mid, ts = entry if isinstance(entry, (list, tuple)) and len(entry) == 2 else (None, None)
+            if not isinstance(mid, str) or not _MESSAGE_ID_V4_PATTERN.match(mid):
+                raise ValueError(f"from_export: invalid message_id '{str(mid)[:50]}'")
+            if not _is_timestamp(ts) or ts <= horizon or mid in detector._ids:
+                raise ValueError("from_export: invalid entry")
+            detector._ids.add(mid)
+            detector._heap.append((ts, mid))
+        heapq.heapify(detector._heap)
+        detector._evict(0)
         return detector
+
+    def _accepts(self, message_id: str, timestamp: int) -> bool:
+        return timestamp > self._horizon and message_id not in self._ids
+
+    def _evict(self, floor: int) -> None:
+        """Remove smallest-timestamp entries while below ``floor`` or over capacity."""
+        while self._heap and (self._heap[0][0] < floor or len(self._heap) > self._capacity):
+            ts, mid = heapq.heappop(self._heap)
+            self._ids.discard(mid)
+            self._horizon = ts

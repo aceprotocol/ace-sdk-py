@@ -146,10 +146,11 @@ def test_encrypted_message_decrypts_for_bob(monkeypatch):
     """Full wire message alice -> bob: verify signature, decrypt, compare body.
 
     The vector's timestamp is fixed, so the 5-minute freshness check is disabled
-    for this test only; every other pipeline step runs for real.
+    and the replay horizon starts at 0 for this test only; every other pipeline
+    step runs for real.
     """
     import ace.messages as messages_mod
-    monkeypatch.setattr(messages_mod, "check_timestamp_freshness", lambda _ts: None)
+    monkeypatch.setattr(messages_mod, "check_timestamp_freshness", lambda *_: None)
 
     v = _load_vectors()
     em = v["vectors"]["encryptedMessage"]
@@ -170,7 +171,8 @@ def test_encrypted_message_decrypts_for_bob(monkeypatch):
         bob,
         _b64(alice["signingPublicKey"]),
         ThreadStateMachine(),
-        ReplayDetector(),
+        # The fixed vector timestamp is far below a new store's horizon.
+        ReplayDetector.from_export({"horizon": 0, "entries": []}),
         sender_encryption_pub_key=_b64(alice["encryptionPublicKey"]),
     )
     assert parsed.body == em["expectedBody"]

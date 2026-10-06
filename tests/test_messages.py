@@ -144,7 +144,7 @@ class TestParseMessage:
         parsed = parse_message(
             msg, receiver,
             sender.get_signing_public_key(),
-            state_machine=sm,
+            state_machine=sm, replay_detector=ReplayDetector(),
         )
         assert parsed.type == "text"
         assert parsed.body == {"message": "Hello from ACE!"}
@@ -166,7 +166,7 @@ class TestParseMessage:
         )
 
         with pytest.raises(ValueError, match="does not match"):
-            parse_message(msg, receiver, other.get_signing_public_key(), state_machine=sm)
+            parse_message(msg, receiver, other.get_signing_public_key(), state_machine=sm, replay_detector=ReplayDetector())
 
     def test_rejects_non_uuid_message_id(self):
         sender = SoftwareIdentity.generate("ed25519")
@@ -184,7 +184,7 @@ class TestParseMessage:
         msg.message_id = "../evil"
 
         with pytest.raises(ValueError, match="UUID v4"):
-            parse_message(msg, receiver, sender.get_signing_public_key(), state_machine=sm)
+            parse_message(msg, receiver, sender.get_signing_public_key(), state_machine=sm, replay_detector=ReplayDetector())
 
     def test_rejects_conversation_id_not_bound_to_encryption_keys(self):
         sender = SoftwareIdentity.generate("ed25519")
@@ -227,7 +227,7 @@ class TestParseMessage:
                 receiver,
                 sender.get_signing_public_key(),
                 state_machine=ThreadStateMachine(),
-                sender_encryption_pub_key=sender.get_encryption_public_key(),
+                sender_encryption_pub_key=sender.get_encryption_public_key(), replay_detector=ReplayDetector(),
             )
 
     def test_parses_strictly_from_sender_registration(self):
@@ -245,7 +245,7 @@ class TestParseMessage:
             state_machine=sm,
         )
 
-        parsed = parse_message_from_registration(msg, receiver, reg, state_machine=sm)
+        parsed = parse_message_from_registration(msg, receiver, reg, state_machine=sm, replay_detector=ReplayDetector())
         assert parsed.body == {"message": "strict registration path"}
 
     def test_rejects_invalid_base64_payload(self):
@@ -264,7 +264,7 @@ class TestParseMessage:
         msg.encryption.payload = "!!!not-base64!!!"
 
         with pytest.raises(ValueError, match="Base64"):
-            parse_message(msg, receiver, sender.get_signing_public_key(), state_machine=sm)
+            parse_message(msg, receiver, sender.get_signing_public_key(), state_machine=sm, replay_detector=ReplayDetector())
 
     def test_rejects_oversized_payload_before_base64_decode(self):
         sender = SoftwareIdentity.generate("ed25519")
@@ -290,7 +290,7 @@ class TestParseMessage:
         )
 
         with pytest.raises(ValueError, match="Payload too large"):
-            parse_message(msg, receiver, sender.get_signing_public_key(), state_machine=ThreadStateMachine())
+            parse_message(msg, receiver, sender.get_signing_public_key(), state_machine=ThreadStateMachine(), replay_detector=ReplayDetector())
 
     def test_rejects_tampered_thread_id(self):
         sender = SoftwareIdentity.generate("ed25519")

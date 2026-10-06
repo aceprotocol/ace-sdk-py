@@ -79,7 +79,7 @@ def test_reject_invalid_signature():
     )
 
     with pytest.raises(ValueError, match="does not match|Signature"):
-        parse_message(msg, receiver, impersonator.get_signing_public_key(), state_machine=sm)
+        parse_message(msg, receiver, impersonator.get_signing_public_key(), state_machine=sm, replay_detector=ReplayDetector())
 
 
 def test_replay_detection():
@@ -96,8 +96,8 @@ def test_replay_detection():
         state_machine=ThreadStateMachine(),
     )
 
-    assert detector.check_and_reserve(msg.message_id) is True
-    assert detector.check_and_reserve(msg.message_id) is False
+    assert detector.commit(msg.message_id, msg.timestamp) is True
+    assert detector.commit(msg.message_id, msg.timestamp) is False
 
 
 def test_cross_scheme_communication():
@@ -115,7 +115,7 @@ def test_cross_scheme_communication():
         body={"message": "Ed25519 → secp256k1"},
         state_machine=sm,
     )
-    parsed1 = parse_message(msg1, agent_sec, agent_ed.get_signing_public_key(), state_machine=sm)
+    parsed1 = parse_message(msg1, agent_sec, agent_ed.get_signing_public_key(), state_machine=sm, replay_detector=ReplayDetector())
     assert parsed1.body == {"message": "Ed25519 → secp256k1"}
 
     # secp256k1 → ed25519
@@ -127,5 +127,5 @@ def test_cross_scheme_communication():
         body={"message": "secp256k1 → Ed25519"},
         state_machine=sm,
     )
-    parsed2 = parse_message(msg2, agent_ed, agent_sec.get_signing_public_key(), state_machine=sm)
+    parsed2 = parse_message(msg2, agent_ed, agent_sec.get_signing_public_key(), state_machine=sm, replay_detector=ReplayDetector())
     assert parsed2.body == {"message": "secp256k1 → Ed25519"}

@@ -297,15 +297,15 @@ def parse_message(
     receiver: ACEIdentity,
     sender_signing_pub_key: bytes,
     state_machine: ThreadStateMachine,
-    replay_detector: ReplayDetector | None = None,
+    replay_detector: ReplayDetector,
     sender_encryption_pub_key: bytes | None = None,
+    oldest_timestamp: int | None = None,
 ) -> ParsedMessage:
     """Verify signature, decrypt, and validate a received message.
 
     Args:
-        replay_detector: Optional ReplayDetector instance. When provided, the
-            message will be checked for replay attacks and automatically reserved.
-            Strongly recommended for production use.
+        oldest_timestamp: Offline acceptance floor; use the same value for every
+            message of one backlog.
         sender_encryption_pub_key: Optional sender X-Wing public key. When
             provided, `conversation_id` is recomputed from the sender and
             recipient encryption keys and must match the envelope value.
@@ -344,77 +344,63 @@ def parse_message(
     if msg.thread_id is not None:
         validate_thread_id(msg.thread_id)
 
-    # 2. Timestamp freshness (pipeline step 2) — cheap check first
-    check_timestamp_freshness(msg.timestamp)
+    # 2–3. Timestamp freshness, replay horizon and seen check — before expensive crypto ops
+    check_timestamp_freshness(msg.timestamp, oldest_timestamp)
+    replay_error = ValueError(
+        f"Replay detected: message {msg.message_id} already processed or below replay horizon"
+    )
+    if not replay_detector.accepts(msg.message_id, msg.timestamp):
+        raise replay_error
 
-    # 3. Replay detection (pipeline step 3) — before expensive crypto ops
-    # Economic messages REQUIRE replay detection — replaying payment/receipt
-    # messages could cause double-crediting or duplicate fulfillment.
-    if is_economic_type(msg.type) and replay_detector is None:
+    # 4. Verify signature BEFORE decryption (pipeline step 4).
+    estimated_payload_bytes = _estimate_base64_decoded_length(msg.encryption.payload)
+    if estimated_payload_bytes > MAX_PAYLOAD_SIZE:
         raise ValueError(
-            f"Economic message type '{msg.type}' requires a ReplayDetector for security"
+            f"Payload too large: estimated decoded size {estimated_payload_bytes} "
+            f"bytes exceeds max {MAX_PAYLOAD_SIZE}"
         )
-    if replay_detector is not None:
-        if not replay_detector.check_and_reserve(msg.message_id):
-            raise ValueError(f"Replay detected: message {msg.message_id} already processed")
-
-    # Replay rule: a failure BEFORE the signature verifies releases the reservation
-    # (a forged envelope must not burn a messageId), but once the signature has
-    # verified the reservation is kept on ANY later failure — an authentic message
-    # is one-shot regardless of outcome.
-    authenticated = False
+    payload_bytes = from_base64(msg.encryption.payload)
+    # Length-checked before any signature or KEM work: a relay cannot make us
+    # decapsulate a malformed ciphertext.
+    kem_ciphertext = decode_kem_ciphertext(msg.encryption.kem_ciphertext)
+    message_payload = _build_signed_message_payload(
+        msg.type,
+        msg.to_id,
+        msg.conversation_id,
+        msg.message_id,
+        msg.thread_id,
+        kem_ciphertext,
+        payload_bytes,
+    )
+    sign_data = build_sign_data("message", msg.from_id, msg.timestamp, message_payload)
+    sig_bytes = decode_signature(msg.signature.value, msg.signature.scheme)
+    valid = False
     try:
-        # 4. Verify signature BEFORE decryption (pipeline step 4).
-        estimated_payload_bytes = _estimate_base64_decoded_length(msg.encryption.payload)
-        if estimated_payload_bytes > MAX_PAYLOAD_SIZE:
-            raise ValueError(
-                f"Payload too large: estimated decoded size {estimated_payload_bytes} "
-                f"bytes exceeds max {MAX_PAYLOAD_SIZE}"
-            )
-        payload_bytes = from_base64(msg.encryption.payload)
-        # Length-checked before any signature or KEM work: a relay cannot make us
-        # decapsulate a malformed ciphertext.
-        kem_ciphertext = decode_kem_ciphertext(msg.encryption.kem_ciphertext)
-        message_payload = _build_signed_message_payload(
-            msg.type,
-            msg.to_id,
-            msg.conversation_id,
-            msg.message_id,
-            msg.thread_id,
-            kem_ciphertext,
-            payload_bytes,
-        )
-        sign_data = build_sign_data("message", msg.from_id, msg.timestamp, message_payload)
-        sig_bytes = decode_signature(msg.signature.value, msg.signature.scheme)
-        valid = False
-        try:
-            valid = verify_signature(
-                sign_data, sig_bytes, msg.signature.scheme, sender_signing_pub_key,
-            )
-        except Exception:
-            pass
-        if not valid:
-            raise ValueError("Signature verification failed")
-        authenticated = True
-
-        # 5. Decrypt body (pipeline step 5) — kem_ciphertext is signature-verified
-        # above, so decapsulation uses the authenticated ciphertext.
-        decrypted = receiver.decrypt_payload(kem_ciphertext, payload_bytes, msg.conversation_id)
-        body = json.loads(decrypted.decode("utf-8"))
-
-        # 6. Validate body schema (pipeline step 6)
-        validate_body(msg.type, body)
-        thread_key = _normalize_thread_id(msg.thread_id)
-        _validate_thread_references(msg.type, body, state_machine, msg.conversation_id, thread_key)
-
-        # 7. State machine validation (pipeline step 7)
-        state_machine.transition(
-            msg.conversation_id, thread_key, msg.type, msg.message_id, msg.timestamp,
+        valid = verify_signature(
+            sign_data, sig_bytes, msg.signature.scheme, sender_signing_pub_key,
         )
     except Exception:
-        if replay_detector is not None and not authenticated:
-            replay_detector.release(msg.message_id)
-        raise
+        pass
+    if not valid:
+        raise ValueError("Signature verification failed")
+    # Commit now: an authentic message is one-shot, even if a later step fails.
+    if not replay_detector.commit(msg.message_id, msg.timestamp, oldest_timestamp):
+        raise replay_error
+
+    # 5. Decrypt body (pipeline step 5) — kem_ciphertext is signature-verified
+    # above, so decapsulation uses the authenticated ciphertext.
+    decrypted = receiver.decrypt_payload(kem_ciphertext, payload_bytes, msg.conversation_id)
+    body = json.loads(decrypted.decode("utf-8"))
+
+    # 6. Validate body schema (pipeline step 6)
+    validate_body(msg.type, body)
+    thread_key = _normalize_thread_id(msg.thread_id)
+    _validate_thread_references(msg.type, body, state_machine, msg.conversation_id, thread_key)
+
+    # 7. State machine validation (pipeline step 7)
+    state_machine.transition(
+        msg.conversation_id, thread_key, msg.type, msg.message_id, msg.timestamp,
+    )
 
     return ParsedMessage(
         message_id=msg.message_id,
@@ -433,7 +419,8 @@ def parse_message_from_registration(
     receiver: ACEIdentity,
     sender_registration: RegistrationFile,
     state_machine: ThreadStateMachine,
-    replay_detector: ReplayDetector | None = None,
+    replay_detector: ReplayDetector,
+    oldest_timestamp: int | None = None,
 ) -> ParsedMessage:
     """Strict parse path that derives sender keys from a validated registration file."""
     validate_registration_file(sender_registration)
@@ -447,6 +434,7 @@ def parse_message_from_registration(
         state_machine=state_machine,
         replay_detector=replay_detector,
         sender_encryption_pub_key=get_registration_encryption_public_key(sender_registration),
+        oldest_timestamp=oldest_timestamp,
     )
 
 
@@ -455,7 +443,8 @@ def parse_message_from_peer(
     receiver: ACEIdentity,
     sender: VerifiedPeer,
     state_machine: ThreadStateMachine,
-    replay_detector: ReplayDetector | None = None,
+    replay_detector: ReplayDetector,
+    oldest_timestamp: int | None = None,
 ) -> ParsedMessage:
     """Safe path for messages whose sender keys came from a relay.
 
@@ -471,4 +460,5 @@ def parse_message_from_peer(
         state_machine=state_machine,
         replay_detector=replay_detector,
         sender_encryption_pub_key=sender.encryption_public_key,
+        oldest_timestamp=oldest_timestamp,
     )

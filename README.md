@@ -39,7 +39,7 @@ Signing uses Ed25519 or secp256k1 (the ACE ID is `sha256(signingPublicKey)`);
 `ml-dsa-65` is reserved in the signing-scheme registry but not implemented.
 
 ```python
-from ace import SoftwareIdentity, ThreadStateMachine, create_message, parse_message
+from ace import ReplayDetector, SoftwareIdentity, ThreadStateMachine, create_message, parse_message
 
 alice = SoftwareIdentity.generate("ed25519")
 bob = SoftwareIdentity.generate("secp256k1")
@@ -48,9 +48,12 @@ msg = create_message(
     alice, bob.get_encryption_public_key(), bob.get_ace_id(),
     "text", {"message": "hello"}, ThreadStateMachine(),
 )
-parsed = parse_message(msg, bob, alice.get_signing_public_key(), ThreadStateMachine())
+parsed = parse_message(msg, bob, alice.get_signing_public_key(), ThreadStateMachine(), ReplayDetector())
 assert parsed.body == {"message": "hello"}
 ```
+
+`ReplayDetector` is the seen store with a replay horizon; persist it across restarts with
+`export()` / `ReplayDetector.from_export()`.
 
 The low-level primitives are in `ace.xwing` (`public_key_from_seed`, `encapsulate`,
 `decapsulate`, plus the byte-length checks `check_public_key` / `check_ciphertext` /
