@@ -43,11 +43,26 @@ class Outbox:
     - ``abandon`` drops a pending send (economic: and its thread head entry).
     """
 
-    def __init__(self, identity: ACEIdentity, store: ACEStore, *, clock: Callable[[], int] | None = None) -> None:
+    def __init__(self, *_: object, **__: object) -> None:
+        raise ACEError("invalid_argument", "use Outbox.open(...)")
+
+    @classmethod
+    def open(cls, identity: ACEIdentity, store: ACEStore, *, clock: Callable[[], int] | None = None) -> "Outbox":
+        """Create an outbox. Under lock ``threads``, repairs thread records from
+        ``deliveries/`` whose snapshot strictly extends the stored history (an Inbox that
+        crashed between its delivery and thread writes); divergence is ``storage_failed``.
+        Never hands messages over and never touches the replay state."""
+        from .inbox import load_deliveries, repair_thread
+
+        self = object.__new__(cls)
         self._identity = identity
         self._store = store
         self._clock = clock
         self._threads = ThreadStore(store, identity.get_ace_id(), clock=clock)
+        with self._threads.locked():
+            for rec in load_deliveries(store, identity.get_ace_id()):
+                repair_thread(self._threads, rec)
+        return self
 
     def _now(self) -> int:
         return int(self._clock()) if self._clock is not None else int(time.time())

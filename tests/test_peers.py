@@ -87,7 +87,10 @@ def test_registration_file_never_rotates(store):
     reg = bob.to_registration_file(name="Bob", endpoint="https://bob.example/ace")
     pinned = peers.pin_registration_file(reg, pinned_at=100)
     assert pinned.source == "registration" and pinned.registered_at == 100
+    before = store.read(_peer_key(bob.get_ace_id()))
+    clock.t += 1000
     assert peers.pin_registration_file(reg, pinned_at=500).registered_at == 100  # kept exactly
+    assert store.read(_peer_key(bob.get_ace_id())) == before  # no write: fetchedAt unchanged
     reg2 = rotated(bob).to_registration_file(name="Bob", endpoint="https://bob.example/ace")
     with raises("stale_peer_binding"):
         peers.pin_registration_file(reg2, pinned_at=10**9)

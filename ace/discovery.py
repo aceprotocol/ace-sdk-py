@@ -298,9 +298,32 @@ def is_blocked_address(ip: str) -> bool:
     return any(addr in n for n in _V4_BLOCKED)
 
 
+_getaddrinfo = socket.getaddrinfo  # injectable resolver (tests)
+_create_connection = socket.create_connection
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS to a pre-validated IP: no second DNS lookup; SNI and certificate
+    verification still use ``domain``."""
+
+    def __init__(self, domain: str, ip: str, timeout: float) -> None:
+        super().__init__(domain, 443, timeout=timeout, context=ssl.create_default_context())
+        self._ace_ip = ip
+        self._ace_ctx = ssl.create_default_context()  # CERT_REQUIRED + hostname check
+
+    def connect(self) -> None:
+        raw = _create_connection((self._ace_ip, 443), timeout=self.timeout)
+        try:
+            self.sock = self._ace_ctx.wrap_socket(raw, server_hostname=self.host)
+        except BaseException:
+            raw.close()
+            raise
+
+
 def _resolve(domain: str, allow_private: bool) -> list[str]:
+    """Resolve once; ``blocked_address`` if ANY address is in a blocked range."""
     try:
-        infos = socket.getaddrinfo(domain, 443, proto=socket.IPPROTO_TCP)
+        infos = _getaddrinfo(domain, 443, proto=socket.IPPROTO_TCP)
     except (socket.gaierror, OSError) as exc:
         raise ACEError("fetch_failed", f"DNS resolution failed: {exc}") from None
     ips: list[str] = []
@@ -335,11 +358,9 @@ def fetch_registration_file(
     if type(max_bytes) is not int or max_bytes < 1:
         raise ACEError("invalid_argument", "max_bytes must be a positive integer")
     ip = _resolve(domain, allow_private_addresses)[0]
-    conn = http.client.HTTPSConnection(domain, 443, timeout=timeout)
+    conn = _PinnedHTTPSConnection(domain, ip, timeout)
     try:
         try:
-            raw_sock = socket.create_connection((ip, 443), timeout=timeout)
-            conn.sock = ssl.create_default_context().wrap_socket(raw_sock, server_hostname=domain)
             conn.request("GET", "/.well-known/ace.json", headers={"Accept": "application/json"})
             resp = conn.getresponse()
         except (OSError, ssl.SSLError, http.client.HTTPException) as exc:

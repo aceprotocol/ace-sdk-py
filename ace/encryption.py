@@ -92,6 +92,8 @@ def decrypt_with_key(
         shared_secret = key.decapsulate(kem_ciphertext)
     except ACEError as exc:
         raise ACEError("decryption_failed", exc.message) from None
+    except Exception as exc:  # pyca ValueError (e.g. all-zero X25519 output), bad lengths, ...
+        raise ACEError("decryption_failed", f"KEM decapsulation failed: {type(exc).__name__}") from None
     payload = bytes(payload)
     try:
         return AESGCM(_aes_key(shared_secret, conversation_id)).decrypt(
@@ -99,6 +101,8 @@ def decrypt_with_key(
         )
     except InvalidTag:
         raise ACEError("decryption_failed", "AEAD authentication failed") from None
+    except Exception as exc:
+        raise ACEError("decryption_failed", f"AEAD decryption failed: {type(exc).__name__}") from None
 
 
 def decrypt_with_seed(kem_ciphertext: bytes, payload: bytes, seed: bytes, conversation_id: str) -> bytes:

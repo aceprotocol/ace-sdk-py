@@ -155,7 +155,11 @@ def verify_auth_headers(
     window_seconds: int = TIMESTAMP_WINDOW_SECONDS,
 ) -> None:
     """Check order: ``auth.ace_id != ace_id`` -> ``invalid_argument``; ``|now - ts| > window``
-    -> ``stale_timestamp``; bad encoding or signature -> ``invalid_signature``."""
+    -> ``stale_timestamp``; bad encoding or signature -> ``invalid_signature``.
+
+    Stateless: it does not detect replays. The relay MUST additionally accept each
+    ``(action, ace_id, signature)`` at most once while its timestamp is inside the window
+    (409 ``replay``)."""
     if not isinstance(auth, RelayAuth) or not isinstance(req, RelayAuthRequest) or scheme not in SIGNING_SCHEMES:
         raise _bad("expected RelayAuth, RelayAuthRequest and a signing scheme")
     if type(window_seconds) is not int or window_seconds < 0:

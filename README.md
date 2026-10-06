@@ -49,7 +49,7 @@ def on_message(m):                                 # persist durably, idempotent
     db.save_inbound(m.from_id, m.message_id, m.type, m.body)
 
 inbox = Inbox.open(identity, store, peers, on_message)   # holds the "receive" lock until close()
-outbox = Outbox(identity, store)
+outbox = Outbox.open(identity, store)
 
 # send: stage (signed + persisted with its thread state), then deliver
 pending = outbox.stage(peers.resolve(seller_id), "rfq", {"need": "translate"}, thread_id="deal-1")

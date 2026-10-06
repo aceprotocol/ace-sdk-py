@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import socket
+import ssl
 
 import pytest
 
@@ -198,14 +199,14 @@ def test_fetch_ssrf_and_argument_errors(monkeypatch):
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
                 (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 443, 0, 0))]
 
-    monkeypatch.setattr(disc.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(disc, "_getaddrinfo", fake_getaddrinfo)
     with raises("blocked_address"):
         fetch_registration_file("example.com")
 
     def failing(*a, **kw):
         raise socket.gaierror("nope")
 
-    monkeypatch.setattr(disc.socket, "getaddrinfo", failing)
+    monkeypatch.setattr(disc, "_getaddrinfo", failing)
     with raises("fetch_failed") as info:
         fetch_registration_file("example.com")
     assert info.value.is_transient
@@ -254,20 +255,12 @@ def test_fetch_success(monkeypatch):
 
 
 def _install_fake_http(monkeypatch, resp):
-    monkeypatch.setattr(disc.socket, "getaddrinfo",
+    monkeypatch.setattr(disc, "_getaddrinfo",
                         lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))])
-    monkeypatch.setattr(disc.socket, "create_connection", lambda *a, **k: object())
-
-    class Ctx:
-        def wrap_socket(self, sock, server_hostname):
-            assert server_hostname == "example.com"
-            return sock
-
-    monkeypatch.setattr(disc.ssl, "create_default_context", lambda: Ctx())
 
     class Conn:
-        def __init__(self, *a, **k):
-            self.sock = None
+        def __init__(self, domain, ip, timeout):
+            assert (domain, ip) == ("example.com", "93.184.216.34")
 
         def request(self, *a, **k):
             pass
@@ -278,4 +271,32 @@ def _install_fake_http(monkeypatch, resp):
         def close(self):
             pass
 
-    monkeypatch.setattr(disc.http.client, "HTTPSConnection", Conn)
+    monkeypatch.setattr(disc, "_PinnedHTTPSConnection", Conn)
+
+
+def test_fetch_connects_to_validated_ip_without_re_resolving(monkeypatch):
+    lookups, connects = [], []
+
+    def resolver(host, port, *a, **kw):
+        lookups.append(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+                (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.35", 443))]
+
+    def create_connection(address, timeout=None):
+        connects.append(address)
+        raise OSError("unreachable in tests")
+
+    monkeypatch.setattr(disc, "_getaddrinfo", resolver)
+    monkeypatch.setattr(disc, "_create_connection", create_connection)
+    with raises("fetch_failed"):
+        fetch_registration_file("example.com")
+    assert lookups == ["example.com"] and connects == [("93.184.216.34", 443)]
+    conn = disc._PinnedHTTPSConnection("example.com", "93.184.216.34", 5)
+    assert conn._ace_ctx.verify_mode == ssl.CERT_REQUIRED and conn._ace_ctx.check_hostname
+    # any blocked address among the answers rejects the domain, before connecting
+    monkeypatch.setattr(disc, "_getaddrinfo", lambda *a, **k: resolver(*a, **k) + [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.7", 443))])
+    connects.clear()
+    with raises("blocked_address"):
+        fetch_registration_file("example.com")
+    assert connects == []

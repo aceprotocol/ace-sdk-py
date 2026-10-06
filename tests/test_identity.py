@@ -85,3 +85,17 @@ def test_seed_helpers_and_decrypt_errors():
         compute_conversation_id(pk, pk[:-1])
     with raises("limit_exceeded"):
         encrypt(b"x" * 65509, pk, cid)
+
+
+def test_decapsulation_library_errors_are_decryption_failed():
+    from ace import decrypt_with_seed, generate_kem_seed
+    from ace.limits import KEM_CIPHERTEXT_SIZE
+
+    seed = generate_kem_seed()
+    # an all-zero X25519 part makes pyca raise ValueError (all-zero shared secret)
+    ct = bytes(range(256)) * 4 + bytes(KEM_CIPHERTEXT_SIZE - 1024)
+    with raises("decryption_failed"):
+        decrypt_with_seed(ct, bytes(64), seed, "a" * 64)
+    ident = SoftwareIdentity.generate("ed25519")
+    with raises("decryption_failed"):
+        ident.decrypt(ct, bytes(64), "a" * 64)

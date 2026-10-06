@@ -363,3 +363,85 @@ def test_crash_during_quarantine_write(pair):
     out = inbox.receive(env.to_dict(), relay_src(1))
     assert out.kind == "retryable" and out.error.code == "storage_failed"
     assert inbox.cursor(SRC) is None and bob.store.list("quarantine/") == []
+
+
+# --- lead amendments ---------------------------------------------------------------------
+
+def test_handler_can_stage_reply_on_same_thread(pair):
+    clock, alice, bob = pair
+    replies = []
+
+    def on_message(m):
+        if m.type == "rfq":  # the threads lock is released before the handover
+            replies.append(bob.outbox.stage(bob.peers.get(alice.id), "offer", {"price": "2", "currency": "USDC"},
+                                            thread_id=m.thread_id, request_id=f"offer:{m.message_id}"))
+
+    bob.host = on_message
+    inbox = bob.open()
+    env = rfq(alice, bob)
+    assert inbox.receive(env.to_dict(), relay_src(1)).kind == "delivered"
+    assert len(replies) == 1
+    assert ThreadStore(bob.store, bob.id).get(env.conversation_id, "deal-1").state == "offered"
+
+
+def test_failed_state_keeps_threads_lock_until_close(pair):
+    clock, alice, bob = pair
+    bob.open().close()
+    inbox = bob.open(store=CountingStore(bob.store, fail_at=3))  # replay write fails
+    assert inbox.receive(rfq(alice, bob).to_dict(), relay_src(1)).kind == "retryable"
+    with raises("storage_failed"):
+        bob.store.lock("threads", timeout=0)
+    with raises("storage_failed"):
+        bob.outbox.stage(bob.peers.get(alice.id), "text", {"message": "x"})  # stage takes `threads` too
+    inbox.close()
+    with bob.store.lock("threads", timeout=0):
+        pass
+
+
+def test_outbox_open_repairs_thread_after_crash(pair):
+    clock, alice, bob = pair
+    from ace import Outbox
+
+    sent = bob.outbox.stage(bob.peers.get(alice.id), "rfq", {"need": "x"}, thread_id="d", request_id="r1")
+    alice.open().receive(sent.message.to_dict(), relay_src(1))
+    offer = alice.outbox.stage(alice.peers.get(bob.id), "offer", {"price": "5", "currency": "USDC"}, thread_id="d").message
+    bob.open().close()
+    inbox = bob.open(store=CountingStore(bob.store, fail_at=2))  # delivery written, thread write fails
+    assert inbox.receive(offer.to_dict(), relay_src(2)).kind == "retryable"
+    inbox.close()
+    outbox = Outbox.open(bob.identity, bob.store, clock=clock)  # repairs the thread from deliveries/
+    snap = ThreadStore(bob.store, bob.id).get(offer.conversation_id, "d")
+    assert snap.state == "offered" and outbox.pending() == []  # delivery proven: pending cleared
+    outbox.stage(bob.peers.get(alice.id), "accept", {"offerId": offer.message_id}, thread_id="d", request_id="a1")
+    inbox = bob.open()  # no divergence: the delivery snapshot is a prefix of the stored history
+    assert bob.host.calls == [(alice.id, offer.message_id)]
+    assert ThreadStore(bob.store, bob.id).get(offer.conversation_id, "d").state == "accepted"
+    assert inbox.receive(offer.to_dict(), relay_src(2)).kind == "duplicate"
+    with raises("invalid_argument"):
+        Outbox(bob.identity, bob.store)
+
+
+def test_recovery_order_repairs_first_then_hands_over(pair):
+    clock, alice, bob = pair
+    inbox = bob.open()
+    first = rfq(alice, bob, thread_id="a")
+    clock.t += 1
+    second = rfq(alice, bob, thread_id="b")
+    bob.host.fail = True
+    for i, e in enumerate((second, first)):
+        assert inbox.receive(e.to_dict(), relay_src(i + 1)).kind == "retryable"
+    inbox.close()
+    seen = []
+
+    def flaky(m):
+        replay = json.loads(bob.store.read("replay.json"))
+        seen.append((m.message_id, len(replay["entries"])))
+        if m.message_id == second.message_id:
+            raise RuntimeError("still down")
+
+    bob.host = flaky
+    with raises("handler_failed"):
+        bob.open()
+    assert seen == [(first.message_id, 2), (second.message_id, 2)]  # (timestamp, key) order
+    assert json.loads(bob.store.read(delivery_key(alice.id, first.message_id)))["status"] == "acked"
+    assert json.loads(bob.store.read(delivery_key(alice.id, second.message_id)))["status"] == "pending"

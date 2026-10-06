@@ -63,7 +63,7 @@ def on_message(m):
 
 
 inbox = Inbox.open(bob, bob_store, bob_peers, on_message)
-outbox = Outbox(alice, alice_store)
+outbox = Outbox.open(alice, alice_store)
 
 pending = outbox.stage(
     alice_peers.resolve(bob.get_ace_id()), "rfq", {"need": "Summarize a PDF"}, thread_id="deal-1"

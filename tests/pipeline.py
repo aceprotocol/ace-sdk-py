@@ -69,7 +69,7 @@ class Agent:
         self.clock = clock
         self.store = store if store is not None else MemoryStore()
         self.peers = PeerStore(self.store, relay=relay, clock=clock)
-        self.outbox = Outbox(self.identity, self.store, clock=clock)
+        self.outbox = Outbox.open(self.identity, self.store, clock=clock)
         self.host = Host()
         self.inbox: Inbox | None = None
 

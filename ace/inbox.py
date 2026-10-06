@@ -161,6 +161,30 @@ def _clear_proven_pending(rec: ThreadRecord | None, new_snap: ThreadSnapshot) ->
     return rec.pending
 
 
+def load_deliveries(store: ACEStore, local_ace_id: str) -> list[_Delivery]:
+    """All delivery records, ordered by (timestamp, key)."""
+    out = []
+    for key in store.list("deliveries/"):
+        d = load_record(store, key)
+        if d is not None:
+            out.append(_delivery_from_dict(d, key, local_ace_id))
+    return sorted(out, key=lambda r: (r.message.timestamp, r.key))
+
+
+def repair_thread(threads: ThreadStore, rec: _Delivery) -> None:
+    """Write ``rec.thread`` if it strictly extends the stored history; divergence is
+    ``storage_failed``. Caller holds the ``threads`` lock."""
+    if rec.thread is None:
+        return
+    stored = threads.load(rec.thread.conversation_id, rec.thread.thread_id)
+    old = _history_dicts(stored.snapshot if stored else None)
+    new = _history_dicts(rec.thread)
+    if len(new) > len(old) and new[: len(old)] == old:
+        threads.save(ThreadRecord(rec.thread, _clear_proven_pending(stored, rec.thread)))
+    elif new != old[: len(new)]:
+        raise ACEError("storage_failed", f"{rec.key}: thread history diverges from the delivery record")
+
+
 class Inbox:
     """Durable, exactly-once-to-the-host receive engine.
 
@@ -210,6 +234,7 @@ class Inbox:
         self._failed = False
         self._closed = False
         self._delivered_since_sweep = 0
+        self._held_threads: Any = None
         lock = store.lock("receive", 0)
         lock.__enter__()
         self._lock = lock
@@ -267,36 +292,33 @@ class Inbox:
         return ts <= max(r.horizon, r._sh.get(from_id, r.horizon))
 
     def _recover(self) -> None:
-        for key in self._store.list("deliveries/"):
-            d = load_record(self._store, key)
-            if d is None:
-                continue
-            rec = _delivery_from_dict(d, key, self._local)
+        """Repair threads and replay from every delivery record first (ordered by
+        (timestamp, key)), then hand over the pending ones in the same order."""
+        records = load_deliveries(self._store, self._local)
+        changed = False
+        with self._threads.locked():
+            for rec in records:
+                if rec.status == "acked" and self._covered(rec.message.from_id, rec.message.timestamp):
+                    continue  # fully committed long ago; its thread may have been pruned
+                repair_thread(self._threads, rec)
+        for rec in records:
             m = rec.message
-            if rec.status == "acked" and self._covered(m.from_id, m.timestamp):
-                self._store.delete(key)  # fully committed and covered: nothing to repair
-                continue
-            if rec.thread is not None:
-                with self._threads.locked():
-                    stored = self._threads.load(rec.thread.conversation_id, rec.thread.thread_id)
-                    old = _history_dicts(stored.snapshot if stored else None)
-                    new = _history_dicts(rec.thread)
-                    if len(new) > len(old) and new[: len(old)] == old:
-                        self._threads.save(ThreadRecord(rec.thread, _clear_proven_pending(stored, rec.thread)))
-                    elif new != old[: len(new)]:
-                        raise ACEError("storage_failed", f"{key}: thread history diverges from the delivery record")
             if self._replay.accepts(m.message_id, m.from_id, m.timestamp):
                 self._replay.commit(m.message_id, m.from_id, m.timestamp, self._floor())
-                self._write_replay(self._replay)
+                changed = True
+        if changed:
+            self._write_replay(self._replay)
+        for rec in records:
+            m = rec.message
             if rec.status == "pending":
                 try:
                     self._on_message(m)
                 except Exception as exc:
                     raise ACEError("handler_failed", f"on_message failed during recovery: {exc}") from exc
                 rec.status = "acked"
-                self._store.write(key, dump_record(rec.to_dict()))
+                self._store.write(rec.key, dump_record(rec.to_dict()))
             if self._covered(m.from_id, m.timestamp):
-                self._store.delete(key)
+                self._store.delete(rec.key)
 
     # --- public ---
 
@@ -308,7 +330,12 @@ class Inbox:
             if self._closed:
                 return
             self._closed = True
-            self._lock.__exit__(None, None, None)
+            held, self._held_threads = self._held_threads, None
+            try:
+                if held is not None:
+                    held.__exit__(None, None, None)
+            finally:
+                self._lock.__exit__(None, None, None)
 
     def __enter__(self) -> "Inbox":
         return self
@@ -439,10 +466,28 @@ class Inbox:
         except ACEError as exc:
             return ReceiveOutcome("retryable", error=exc, from_id=env.from_id, message_id=env.message_id)
         try:
-            return self._parse_and_commit(env, peer, key, source, now, economic)
-        finally:
+            result = self._parse_and_commit(env, peer, key, source, now, economic)
+        except BaseException:
             if lock is not None:
                 lock.__exit__(None, None, None)
+            raise
+        if lock is not None:
+            if self._failed:
+                self._held_threads = lock  # keep other writers out until close()/open() repairs
+            else:
+                lock.__exit__(None, None, None)
+        if isinstance(result, ReceiveOutcome):
+            return result
+        outcome = self._hand_over(result)  # 7.4-7.5, without the threads lock
+        if outcome.kind == "delivered":
+            self._delivered_since_sweep += 1
+            if self._delivered_since_sweep >= _SWEEP_EVERY:
+                self._delivered_since_sweep = 0
+                try:
+                    self.sweep()
+                except ACEError:
+                    pass
+        return outcome
 
     def _safe(self, fn: Callable[[], ReceiveOutcome]) -> ReceiveOutcome:
         try:
@@ -452,7 +497,9 @@ class Inbox:
 
     def _parse_and_commit(
         self, env: ACEMessage, peer: Any, key: str, source: ReceiveSource, now: int, economic: bool,
-    ) -> ReceiveOutcome:
+    ) -> "ReceiveOutcome | _Delivery":
+        """Steps 5-7.3 (caller holds ``threads`` for economic types). Returns an outcome,
+        or the committed pending delivery to hand over."""
         ids = {"from_id": env.from_id, "message_id": env.message_id}
         try:
             if economic:
@@ -494,16 +541,7 @@ class Inbox:
         except ACEError as exc:
             self._failed = True
             return ReceiveOutcome("retryable", error=exc, **ids)
-        outcome = self._hand_over(delivery)  # 7.4-7.5
-        if outcome.kind == "delivered":
-            self._delivered_since_sweep += 1
-            if self._delivered_since_sweep >= _SWEEP_EVERY:
-                self._delivered_since_sweep = 0
-                try:
-                    self.sweep()
-                except ACEError:
-                    pass
-        return outcome
+        return delivery
 
     def sweep(self) -> int:
         """Delete ``acked`` delivery records covered by a replay horizon; returns the count."""
