@@ -149,24 +149,32 @@ def binding_sign_data(ace_id: str, timestamp: int, enc_b64: str, sig_b64: str) -
     return build_sign_data("register", ace_id, timestamp, encode_payload(enc_b64, sig_b64))
 
 
-def verify_peer_record(record: dict) -> VerifiedPeer:
-    """Verify a relay ``PeerRecord``; every failure is ``invalid_peer``."""
+def decode_peer_binding(record: dict) -> tuple[str, SigningScheme, bytes, bytes, int]:
+    """The unsigned part of a ``PeerRecord``: ``(ace_id, scheme, signing_key, enc_key,
+    registered_at)``, with the ID bound to the signing key; failures are ``invalid_peer``."""
     code: ACEErrorCode = "invalid_peer"
-    if not isinstance(record, dict):
-        raise ACEError(code, "peer record must be an object")
     ace_id, scheme = record.get("aceId"), record.get("scheme")
     if not is_ace_id(ace_id):
         raise ACEError(code, "aceId is not an ACE ID")
     if scheme not in SIGNING_SCHEMES:
         raise ACEError(code, "unsupported scheme")
-    enc_b64, sig_b64 = record.get("encryptionPublicKey"), record.get("signingPublicKey")
-    signing_key = decode_signing_key(scheme, sig_b64, code)
+    signing_key = decode_signing_key(scheme, record.get("signingPublicKey"), code)
     if compute_ace_id(signing_key) != ace_id:
         raise ACEError(code, "aceId does not match the signing key")
-    enc_key = decode_encryption_key(enc_b64, code)
+    enc_key = decode_encryption_key(record.get("encryptionPublicKey"), code)
     registered_at = wire_int(record.get("registeredAt"))
     if registered_at is None:
         raise ACEError(code, "registeredAt must be an integer")
+    return ace_id, scheme, signing_key, enc_key, registered_at  # type: ignore[return-value]
+
+
+def verify_peer_record(record: dict) -> VerifiedPeer:
+    """Verify a relay ``PeerRecord``; every failure is ``invalid_peer``."""
+    code: ACEErrorCode = "invalid_peer"
+    if not isinstance(record, dict):
+        raise ACEError(code, "peer record must be an object")
+    ace_id, scheme, signing_key, enc_key, registered_at = decode_peer_binding(record)
+    enc_b64, sig_b64 = record["encryptionPublicKey"], record["signingPublicKey"]
     signature = record.get("registrationSignature")
     sig = decode_signature(signature, scheme, code)  # type: ignore[arg-type]
     if not verify_signature(binding_sign_data(ace_id, registered_at, enc_b64, sig_b64), sig, scheme, signing_key):  # type: ignore[arg-type]

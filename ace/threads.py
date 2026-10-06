@@ -17,7 +17,7 @@ from .state_machine import (
     ThreadSnapshot,
     ThreadStateMachine,
 )
-from .store import ACEStore, dump_record, load_record
+from .store import ACEStore, load_record, write_record
 from .types import ACEMessage
 
 THREAD_RETENTION_SECONDS = 30 * 86400
@@ -67,7 +67,6 @@ class ThreadRecord:
     def to_dict(self) -> dict[str, Any]:
         d = self.snapshot.to_dict()
         d["pending"] = self.pending.to_dict() if self.pending else None
-        d["version"] = 1
         return d
 
 
@@ -210,7 +209,7 @@ class ThreadStore:
         is_open = snap.state not in TERMINAL_STATES
         if is_open:
             self._set_open(snap.peer_ace_id, key, True)  # index first: a crash leaves only an extra entry
-        self._store.write(key, dump_record(record.to_dict()))
+        write_record(self._store, key, record.to_dict())
         if not is_open:
             self._set_open(snap.peer_ace_id, key, False)
         self._maybe_prune()
@@ -264,7 +263,7 @@ class ThreadStore:
     def _write_index(self, peer_ace_id: str, entries: list[str]) -> None:
         key = thread_index_key(peer_ace_id)
         if entries:
-            self._store.write(key, dump_record({"open": sorted(entries), "version": 1}))
+            write_record(self._store, key, {"open": sorted(entries)})
         else:
             self._store.delete(key)
 

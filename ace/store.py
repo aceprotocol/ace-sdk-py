@@ -458,9 +458,10 @@ class FileStore:
 
 # --- JSON records -----------------------------------------------------------------------
 
-def dump_record(obj: object) -> bytes:
-    """Persisted-JSON writer: compact UTF-8, sorted keys, non-ASCII and '/' unescaped."""
-    return canonical_state_bytes(obj)
+def write_record(store: ACEStore, key: str, obj: dict) -> None:
+    """Write ``obj`` as a ``version: 1`` record (compact UTF-8, sorted keys, non-ASCII and
+    '/' unescaped); the counterpart of ``load_record``."""
+    store.write(key, canonical_state_bytes({**obj, "version": 1}))
 
 
 def load_record(store: ACEStore, key: str) -> dict | None:

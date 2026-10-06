@@ -7,6 +7,7 @@ import hashlib
 from typing import Callable, NamedTuple
 
 from ._encoding import (
+    check_fresh,
     check_wire_int,
     decode_b64,
     decode_signature,
@@ -21,7 +22,6 @@ from .discovery import (
     VerifiedPeer,
     _make_peer,
     binding_sign_data,
-    decode_encryption_key,
     decode_signing_key,
     validate_profile,
 )
@@ -109,7 +109,7 @@ def create_registration_request(
     check_wire_int(ts, "timestamp")
     enc = identity.get_encryption_public_key()
     if not isinstance(enc, (bytes, bytearray)) or len(enc) != KEM_PUBLIC_KEY_SIZE:
-        raise ACEError("invalid_key", "identity encryption public key must be 1216 bytes")
+        raise ACEError("invalid_key", f"identity encryption public key must be {KEM_PUBLIC_KEY_SIZE} bytes")
     snapshot = profile if profile is _KEEP or profile is None else validate_profile(copy.deepcopy(profile))  # type: ignore[arg-type]
     epk, spk = to_base64(enc), to_base64(identity.get_signing_public_key())
     ace_id, scheme = identity.get_ace_id(), identity.get_signing_scheme()
@@ -163,14 +163,13 @@ def verify_registration_request(
         raise ACEError(bad, "profile must be an object or null")
 
     spk_bytes = decode_b64(spk, bad, "signingPublicKey", max_bytes=64)
-    decode_b64(epk, bad, "encryptionPublicKey", max_bytes=KEM_PUBLIC_KEY_SIZE + 3)
-    now = unix_now(clock)
-    if abs(now - ts) > window_seconds:
-        raise ACEError("stale_timestamp", "registration timestamp is outside the freshness window")
+    enc_key = decode_b64(epk, bad, "encryptionPublicKey", max_bytes=KEM_PUBLIC_KEY_SIZE + 3)
+    check_fresh(ts, clock, window_seconds, "registration timestamp")
     if compute_ace_id(spk_bytes) != ace_id:
         raise ACEError(bad, "aceId does not match signingPublicKey")
     signing_key = decode_signing_key(scheme, spk, "invalid_key")
-    enc_key = decode_encryption_key(epk, "invalid_key")
+    if len(enc_key) != KEM_PUBLIC_KEY_SIZE:
+        raise ACEError("invalid_key", f"encryptionPublicKey must be {KEM_PUBLIC_KEY_SIZE} bytes")
     profile = None if raw_profile is None else validate_profile(raw_profile)
     if not verify_signature(binding_sign_data(ace_id, ts, epk, spk), sig, scheme, signing_key):  # type: ignore[arg-type]
         raise ACEError("invalid_signature", "registration binding signature does not verify")

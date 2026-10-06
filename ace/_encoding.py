@@ -93,6 +93,12 @@ def unix_now(clock: Callable[[], int] | None) -> int:
     return int(clock()) if clock is not None else int(time.time())
 
 
+def check_fresh(timestamp: int, clock: Callable[[], int] | None, window_seconds: int, what: str) -> None:
+    """``stale_timestamp`` unless ``|now - timestamp| <= window_seconds``."""
+    if abs(unix_now(clock) - timestamp) > window_seconds:
+        raise ACEError("stale_timestamp", f"{what} is outside the freshness window")
+
+
 def decimal(n: int) -> str:
     return str(n)
 

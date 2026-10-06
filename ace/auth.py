@@ -8,12 +8,12 @@ from typing import Callable, Literal, Mapping, NamedTuple, Sequence
 
 from ._encoding import (
     MAX_SAFE_INTEGER,
+    check_fresh,
     check_wire_int,
     decimal,
     decode_signature,
     encode_signature,
     is_ace_id,
-    unix_now,
     wire_int,
 )
 from ._signing import build_sign_data, encode_payload, verify_signature
@@ -166,9 +166,7 @@ def verify_auth_headers(
         raise _bad("window_seconds must be a non-negative integer")
     if auth.ace_id != ace_id:
         raise _bad("X-ACE-Id does not match the signer")
-    now = unix_now(clock)
-    if abs(now - auth.timestamp) > window_seconds:
-        raise ACEError("stale_timestamp", "X-ACE-Timestamp is outside the freshness window")
+    check_fresh(auth.timestamp, clock, window_seconds, "X-ACE-Timestamp")
     sig = decode_signature(auth.signature, scheme, "invalid_signature")
     if not verify_signature(_sign_data(req, auth.ace_id, auth.timestamp), sig, scheme, signing_public_key):
         raise ACEError("invalid_signature", "X-ACE-Signature does not verify")

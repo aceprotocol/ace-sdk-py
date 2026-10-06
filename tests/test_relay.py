@@ -218,6 +218,19 @@ def test_listen_on_open_exception_ends_the_stream(relay, ids):
     assert relay.requests.count(("GET", "/v1/listen")) == 2
 
 
+def test_listen_error_thrown_at_yield_propagates(relay, ids):
+    _, bob = ids
+    client = RelayClient(relay.url)
+    client.register(bob)
+    relay.enqueue_raw(bob.get_ace_id(), {"n": 0})
+    gen = client.listen(bob)
+    assert next(gen).message == {"n": 0}
+    with raises("relay_unavailable"):  # the consumer's error, not a dropped stream: no retry
+        gen.throw(ACEError("relay_unavailable", "from the consumer"))
+    assert relay.requests.count(("GET", "/v1/listen")) == 1
+    _until(lambda: relay.open_listens == 0)
+
+
 def test_listen_stop_unblocks(relay, ids):
     _, bob = ids
     client = RelayClient(relay.url)

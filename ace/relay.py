@@ -397,44 +397,49 @@ class RelayClient:
         resume = since or "-"
         RelayAuthRequest.listen(resume)  # validate
         failures = 0
-        in_hook = False
-        while stop is None or not stop.is_set():
+        stopped = (lambda: False) if stop is None else stop.is_set
+        while not stopped():
+            # Only the stream is inside the try: an error from on_open or thrown in at the
+            # yield is the caller's and propagates as is. Once stopped, the watcher's socket
+            # shutdown surfaces as a stream error or EOF, both of which end here.
+            stream = self._listen_once(identity, resume, stop, idle_timeout)
             try:
-                for entry in self._listen_once(identity, resume, stop, idle_timeout):
+                while True:
+                    try:
+                        entry = next(stream)
+                    except StopIteration:  # drain or EOF -> reconnect immediately unless stopped
+                        failures = 0
+                        break
+                    except ACEError as exc:
+                        if stopped():
+                            return
+                        if exc.code != "relay_unavailable":
+                            raise
+                        failures += 1
+                        if failures >= _MAX_CONNECT_FAILURES:
+                            raise
+                        delay = min(2 ** (failures - 1), _MAX_BACKOFF_SECONDS)
+                        if exc.retry_after_seconds is not None:
+                            delay = min(max(delay, exc.retry_after_seconds), _MAX_BACKOFF_SECONDS)
+                        if stop is not None:
+                            if stop.wait(delay):
+                                return
+                        else:
+                            _sleep(delay)
+                        break
+                    if stopped():  # buffered frames are not yielded after stop
+                        return
                     if entry is _CONNECTED:
                         if on_open is not None:
-                            in_hook = True
                             on_open()
-                            in_hook = False
                         continue
                     failures = 0
                     if entry is None:
                         continue  # connected / heartbeat-level progress
                     yield entry
                     resume = entry.stream_id
-                    if stop is not None and stop.is_set():
-                        return
-                # clean end: drain or EOF -> reconnect immediately unless stopped
-                failures = 0
-                continue
-            except ACEError as exc:
-                if in_hook:
-                    raise
-                if stop is not None and stop.is_set():
-                    return
-                if exc.code != "relay_unavailable":
-                    raise
-                failures += 1
-                if failures >= _MAX_CONNECT_FAILURES:
-                    raise
-                delay = min(2 ** (failures - 1), _MAX_BACKOFF_SECONDS)
-                if exc.retry_after_seconds is not None:
-                    delay = min(max(delay, exc.retry_after_seconds), _MAX_BACKOFF_SECONDS)
-                if stop is not None:
-                    if stop.wait(delay):
-                        return
-                else:
-                    _sleep(delay)
+            finally:
+                stream.close()
 
     def _listen_once(
         self, identity: ACEIdentity, since: str, stop: threading.Event | None, idle_timeout: float,
@@ -470,7 +475,7 @@ class RelayClient:
 
                 def watch() -> None:
                     while not done.is_set():
-                        if stop.wait(0.05):
+                        if stop.wait(0.5):  # the period only bounds how long the watcher outlives its stream
                             try:
                                 if sock is not None:
                                     sock.shutdown(socket.SHUT_RDWR)
@@ -481,7 +486,7 @@ class RelayClient:
                 watcher = threading.Thread(target=watch, daemon=True)
                 watcher.start()
             yield _CONNECTED
-            yield from self._parse_sse(resp, stop)
+            yield from self._parse_sse(resp)
         finally:
             done.set()
             # A response that will close owns the socket after getresponse(); closing only the
@@ -491,7 +496,7 @@ class RelayClient:
             conn.close()
 
     @staticmethod
-    def _parse_sse(resp: http.client.HTTPResponse, stop: threading.Event | None) -> Iterator[RelayEntry | None]:
+    def _parse_sse(resp: http.client.HTTPResponse) -> Iterator[RelayEntry | None]:
         event_id: str | None = None
         event_type = ""
         data: list[bytes] = []
@@ -500,19 +505,13 @@ class RelayClient:
             try:
                 line = resp.readline(_SSE_FRAME_LIMIT + 2)
             except (OSError, http.client.HTTPException, ValueError) as exc:
-                if stop is not None and stop.is_set():
-                    return
                 raise ACEError("relay_unavailable", f"listen stream dropped: {exc}") from None
             if not line:
-                if stop is not None and stop.is_set():
-                    return
                 raise ACEError("relay_unavailable", "listen stream closed by the relay")
             if not line.endswith(b"\n"):
                 if len(line) > _SSE_FRAME_LIMIT:
                     raise _protocol("SSE frame exceeds the size limit")
                 raise ACEError("relay_unavailable", "listen stream ended mid-line")
-            if stop is not None and stop.is_set():
-                return
             if line.startswith(b":"):
                 continue  # heartbeat / comment
             size += len(line)

@@ -10,17 +10,15 @@ from .discovery import (
     VerifiedPeer,
     _make_peer,
     adopt_decision,
-    decode_encryption_key,
-    decode_signing_key,
+    decode_peer_binding,
     validate_profile,
     verify_peer_record,
     verify_registration_file,
 )
 from .errors import ACEError
-from .identity import compute_ace_id
-from .store import ACEStore, dump_record, load_record
+from .store import ACEStore, load_record, write_record
 from .threads import sha256_hex
-from .types import SIGNING_SCHEMES, RegistrationFile
+from .types import RegistrationFile
 
 if TYPE_CHECKING:
     from .relay import RelayClient
@@ -48,7 +46,6 @@ def _peer_to_record(peer: VerifiedPeer, fetched_at: int) -> dict[str, Any]:
         "scheme": peer.scheme,
         "signingPublicKey": to_base64(peer.signing_public_key),
         "source": peer.source,
-        "version": 1,
     }
 
 
@@ -64,16 +61,9 @@ def _peer_from_record(d: dict, key: str) -> tuple[VerifiedPeer, int]:
                 "registeredAt", "profile")}
             peer = verify_peer_record(record)
         elif source == "registration":
-            ace_id, scheme = d.get("aceId"), d.get("scheme")
-            if not is_ace_id(ace_id) or scheme not in SIGNING_SCHEMES:
-                raise ACEError("invalid_peer", "aceId / scheme")
-            signing_key = decode_signing_key(scheme, d.get("signingPublicKey"), "invalid_peer")
-            if compute_ace_id(signing_key) != ace_id:
-                raise ACEError("invalid_peer", "aceId does not match the signing key")
-            enc_key = decode_encryption_key(d.get("encryptionPublicKey"), "invalid_peer")
-            registered_at = wire_int(d.get("registeredAt"))
-            if registered_at is None or d.get("registrationSignature") is not None:
-                raise ACEError("invalid_peer", "registeredAt / registrationSignature")
+            ace_id, scheme, signing_key, enc_key, registered_at = decode_peer_binding(d)
+            if d.get("registrationSignature") is not None:
+                raise ACEError("invalid_peer", "a registration-file pin has no registrationSignature")
             profile = None if d.get("profile") is None else validate_profile(d["profile"])
             peer = _make_peer(
                 ace_id=ace_id, scheme=scheme, signing_public_key=signing_key, encryption_public_key=enc_key,
@@ -145,7 +135,7 @@ class PeerStore:
             pin = rec[0] if rec else None
             result, outcome = adopt_decision(pin, peer, now)
             if result is not pin:
-                self._store.write(_peer_key(peer.ace_id), dump_record(_peer_to_record(result, now)))
+                write_record(self._store, _peer_key(peer.ace_id), _peer_to_record(result, now))
             return PeerAdoption(result, outcome)
 
     def pin_registration_file(self, reg: RegistrationFile | dict, *, pinned_at: int | None = None) -> VerifiedPeer:

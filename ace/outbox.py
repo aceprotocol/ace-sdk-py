@@ -13,7 +13,7 @@ from .envelope import message_sign_data
 from .errors import ACEError
 from .messages import create_message
 from .state_machine import ThreadHistoryEntry, ThreadStateMachine
-from .store import ACEStore, dump_record, load_record
+from .store import ACEStore, load_record, write_record
 from .threads import PendingSend, ThreadRecord, ThreadStore, rebuild_snapshot, sha256_hex
 from .types import ACEIdentity, ACEMessage, MessageType, SignatureEnvelope, is_economic_type
 
@@ -82,9 +82,7 @@ class Outbox:
         return None
 
     def _write_outbox(self, p: PendingSend) -> None:
-        d = p.to_dict()
-        d["version"] = 1
-        self._store.write(_outbox_key(p.request_id), dump_record(d))
+        write_record(self._store, _outbox_key(p.request_id), p.to_dict())
 
     # --- API ---
 
@@ -102,7 +100,8 @@ class Outbox:
             raise ACEError("invalid_argument", "recipient must be a VerifiedPeer")
         local = self._identity.get_ace_id()
         with self._threads.locked():
-            found = self._find(rid)
+            # a fresh UUID cannot be staged yet: skip the scan over every thread record
+            found = None if request_id is None else self._find(rid)
             if found is not None:
                 return found[0]
             now = self._now()
@@ -140,33 +139,26 @@ class Outbox:
             transport(message)
         except ACEError as exc:
             if exc.code == "envelope_expired":
-                self._update(rid, message.message_id, lambda p: dataclasses.replace(p, status="expired"))
+                self._set_pending(rid, message.message_id, lambda p: dataclasses.replace(p, status="expired"))
             raise
-        self._acknowledge(rid, message.message_id)
+        self._set_pending(rid, message.message_id, lambda p: None)
 
-    def _update(self, rid: str, message_id: str, change: Callable[[PendingSend], PendingSend]) -> PendingSend | None:
-        with self._threads.locked():
-            found = self._find(rid)
-            if found is None or found[0].message.message_id != message_id:
-                return None
-            p, rec = found
-            new = change(p)
-            if rec is None:
-                self._write_outbox(new)
-            else:
-                self._threads.save(ThreadRecord(rec.snapshot, new))
-            return new
-
-    def _acknowledge(self, rid: str, message_id: str) -> None:
+    def _set_pending(
+        self, rid: str, message_id: str, change: Callable[[PendingSend], PendingSend | None],
+    ) -> None:
+        """Replace (or with None, clear) the pending send, if it still carries ``message_id``."""
         with self._threads.locked():
             found = self._find(rid)
             if found is None or found[0].message.message_id != message_id:
                 return
-            _, rec = found
-            if rec is None:
+            p, rec = found
+            new = change(p)
+            if rec is not None:
+                self._threads.save(ThreadRecord(rec.snapshot, new))
+            elif new is None:
                 self._store.delete(_outbox_key(rid))
             else:
-                self._threads.save(ThreadRecord(rec.snapshot, None))
+                self._write_outbox(new)
 
     def resign(self, request_id: str) -> PendingSend:
         rid = _check_request_id(request_id)

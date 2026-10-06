@@ -5,7 +5,7 @@ from __future__ import annotations
 import threading
 from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import Any, Callable, Generator, Iterator, Literal
+from typing import Any, Callable, Generator, Iterator, Literal, NamedTuple
 
 from ._encoding import is_ace_id, is_conversation_id, is_message_id, is_thread_id, unix_now, wire_int
 from .encryption import compute_conversation_id
@@ -22,7 +22,7 @@ from .peers import PeerStore
 from .relay import STREAM_ID_RE, RelayClient, compare_stream_ids, normalize_relay_url
 from .replay import ReplayDetector
 from .state_machine import ThreadSnapshot, ThreadStateMachine
-from .store import ACEStore, dump_record, load_record
+from .store import ACEStore, load_record, write_record
 from .threads import PendingSend, ThreadRecord, ThreadStore, sha256_hex, snapshot_from_dict
 from .types import ACEIdentity, ACEMessage, ParsedMessage, is_economic_type, is_message_type
 
@@ -104,6 +104,11 @@ class PullResult:
         return sum(o.kind == "quarantined" for o in self.outcomes)
 
 
+class _DrainEnd(NamedTuple):
+    reason: Literal["drained", "blocked", "page_limit", "stopped"]
+    error: ACEError | None = None
+
+
 def delivery_key(from_id: str, message_id: str) -> str:
     return f"deliveries/{sha256_hex(from_id, message_id)}.json"
 
@@ -129,7 +134,7 @@ class _Delivery:
         return {
             "fingerprint": self.fingerprint, "message": _parsed_to_dict(self.message),
             "receivedAt": self.received_at, "source": self.source, "status": self.status,
-            "thread": self.thread.to_dict() if self.thread else None, "version": 1,
+            "thread": self.thread.to_dict() if self.thread else None,
         }
 
 
@@ -294,7 +299,7 @@ class Inbox:
             raise ACEError("storage_failed", f"replay.json is invalid: {exc}") from None
 
     def _write_replay(self, replay: ReplayDetector) -> None:
-        self._store.write("replay.json", dump_record(replay.export_state()))
+        write_record(self._store, "replay.json", replay.export_state())
 
     def _load_cursors(self) -> dict[str, str]:
         d = load_record(self._store, "cursors.json")
@@ -332,7 +337,7 @@ class Inbox:
                 except Exception as exc:
                     raise ACEError("handler_failed", f"on_message failed during recovery: {exc}") from exc
                 rec.status = "acked"
-                self._store.write(rec.key, dump_record(rec.to_dict()))
+                write_record(self._store, rec.key, rec.to_dict())
             if self._replay.covers(m.from_id, m.timestamp):
                 self._store.delete(rec.key)
 
@@ -385,7 +390,7 @@ class Inbox:
         if current is not None and compare_stream_ids(source.stream_id, current) <= 0:
             return
         cursors = {**self._cursors, url: source.stream_id}
-        self._store.write("cursors.json", dump_record({"cursors": cursors, "version": 1}))
+        write_record(self._store, "cursors.json", {"cursors": cursors})
         self._cursors = cursors  # type: ignore[assignment]
 
     def _quarantine(self, err: ACEError, env: ACEMessage, source: ReceiveSource) -> ReceiveOutcome:
@@ -397,10 +402,10 @@ class Inbox:
     def _write_quarantine(self, err: ACEError, env: ACEMessage, fp: str) -> None:
         key = f"quarantine/{fp}.json"
         existed = self._store.read(key) is not None
-        self._store.write(key, dump_record({
+        write_record(self._store, key, {
             "code": err.code, "envelope": env.to_dict(), "fingerprint": fp, "quarantinedAt": self._now(),
-            "reason": err.message[:_REASON_MAX], "source": "relay", "version": 1,
-        }))
+            "reason": err.message[:_REASON_MAX], "source": "relay",
+        })
         if existed:
             return
         # O(1) per insert: listed once per Inbox (it holds ``receive``, so it is the only
@@ -438,7 +443,7 @@ class Inbox:
                 self._store.delete(rec.key)
             else:
                 rec.status = "acked"
-                self._store.write(rec.key, dump_record(rec.to_dict()))
+                write_record(self._store, rec.key, rec.to_dict())
         except ACEError as exc:
             self._failed = True
             return ReceiveOutcome("retryable", error=exc, from_id=m.from_id, message_id=m.message_id)
@@ -542,7 +547,7 @@ class Inbox:
         snap = machine.get_snapshot(env.conversation_id, env.thread_id) if economic else None  # type: ignore[arg-type]
         delivery = _Delivery(key, parsed, envelope_fingerprint(env), now, source.kind, "pending", snap)
         try:
-            self._store.write(key, dump_record(delivery.to_dict()))  # 7.1 commit point
+            write_record(self._store, key, delivery.to_dict())  # 7.1 commit point
         except ACEError as exc:
             return ReceiveOutcome("retryable", error=exc, **ids)
         try:
@@ -595,37 +600,38 @@ class Inbox:
             try:
                 outcome = next(drain)
             except StopIteration as done:
-                blocked, has_more = done.value
-                return PullResult(outcomes, blocked, has_more)
+                end = done.value
+                return PullResult(outcomes, end.error, end.reason in ("stopped", "page_limit"))
             if outcome.kind != "retryable":
                 outcomes.append(outcome)
 
     def _drain(
         self, relay: RelayClient, limit: int, max_pages: int | None = None, stop: threading.Event | None = None,
-    ) -> Generator[ReceiveOutcome, None, tuple[ACEError | None, bool]]:
-        """Yield each outcome of a drain (a retryable one last); return the blocking error and
-        ``has_more``."""
+    ) -> Generator[ReceiveOutcome, None, _DrainEnd]:
+        """Yield each outcome of a drain (a retryable one last); return why it ended."""
         url = relay.base_url
         since = self.cursor(relay) or "-"
         pages = 0
         while True:
-            if (max_pages is not None and pages >= max_pages) or (stop is not None and stop.is_set()):
-                return None, True
+            # a stopped caller ends before the next page or entry; the cursor marks the spot
+            if stop is not None and stop.is_set():
+                return _DrainEnd("stopped")
+            if max_pages is not None and pages >= max_pages:
+                return _DrainEnd("page_limit")
             pages += 1
             try:
                 page = relay.fetch_inbox(self._identity, since=since, limit=limit)
             except ACEError as exc:
-                return exc, False
+                return _DrainEnd("blocked", exc)
             for entry in page.entries:
-                # a stopped caller ends before the next entry; the cursor marks the spot
                 if stop is not None and stop.is_set():
-                    return None, True
+                    return _DrainEnd("stopped")
                 outcome = self.receive(entry.message, ReceiveSource.relay(url, entry.stream_id))
                 yield outcome
                 if outcome.kind == "retryable":
-                    return outcome.error, False
+                    return _DrainEnd("blocked", outcome.error)
             if len(page.entries) < limit:
-                return None, False
+                return _DrainEnd("drained")
             since = page.entries[-1].stream_id
 
     def follow(
@@ -642,10 +648,10 @@ class Inbox:
         a failed inbox fetch is raised. Set ``stop`` (or close the generator) to end. Outcomes
         are streamed, not retained: the consumer's pace is the backpressure.
         """
-        blocked, has_more = yield from self._drain(relay, MAX_INBOX_PAGE, None, stop)
-        if blocked is not None:
-            raise blocked
-        if has_more:  # stopped
+        end = yield from self._drain(relay, MAX_INBOX_PAGE, None, stop)
+        if end.error is not None:
+            raise end.error
+        if end.reason == "stopped":
             return
         url = relay.base_url
         for entry in relay.listen(self._identity, since=self.cursor(relay) or "-", stop=stop, on_open=on_live):
