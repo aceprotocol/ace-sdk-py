@@ -122,6 +122,8 @@ def validate_registration_file(reg: RegistrationFile) -> RegistrationKeys:
         raise ValueError(f"Invalid or missing ACE id: '{reg.id}'")
     if not isinstance(reg.name, str) or not reg.name:
         raise ValueError("Missing required field: name")
+    if CONTROL_CHAR_RE.search(reg.name):
+        raise ValueError("Registration name must not contain control characters")
     if not reg.endpoint:
         raise ValueError("Missing required field: endpoint")
     if not _is_https_url(reg.endpoint):

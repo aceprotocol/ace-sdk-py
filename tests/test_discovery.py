@@ -78,6 +78,15 @@ def test_validate_reg_endpoint_url(endpoint, ok):
             validate_registration_file(reg)
 
 
+def test_validate_reg_name_rejects_control_chars_without_length_limit():
+    reg = _make_valid_reg()
+    reg.name = "Agent\x1b[2J"
+    with pytest.raises(ValueError, match="name must not contain control characters"):
+        validate_registration_file(reg)
+    reg.name = "a" * 1000
+    validate_registration_file(reg)
+
+
 def test_validate_reg_tier_accepts_integral_float():
     # JSON has one number type: 1.0 is tier 1, as in the TS and Swift SDKs.
     reg = _make_valid_reg()
