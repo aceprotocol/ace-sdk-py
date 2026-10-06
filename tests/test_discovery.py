@@ -166,6 +166,22 @@ def test_extract_secp256k1_registration_keys():
     assert get_registration_encryption_public_key(reg) == id_.get_encryption_public_key()
 
 
+@pytest.mark.parametrize("scheme", ["ed25519", "secp256k1"])
+def test_validate_reg_returns_decoded_keys(scheme):
+    id_ = SoftwareIdentity.generate(scheme)
+    reg = id_.to_registration_file(name="Test", endpoint="https://test.com/ace")
+    keys = validate_registration_file(reg)
+    assert keys.signing_public_key == id_.get_signing_public_key()
+    assert keys.encryption_public_key == id_.get_encryption_public_key()
+
+
+def test_validate_reg_rejects_unknown_scheme():
+    reg = _make_valid_reg()
+    reg.signing.scheme = "rsa"  # type: ignore[assignment]
+    with pytest.raises(ValueError, match="Unsupported signing.scheme"):
+        validate_registration_file(reg)
+
+
 # --- fetch_registration_file tests ---
 
 

@@ -9,7 +9,7 @@ import re
 import socket
 import ssl
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlparse
 
 import base58
@@ -87,8 +87,22 @@ def validate_ace_id(ace_id: str) -> bool:
     return bool(_ACE_ID_PATTERN.match(ace_id))
 
 
-def validate_registration_file(reg: RegistrationFile) -> None:
-    """Validate a registration file has all required fields and correct format."""
+class RegistrationKeys(NamedTuple):
+    """Decoded public keys of a validated registration file."""
+
+    signing_public_key: bytes
+    encryption_public_key: bytes
+
+
+def _secp_address(signing_public_key: bytes) -> str:
+    return secp_pubkey_to_address(SecpPublicKey(signing_public_key).format(compressed=False))
+
+
+def validate_registration_file(reg: RegistrationFile) -> RegistrationKeys:
+    """Validate a registration file has all required fields and correct format.
+
+    Returns the decoded keys so callers need not decode them a second time.
+    """
     if reg.ace != "1.0":
         raise ValueError(f"Invalid ace version: expected '1.0', got '{reg.ace}'")
     if not reg.id or not validate_ace_id(reg.id):
@@ -105,25 +119,17 @@ def validate_registration_file(reg: RegistrationFile) -> None:
         raise ValueError("Missing required field: signing")
     if not reg.signing.scheme:
         raise ValueError("Missing required field: signing.scheme")
+    if reg.signing.scheme not in _VALID_SCHEMES:
+        raise ValueError(f"Unsupported signing.scheme: '{str(reg.signing.scheme)[:32]}'")
     if not reg.signing.address:
         raise ValueError("Missing required field: signing.address")
     if not reg.signing.encryption_public_key:
         raise ValueError("Missing required field: signing.encryptionPublicKey")
-    decode_kem_public_key(reg.signing.encryption_public_key)
-    if reg.signing.scheme == "ed25519":
-        address_pub_key = _decode_ed25519_address(reg.signing.address)
-        if reg.signing.signing_public_key:
-            signing_pub_key_bytes = from_base64(reg.signing.signing_public_key)
-            if signing_pub_key_bytes != address_pub_key:
-                raise ValueError("ed25519 signing.signingPublicKey does not match signing.address")
-    elif reg.signing.scheme == "secp256k1":
-        if not reg.signing.signing_public_key:
-            raise ValueError("secp256k1 scheme requires signing.signingPublicKey")
-        signing_pub_key_bytes = from_base64(reg.signing.signing_public_key)
-        uncompressed = SecpPublicKey(signing_pub_key_bytes).format(compressed=False)
-        derived_address = secp_pubkey_to_address(uncompressed)
-        if reg.signing.address != derived_address:
-            raise ValueError("signing.address does not match signing.signingPublicKey")
+    encryption_public_key = get_registration_encryption_public_key(reg)
+    signing_public_key = get_registration_signing_public_key(reg)
+    if reg.signing.scheme == "secp256k1" and reg.signing.address != _secp_address(signing_public_key):
+        raise ValueError("signing.address does not match signing.signingPublicKey")
+    return RegistrationKeys(signing_public_key, encryption_public_key)
 
 
 def verify_registration_id(reg: RegistrationFile) -> bool:
@@ -134,9 +140,7 @@ def verify_registration_id(reg: RegistrationFile) -> bool:
     if reg.id != expected_id:
         return False
     if reg.signing.scheme == "secp256k1":
-        uncompressed = SecpPublicKey(signing_pub_key_bytes).format(compressed=False)
-        expected_address = secp_pubkey_to_address(uncompressed)
-        return reg.signing.address == expected_address
+        return reg.signing.address == _secp_address(signing_pub_key_bytes)
     return True
 
 
@@ -151,7 +155,7 @@ def get_registration_signing_public_key(reg: RegistrationFile) -> bytes:
         return address_pub_key
     if reg.signing.signing_public_key:
         return from_base64(reg.signing.signing_public_key)
-    raise ValueError("Cannot derive signing public key from registration file")
+    raise ValueError(f"{reg.signing.scheme} scheme requires signing.signingPublicKey")
 
 
 def get_registration_encryption_public_key(reg: RegistrationFile) -> bytes:
@@ -196,35 +200,47 @@ def verify_encryption_key_binding(
     ``False`` on any malformed input rather than raising, so callers can treat all
     verification failures uniformly.
     """
+    return _verify_binding(
+        ace_id, scheme, encryption_public_key, signing_public_key, timestamp, signature,
+    ) is not None
+
+
+def _verify_binding(
+    ace_id: str,
+    scheme: SigningScheme,
+    encryption_public_key: str,
+    signing_public_key: str,
+    timestamp: int,
+    signature: str,
+) -> RegistrationKeys | None:
+    """:func:`verify_encryption_key_binding`, returning the decoded keys on success."""
     if scheme not in _VALID_SCHEMES:
-        return False
+        return None
     if isinstance(timestamp, bool):
-        return False
+        return None
     if isinstance(timestamp, float):
         if not timestamp.is_integer():
-            return False
+            return None
         timestamp = int(timestamp)
     if not isinstance(timestamp, int):
-        return False
+        return None
     try:
         # The bound key must be a well-formed X-Wing public key.
-        decode_kem_public_key(encryption_public_key)
+        enc_pub_bytes = decode_kem_public_key(encryption_public_key)
         signing_pub_bytes = from_base64(signing_public_key)
     except (ValueError, TypeError):
-        return False
+        return None
     # The signing key must be the one that defines this identity.
     if compute_ace_id(signing_pub_bytes) != ace_id:
-        return False
+        return None
     try:
         payload = encode_payload(encryption_public_key, signing_public_key)
         sign_data = build_sign_data("register", ace_id, timestamp, payload)
         sig_bytes = decode_signature(signature, scheme)
+        valid = verify_signature(sign_data, sig_bytes, scheme, signing_pub_bytes)
     except (ValueError, TypeError):
-        return False
-    try:
-        return verify_signature(sign_data, sig_bytes, scheme, signing_pub_bytes)
-    except (ValueError, TypeError):
-        return False
+        return None
+    return RegistrationKeys(signing_pub_bytes, enc_pub_bytes) if valid else None
 
 
 @dataclass(frozen=True)
@@ -272,20 +288,17 @@ class VerifiedPeer:
                 "trusted.  Without the binding a relay could substitute its own encryption key "
                 "and read messages meant to be end-to-end encrypted."
             )
-        if not verify_encryption_key_binding(
-            ace_id, scheme, enc_pub_b64, sign_pub_b64, registered_at, signature,
-        ):
+        keys = _verify_binding(ace_id, scheme, enc_pub_b64, sign_pub_b64, registered_at, signature)
+        if keys is None:
             raise ValueError(
                 "Peer encryption-key binding failed verification: the encryptionPublicKey is "
                 "not signed by this identity's signing key (possible key substitution / relay MITM)."
             )
-        # The binding check above already validated both Base64 strings and the
-        # X-Wing length; re-decoding here is cheap and keeps that check self-contained.
         return cls(
             ace_id=ace_id,
             scheme=scheme,  # type: ignore[arg-type]
-            signing_public_key=from_base64(sign_pub_b64),
-            encryption_public_key=decode_kem_public_key(enc_pub_b64),
+            signing_public_key=keys.signing_public_key,
+            encryption_public_key=keys.encryption_public_key,
         )
 
 

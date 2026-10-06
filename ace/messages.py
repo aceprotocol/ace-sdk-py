@@ -7,13 +7,7 @@ import time
 import uuid
 
 from ._utils import from_base64, to_base64
-from .discovery import (
-    VerifiedPeer,
-    get_registration_encryption_public_key,
-    get_registration_signing_public_key,
-    validate_registration_file,
-    verify_registration_id,
-)
+from .discovery import VerifiedPeer, validate_registration_file
 from .encryption import MAX_PAYLOAD_SIZE, compute_conversation_id, decode_kem_ciphertext, encrypt
 from .identity import compute_ace_id
 from .security import ReplayDetector, check_timestamp_freshness, validate_message_id
@@ -406,17 +400,19 @@ def parse_message_from_registration(
     oldest_timestamp: int | None = None,
 ) -> ParsedMessage:
     """Strict parse path that derives sender keys from a validated registration file."""
-    validate_registration_file(sender_registration)
-    if not verify_registration_id(sender_registration):
+    # validate_registration_file already checks the secp256k1 address against the
+    # signing key, so the only remaining verify_registration_id check is the id.
+    keys = validate_registration_file(sender_registration)
+    if compute_ace_id(keys.signing_public_key) != sender_registration.id:
         raise ValueError("Sender registration file failed cryptographic verification")
 
     return parse_message(
         msg,
         receiver,
-        get_registration_signing_public_key(sender_registration),
+        keys.signing_public_key,
         state_machine=state_machine,
         replay_detector=replay_detector,
-        sender_encryption_pub_key=get_registration_encryption_public_key(sender_registration),
+        sender_encryption_pub_key=keys.encryption_public_key,
         oldest_timestamp=oldest_timestamp,
     )
 

@@ -2,6 +2,7 @@
 
 from . import xwing
 from .discovery import (
+    RegistrationKeys,
     VerifiedPeer,
     fetch_registration_file,
     get_registration_encryption_public_key,
@@ -91,7 +92,7 @@ __all__ = [
     "create_message", "parse_message", "parse_message_from_registration",
     "parse_message_from_peer", "validate_body",
     # Discovery
-    "validate_registration_file", "validate_ace_id", "verify_registration_id",
+    "validate_registration_file", "RegistrationKeys", "validate_ace_id", "verify_registration_id",
     "get_registration_signing_public_key", "get_registration_encryption_public_key",
     "fetch_registration_file",
     "validate_profile",
