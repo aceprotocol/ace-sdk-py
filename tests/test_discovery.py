@@ -1,461 +1,281 @@
+"""Peer records, registration files, profiles, fetch, registration requests, auth headers."""
+
+from __future__ import annotations
+
+import base64
+import socket
+
 import pytest
 
-from ace import SoftwareIdentity, discovery
-from ace._utils import to_base64
-from ace.discovery import (
-    _parse_registration_json,
-    _resolve_and_check_ssrf,
+from ace import (
+    AgentProfile,
+    ProfilePricing,
+    RegistrationFile,
+    RelayAuthRequest,
+    SoftwareIdentity,
+    VerifiedPeer,
+    create_auth_headers,
+    create_registration_request,
     fetch_registration_file,
-    get_registration_encryption_public_key,
-    get_registration_signing_public_key,
-    validate_ace_id,
-    validate_registration_file,
-    verify_registration_id,
+    parse_auth_headers,
+    validate_profile,
+    verify_auth_headers,
+    verify_peer_record,
+    verify_registration_file,
+    verify_registration_request,
 )
-from ace.types import RegistrationFile, SigningConfig
+from ace import discovery as disc
 
-# A syntactically valid (right-length) X-Wing public key; validation only checks length.
-_ENC_PUB_B64 = to_base64(b"\x00" * 1216)
-_32_BYTE_KEY_B64 = to_base64(b"\x00" * 32)
+from .helpers import raises
 
-
-def test_validate_ace_id_valid():
-    assert validate_ace_id("ace:sha256:" + "a" * 64) is True
+NOW = 1_800_000_000
 
 
-def test_validate_ace_id_invalid():
-    assert validate_ace_id("invalid") is False
-    assert validate_ace_id("ace:sha256:short") is False
-    assert validate_ace_id("ace:md5:" + "a" * 64) is False
-
-
-def _make_valid_reg() -> RegistrationFile:
-    return RegistrationFile(
-        ace="1.0",
-        id="ace:sha256:" + "a" * 64,
-        name="TestAgent",
-        endpoint="https://test.example.com/ace",
-        tier=0,
-        signing=SigningConfig(
-            scheme="ed25519",
-            address="5Ht7RkVSupHeNbGWiHfwJ3RYn4RZfpAv5tk2UrQKbkWR",
-            encryption_public_key=_ENC_PUB_B64,
-        ),
-    )
-
-
-def test_validate_reg_valid():
-    validate_registration_file(_make_valid_reg())
-
-
-def test_validate_ace_id_rejects_trailing_newline():
-    assert validate_ace_id("ace:sha256:" + "a" * 64 + "\n") is False
-
-
-def test_validate_reg_name_has_no_length_rule():
-    reg = _make_valid_reg()
-    reg.name = "n" * 200
-    validate_registration_file(reg)
-    reg.name = ""
-    with pytest.raises(ValueError, match="name"):
-        validate_registration_file(reg)
-
-
-@pytest.mark.parametrize("endpoint, ok", [
-    ("HTTPS://test.example.com/ace", True),
-    ("https://", False),
-    ("https:///path", False),
-    ("http://test.example.com", False),
-    ("https//test.example.com", False),
-])
-def test_validate_reg_endpoint_url(endpoint, ok):
-    reg = _make_valid_reg()
-    reg.endpoint = endpoint
-    if ok:
-        validate_registration_file(reg)
-    else:
-        with pytest.raises(ValueError, match="endpoint"):
-            validate_registration_file(reg)
-
-
-def test_validate_reg_name_rejects_control_chars_without_length_limit():
-    reg = _make_valid_reg()
-    reg.name = "Agent\x1b[2J"
-    with pytest.raises(ValueError, match="name must not contain control characters"):
-        validate_registration_file(reg)
-    reg.name = "a" * 1000
-    validate_registration_file(reg)
-
-
-def test_validate_reg_tier_accepts_integral_float():
-    # JSON has one number type: 1.0 is tier 1, as in the TS and Swift SDKs.
-    reg = _make_valid_reg()
-    reg.tier = 1.0
-    validate_registration_file(reg)
-
-
-@pytest.mark.parametrize("tier", [True, False, 0.5, 2, "0"])
-def test_validate_reg_tier_must_be_0_or_1(tier):
-    reg = _make_valid_reg()
-    reg.tier = tier
-    with pytest.raises(ValueError, match="Invalid tier"):
-        validate_registration_file(reg)
-
-
-def test_fetch_rejects_domain_with_trailing_newline():
-    with pytest.raises(ValueError, match="Invalid domain"):
-        fetch_registration_file("example.com\n")
-
-
-def test_validate_reg_rejects_32_byte_encryption_key():
-    """A registration whose encryption key is a 32-byte key must fail with a length error."""
-    reg = _make_valid_reg()
-    reg.signing.encryption_public_key = _32_BYTE_KEY_B64
-    with pytest.raises(ValueError, match="1216"):
-        validate_registration_file(reg)
-    with pytest.raises(ValueError, match="1216"):
-        get_registration_encryption_public_key(reg)
-
-
-@pytest.mark.parametrize("length", [1215, 1217])
-def test_validate_reg_rejects_off_by_one_encryption_key(length):
-    reg = _make_valid_reg()
-    reg.signing.encryption_public_key = to_base64(b"\x01" * length)
-    with pytest.raises(ValueError, match="1216"):
-        validate_registration_file(reg)
-
-
-def test_validate_reg_rejects_non_base64_encryption_key():
-    reg = _make_valid_reg()
-    reg.signing.encryption_public_key = "!!!not-base64!!!"
-    with pytest.raises(ValueError, match="Base64"):
-        validate_registration_file(reg)
-
-
-def test_validate_reg_rejects_short_ed25519_address():
-    reg = _make_valid_reg()
-    reg.signing.address = "1234"
-    with pytest.raises(ValueError, match="decode to 32 bytes"):
-        validate_registration_file(reg)
-
-
-def test_validate_reg_rejects_mismatched_ed25519_signing_key():
-    identity = SoftwareIdentity.generate("ed25519")
-    other = SoftwareIdentity.generate("ed25519")
-    reg = identity.to_registration_file(name="Test", endpoint="https://test.com/ace")
-    reg.signing.signing_public_key = to_base64(other.get_signing_public_key())
-
-    with pytest.raises(ValueError, match="does not match"):
-        validate_registration_file(reg)
-
-
-def test_validate_reg_missing_endpoint():
-    reg = _make_valid_reg()
-    reg.endpoint = ""
-    with pytest.raises(ValueError, match="endpoint"):
-        validate_registration_file(reg)
-
-
-def test_validate_reg_secp256k1_requires_signing_key():
-    reg = _make_valid_reg()
-    reg.signing = SigningConfig(
-        scheme="secp256k1",
-        address="0x" + "a" * 40,
-        encryption_public_key=_ENC_PUB_B64,
-    )
-    with pytest.raises(ValueError, match="signingPublicKey"):
-        validate_registration_file(reg)
-
-
-def test_verify_registration_id_ed25519():
-    id_ = SoftwareIdentity.generate("ed25519")
-    reg = id_.to_registration_file(name="Test", endpoint="https://test.com/ace")
-    assert verify_registration_id(reg) is True
-
-
-def test_verify_registration_id_tampered():
-    id_ = SoftwareIdentity.generate("ed25519")
-    reg = id_.to_registration_file(name="Test", endpoint="https://test.com/ace")
-    reg.id = "ace:sha256:" + "f" * 64
-    assert verify_registration_id(reg) is False
-
-
-def test_verify_registration_id_secp256k1():
-    id_ = SoftwareIdentity.generate("secp256k1")
-    reg = id_.to_registration_file(name="Test", endpoint="https://test.com/ace")
-    assert verify_registration_id(reg) is True
-
-
-def test_validate_reg_rejects_mismatched_secp256k1_address():
-    id_ = SoftwareIdentity.generate("secp256k1")
-    reg = id_.to_registration_file(name="Test", endpoint="https://test.com/ace")
-    reg.signing.address = "0x" + "a" * 40
-    with pytest.raises(ValueError, match="does not match"):
-        validate_registration_file(reg)
-
-
-def test_verify_registration_id_rejects_tampered_secp256k1_address():
-    id_ = SoftwareIdentity.generate("secp256k1")
-    reg = id_.to_registration_file(name="Test", endpoint="https://test.com/ace")
-    reg.signing.address = "0x" + "f" * 40
-    assert verify_registration_id(reg) is False
-
-
-def test_extract_ed25519_registration_keys():
-    id_ = SoftwareIdentity.generate("ed25519")
-    reg = id_.to_registration_file(name="Test", endpoint="https://test.com/ace")
-    assert get_registration_signing_public_key(reg) == id_.get_signing_public_key()
-    assert get_registration_encryption_public_key(reg) == id_.get_encryption_public_key()
-
-
-def test_extract_ed25519_registration_keys_rejects_mismatch():
-    id_ = SoftwareIdentity.generate("ed25519")
-    other = SoftwareIdentity.generate("ed25519")
-    reg = id_.to_registration_file(name="Test", endpoint="https://test.com/ace")
-    reg.signing.signing_public_key = to_base64(other.get_signing_public_key())
-
-    with pytest.raises(ValueError, match="does not match"):
-        get_registration_signing_public_key(reg)
-
-
-def test_extract_secp256k1_registration_keys():
-    id_ = SoftwareIdentity.generate("secp256k1")
-    reg = id_.to_registration_file(name="Test", endpoint="https://test.com/ace")
-    assert get_registration_signing_public_key(reg) == id_.get_signing_public_key()
-    assert get_registration_encryption_public_key(reg) == id_.get_encryption_public_key()
+def record_of(ident, ts=NOW, **override):
+    r = create_registration_request(ident, timestamp=ts)
+    rec = {"aceId": r["aceId"], "scheme": r["scheme"], "encryptionPublicKey": r["encryptionPublicKey"],
+           "signingPublicKey": r["signingPublicKey"], "registrationSignature": r["signature"], "registeredAt": ts}
+    rec.update(override)
+    return rec
 
 
 @pytest.mark.parametrize("scheme", ["ed25519", "secp256k1"])
-def test_validate_reg_returns_decoded_keys(scheme):
-    id_ = SoftwareIdentity.generate(scheme)
-    reg = id_.to_registration_file(name="Test", endpoint="https://test.com/ace")
-    keys = validate_registration_file(reg)
-    assert keys.signing_public_key == id_.get_signing_public_key()
-    assert keys.encryption_public_key == id_.get_encryption_public_key()
+def test_verify_peer_record(scheme):
+    ident = SoftwareIdentity.generate(scheme)
+    peer = verify_peer_record({**record_of(ident), "profile": {"name": "X", "unknown": 1}, "extra": True})
+    assert peer.source == "relay" and peer.registered_at == NOW and peer.profile.name == "X"
+    assert peer.address == ident.get_address()
+    other = SoftwareIdentity.generate(scheme)
+    bad = [
+        {"aceId": "nope"},
+        {"scheme": "rsa"},
+        {"aceId": other.get_ace_id()},
+        {"encryptionPublicKey": base64.b64encode(b"\x00" * 1215).decode()},
+        {"registeredAt": -1},
+        {"registeredAt": NOW + 1},
+        {"registrationSignature": None},
+        {"profile": {"pricing": {"currency": "USDC", "x": 1}}},
+        {"signingPublicKey": base64.b64encode(b"\x02" + b"\x00" * 32).decode()},
+    ]
+    for override in bad:
+        with raises("invalid_peer"):
+            verify_peer_record(record_of(ident, **override))
+    with raises("invalid_peer"):
+        verify_peer_record([])  # type: ignore[arg-type]
 
 
-def test_validate_reg_rejects_unknown_scheme():
-    reg = _make_valid_reg()
-    reg.signing.scheme = "rsa"  # type: ignore[assignment]
-    with pytest.raises(ValueError, match="Unsupported signing.scheme"):
-        validate_registration_file(reg)
+def test_verified_peer_cannot_be_forged():
+    with raises("invalid_argument"):
+        VerifiedPeer("ace:sha256:" + "0" * 64, "ed25519", b"", b"", 0, None, "relay", None)
+    import dataclasses
+    peer = verify_peer_record(record_of(SoftwareIdentity.generate("ed25519")))
+    with raises("invalid_argument"):
+        dataclasses.replace(peer, encryption_public_key=b"\x00" * 1216)
 
 
-# --- fetch_registration_file tests ---
+def test_verify_registration_file_rules():
+    ed, secp = SoftwareIdentity.generate("ed25519"), SoftwareIdentity.generate("secp256k1")
+    reg_ed = ed.to_registration_file(name="A", endpoint="https://a.example/ace").to_dict()
+    reg_secp = secp.to_registration_file(name="B", endpoint="https://b.example/ace").to_dict()
+    peer = verify_registration_file(reg_ed, clock=lambda: 42)
+    assert peer.registered_at == 42 and peer.source == "registration" and peer.registration_signature is None
+    assert verify_registration_file(reg_secp, pinned_at=7).registered_at == 7
+    lower = {**reg_secp, "signing": {**reg_secp["signing"], "address": reg_secp["signing"]["address"].lower()}}
+    verify_registration_file(lower)  # case-insensitive address comparison
+    with_unknown = {**reg_ed, "future": {"x": 1}, "description": None}
+    verify_registration_file(with_unknown)
+
+    def mut(reg, **kw):
+        out = {**reg, **{k: v for k, v in kw.items() if k != "signing"}}
+        if "signing" in kw:
+            out["signing"] = {**reg["signing"], **kw["signing"]}
+        return out
+
+    bad = [
+        mut(reg_ed, ace="1.1"), mut(reg_ed, id="ace:sha256:" + "0" * 64), mut(reg_ed, name=""),
+        mut(reg_ed, name="a\nb"), mut(reg_ed, endpoint="http://a.example"), mut(reg_ed, tier=2),
+        mut(reg_ed, tier=True), mut(reg_ed, signing={"scheme": "rsa"}),
+        mut(reg_ed, signing={"signingPublicKey": base64.b64encode(b"\x01" * 32).decode()}),
+        mut(reg_ed, signing={"address": "1" + reg_ed["signing"]["address"]}),
+        mut(reg_ed, signing={"encryptionPublicKey": "AAAA"}),
+        mut(reg_secp, signing={"signingPublicKey": None}),
+        mut(reg_secp, signing={"address": "0x" + "0" * 40}),
+        mut(reg_ed, capabilities=[{"id": "x"}]), mut(reg_ed, settlement=[1]), mut(reg_ed, chains=[{"network": "x"}]),
+        {"ace": "1.0"},
+    ]
+    for reg in bad:
+        with raises("invalid_registration"):
+            verify_registration_file(reg)
+    with raises("invalid_argument"):
+        verify_registration_file(reg_ed, pinned_at=-1)
+    assert isinstance(RegistrationFile.from_dict(reg_ed), RegistrationFile)
 
 
-def test_fetch_rejects_invalid_domain_with_path():
-    with pytest.raises(ValueError, match="Invalid domain"):
-        fetch_registration_file("evil.com/../../admin")
+def test_validate_profile():
+    p = validate_profile({"name": "Agent", "tags": ["a-b"], "pricing": {"currency": "USDC", "maxAmount": "1.5"},
+                          "unknownField": 1, "image": None})
+    assert p.pricing == ProfilePricing("USDC", "1.5") and p.image is None
+    validate_profile(AgentProfile())
+    bad = [
+        {"name": ""}, {"name": "x" * 65}, {"name": "a\x7f"}, {"description": "x" * 257}, {"image": "http://x.example"},
+        {"tags": ["UPPER"]}, {"tags": ["a"] * 11}, {"capabilities": ["x" * 33]}, {"chains": ["eip155"]},
+        {"endpoint": "https://"}, {"pricing": {"currency": ""}}, {"pricing": {"currency": "x" * 17}},
+        {"pricing": {"currency": "USDC", "maxAmount": "1."}}, {"pricing": {"currency": "USDC", "maxAmount": "-1"}},
+        {"pricing": {"currency": "USDC", "maxAmount": "1" * 33}}, {"pricing": {"currency": "USDC", "max_amount": "1"}},
+        {"tags": "a"}, {"name": 5},
+    ]
+    for prof in bad:
+        with raises("invalid_profile"):
+            validate_profile(prof)
+    with raises("invalid_profile"):
+        validate_profile(AgentProfile(name=5))  # type: ignore[arg-type]
 
 
-def test_fetch_rejects_domain_with_port():
-    with pytest.raises(ValueError, match="Invalid domain"):
-        fetch_registration_file("localhost:8080")
+def test_registration_request_modes():
+    ident = SoftwareIdentity.generate("secp256k1")
+    keep = create_registration_request(ident, timestamp=NOW)
+    assert "profile" not in keep
+    removed = create_registration_request(ident, None, timestamp=NOW)
+    assert removed["profile"] is None
+    replaced = create_registration_request(ident, {"name": "X", "ignored": 1}, timestamp=NOW)
+    assert replaced["profile"] == {"name": "X"}
+    for req in (keep, removed, replaced):
+        result = verify_registration_request(req, clock=lambda: NOW)
+        assert result.peer.registered_at == NOW and result.peer.source == "relay"
+        assert len(result.request_digest) == 64
+    assert len({verify_registration_request(r, clock=lambda: NOW).request_digest for r in (keep, removed, replaced)}) == 3
+    with raises("invalid_profile"):
+        create_registration_request(ident, {"name": ""}, timestamp=NOW)
+    with raises("invalid_argument"):
+        verify_registration_request(keep, window_seconds=-1)
+    with raises("invalid_registration"):
+        verify_registration_request({**keep, "signature": keep["signature"].upper()}, clock=lambda: NOW)
+    with raises("invalid_registration"):
+        verify_registration_request({**keep, "profile": "x"}, clock=lambda: NOW)
 
 
-def test_fetch_rejects_single_label_domain():
-    with pytest.raises(ValueError, match="Invalid domain"):
-        fetch_registration_file("localhost")
+def test_auth_headers():
+    ident = SoftwareIdentity.generate("ed25519")
+    req = RelayAuthRequest.listen("5-0")
+    headers = create_auth_headers(ident, req, NOW)
+    auth = parse_auth_headers({"x-ace-id": [headers["X-ACE-Id"]], "X-Ace-Timestamp": headers["X-ACE-Timestamp"],
+                               "x-ace-signature": headers["X-ACE-Signature"], "other": None})
+    kw = dict(ace_id=ident.get_ace_id(), scheme="ed25519", signing_public_key=ident.get_signing_public_key())
+    verify_auth_headers(auth, req, clock=lambda: NOW + 300, **kw)
+    with raises("stale_timestamp"):
+        verify_auth_headers(auth, req, clock=lambda: NOW + 301, **kw)
+    with raises("invalid_signature"):
+        verify_auth_headers(auth, RelayAuthRequest.listen("-"), clock=lambda: NOW, **kw)
+    with raises("invalid_signature"):
+        verify_auth_headers(auth, req, clock=lambda: NOW, **{**kw, "scheme": "secp256k1"})
+    with raises("invalid_argument"):
+        verify_auth_headers(auth, req, clock=lambda: NOW, **{**kw, "ace_id": "ace:sha256:" + "0" * 64})
+    for bad in ({}, {**headers, "X-ACE-Timestamp": "01"}, {**headers, "X-ACE-Timestamp": "9007199254740992"},
+                {**headers, "X-ACE-Id": "x"}, {**headers, "X-ACE-Signature": ""}):
+        with raises("invalid_argument"):
+            parse_auth_headers(bad)
+    for build in (lambda: RelayAuthRequest.listen("abc"), lambda: RelayAuthRequest.inbox("-", 101),
+                  lambda: RelayAuthRequest.inbox("-", 0), lambda: RelayAuthRequest.intent("x", ["a,b"]),
+                  lambda: RelayAuthRequest.intent("x", "ab"), lambda: RelayAuthRequest.intent("x", ttl=-1),
+                  lambda: RelayAuthRequest("bogus")):  # type: ignore[arg-type]
+        with raises("invalid_argument"):
+            build()
+    assert RelayAuthRequest.unregister().payload() == b""
 
 
-class _DummyConn:
-    closed = False
+def test_blocked_addresses():
+    blocked = ["0.1.2.3", "10.0.0.1", "100.64.0.1", "127.0.0.1", "169.254.1.1", "172.16.0.1", "192.0.0.1",
+               "192.0.2.1", "192.168.1.1", "198.18.0.1", "198.51.100.1", "203.0.113.1", "224.0.0.1", "240.0.0.1",
+               "255.255.255.255", "::", "::1", "::ffff:127.0.0.1", "64:ff9b::a00:1", "100::1", "2001:db8::1",
+               "fc00::1", "fd12::1", "fe80::1%en0", "ff02::1"]
+    allowed = ["8.8.8.8", "1.1.1.1", "::ffff:8.8.8.8", "64:ff9b::808:808", "2606:4700::1111", "172.32.0.1"]
+    assert all(disc.is_blocked_address(ip) for ip in blocked)
+    assert not any(disc.is_blocked_address(ip) for ip in allowed)
 
-    def close(self):
-        self.closed = True
+
+def test_fetch_ssrf_and_argument_errors(monkeypatch):
+    def fake_getaddrinfo(host, port, *a, **kw):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443)),
+                (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 443, 0, 0))]
+
+    monkeypatch.setattr(disc.socket, "getaddrinfo", fake_getaddrinfo)
+    with raises("blocked_address"):
+        fetch_registration_file("example.com")
+
+    def failing(*a, **kw):
+        raise socket.gaierror("nope")
+
+    monkeypatch.setattr(disc.socket, "getaddrinfo", failing)
+    with raises("fetch_failed") as info:
+        fetch_registration_file("example.com")
+    assert info.value.is_transient
+    for domain in ("localhost", "http://x.com", "a.b/c", "x.com:443"):
+        with raises("invalid_argument"):
+            fetch_registration_file(domain)
+    with raises("invalid_argument"):
+        fetch_registration_file("example.com", timeout=0)
+    with raises("invalid_argument"):
+        fetch_registration_file("example.com", max_bytes=0)
 
 
-class _DummyResponse:
-    status = 200
-    reason = "OK"
-
-    def __init__(self, headers=None, body=b"{}", status=200):
-        self._headers = headers if headers is not None else {"Content-Type": "application/json"}
-        self._body = body
-        self.status = status
+class _Resp:
+    def __init__(self, status, ctype, body):
+        self.status, self._ctype, self._body = status, ctype, body
 
     def getheader(self, name, default=None):
-        return self._headers.get(name, default)
+        return self._ctype if name.lower() == "content-type" else default
 
-    def read(self, size=-1):
-        return self._body if size < 0 else self._body[:size]
-
-
-def _patch_pinned(monkeypatch, response):
-    conn = _DummyConn()
-    monkeypatch.setattr("ace.discovery._urlopen_pinned", lambda domain, timeout: (conn, response))
-    return conn
+    def read(self, n):
+        return self._body[:n]
 
 
-def test_fetch_rejects_oversized_content_length(monkeypatch):
-    resp = _DummyResponse(headers={"Content-Type": "application/json", "Content-Length": str(1_048_577)})
-    conn = _patch_pinned(monkeypatch, resp)
-    with pytest.raises(ValueError, match="too large"):
-        fetch_registration_file("example.com")
-    assert conn.closed  # connection is always closed
+@pytest.mark.parametrize("status,ctype,body,code", [
+    (302, "application/json", b"{}", "invalid_registration"),
+    (404, "application/json", b"{}", "invalid_registration"),
+    (503, "application/json", b"{}", "fetch_failed"),
+    (429, "application/json", b"{}", "fetch_failed"),
+    (200, "text/html", b"{}", "invalid_registration"),
+    (200, "application/json; charset=utf-8", b"x" * 101, "invalid_registration"),
+    (200, "application/json", b"not json", "invalid_registration"),
+    (200, "application/json", b"{}", "invalid_registration"),
+])
+def test_fetch_response_mapping(monkeypatch, status, ctype, body, code):
+    _install_fake_http(monkeypatch, _Resp(status, ctype, body))
+    with raises(code):
+        fetch_registration_file("example.com", max_bytes=100)
 
 
-def test_fetch_rejects_oversized_body(monkeypatch):
-    class _BigBody(_DummyResponse):
-        def read(self, size=-1):
-            return b"a" * size
-
-    _patch_pinned(monkeypatch, _BigBody())
-    with pytest.raises(ValueError, match="too large"):
-        fetch_registration_file("example.com")
+def test_fetch_success(monkeypatch):
+    import json
+    ident = SoftwareIdentity.generate("ed25519")
+    body = json.dumps(ident.to_registration_file(name="A", endpoint="https://example.com/ace").to_dict()).encode()
+    _install_fake_http(monkeypatch, _Resp(200, "Application/JSON; charset=utf-8", body))
+    assert fetch_registration_file("example.com").id == ident.get_ace_id()
 
 
-def test_fetch_rejects_redirect(monkeypatch):
-    resp = _DummyResponse(headers={"Location": "http://169.254.169.254/"}, body=b"", status=302)
-    _patch_pinned(monkeypatch, resp)
-    with pytest.raises(ValueError, match="Refusing to follow redirect"):
-        fetch_registration_file("example.com")
+def _install_fake_http(monkeypatch, resp):
+    monkeypatch.setattr(disc.socket, "getaddrinfo",
+                        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))])
+    monkeypatch.setattr(disc.socket, "create_connection", lambda *a, **k: object())
 
-
-def test_urlopen_pinned_connects_to_the_vetted_ip(monkeypatch):
-    """Pinning: the socket connects to the vetted IP, and TLS/Host use the domain."""
-    monkeypatch.setattr("ace.discovery.socket.getaddrinfo", _mock_getaddrinfo("93.184.216.34"))
-    captured: dict = {}
-
-    class _Sock:
-        def close(self):
-            pass
-
-    def fake_create_connection(addr, timeout=None):
-        captured["addr"] = addr
-        return _Sock()
-
-    class _Ctx:
-        def wrap_socket(self, sock, server_hostname=None):
-            captured["sni"] = server_hostname
+    class Ctx:
+        def wrap_socket(self, sock, server_hostname):
+            assert server_hostname == "example.com"
             return sock
 
-    class _Conn:
-        def __init__(self, host, port, timeout=None):
-            captured["host"] = host
+    monkeypatch.setattr(disc.ssl, "create_default_context", lambda: Ctx())
 
-        sock = None
+    class Conn:
+        def __init__(self, *a, **k):
+            self.sock = None
 
         def request(self, *a, **k):
             pass
 
         def getresponse(self):
-            return "RESP"
+            return resp
 
         def close(self):
             pass
 
-    monkeypatch.setattr("ace.discovery.socket.create_connection", fake_create_connection)
-    monkeypatch.setattr("ace.discovery.ssl.create_default_context", lambda: _Ctx())
-    monkeypatch.setattr("ace.discovery.http.client.HTTPSConnection", _Conn)
-
-    conn, resp = discovery._urlopen_pinned("example.com", 10.0)
-    assert captured["addr"] == ("93.184.216.34", 443)  # connected to the vetted IP, not re-resolved
-    assert captured["sni"] == "example.com"            # TLS cert validated against the domain
-    assert captured["host"] == "example.com"           # Host header is the domain
-    assert resp == "RESP"
-
-
-def test_parse_registration_json_ed25519():
-    id_ = SoftwareIdentity.generate("ed25519")
-    reg = id_.to_registration_file(name="Test", endpoint="https://test.com/ace")
-    raw = reg.to_dict()
-    parsed = _parse_registration_json(raw)
-    assert parsed.ace == "1.0"
-    assert parsed.id == reg.id
-    assert parsed.name == "Test"
-    assert parsed.signing.scheme == "ed25519"
-    assert parsed.signing.address == reg.signing.address
-
-
-def test_parse_registration_json_secp256k1():
-    id_ = SoftwareIdentity.generate("secp256k1")
-    reg = id_.to_registration_file(name="Test", endpoint="https://test.com/ace")
-    raw = reg.to_dict()
-    parsed = _parse_registration_json(raw)
-    assert parsed.signing.scheme == "secp256k1"
-    assert parsed.signing.signing_public_key == reg.signing.signing_public_key
-    validate_registration_file(parsed)
-    assert verify_registration_id(parsed)
-
-
-def test_parse_registration_json_with_capabilities():
-    id_ = SoftwareIdentity.generate("ed25519")
-    from ace.types import Capability, PricingInfo
-    reg = id_.to_registration_file(
-        name="Test",
-        endpoint="https://test.com/ace",
-        capabilities=[
-            Capability(
-                id="translate",
-                description="Translate text",
-                input="text/plain",
-                pricing=PricingInfo(model="per-call", amount="1.00", currency="USD"),
-            )
-        ],
-        settlement=["crypto/instant"],
-    )
-    raw = reg.to_dict()
-    parsed = _parse_registration_json(raw)
-    assert parsed.capabilities is not None
-    assert len(parsed.capabilities) == 1
-    assert parsed.capabilities[0].id == "translate"
-    assert parsed.capabilities[0].pricing is not None
-    assert parsed.capabilities[0].pricing.amount == "1.00"
-    assert parsed.settlement == ["crypto/instant"]
-
-
-# --- SSRF protection tests ---
-
-
-def _mock_getaddrinfo(ip_str):
-    """Return a monkeypatch-ready getaddrinfo that resolves to the given IP."""
-    import socket
-    def fake_getaddrinfo(host, port, **kwargs):
-        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (ip_str, port))]
-    return fake_getaddrinfo
-
-
-def test_check_ssrf_rejects_loopback(monkeypatch):
-    monkeypatch.setattr("ace.discovery.socket.getaddrinfo", _mock_getaddrinfo("127.0.0.1"))
-    with pytest.raises(ValueError, match="non-public IP"):
-        _resolve_and_check_ssrf("evil.com")
-
-
-def test_check_ssrf_rejects_private_10(monkeypatch):
-    monkeypatch.setattr("ace.discovery.socket.getaddrinfo", _mock_getaddrinfo("10.0.0.1"))
-    with pytest.raises(ValueError, match="non-public IP"):
-        _resolve_and_check_ssrf("internal.corp")
-
-
-def test_check_ssrf_rejects_private_192(monkeypatch):
-    monkeypatch.setattr("ace.discovery.socket.getaddrinfo", _mock_getaddrinfo("192.168.1.1"))
-    with pytest.raises(ValueError, match="non-public IP"):
-        _resolve_and_check_ssrf("router.local")
-
-
-def test_check_ssrf_rejects_link_local(monkeypatch):
-    monkeypatch.setattr("ace.discovery.socket.getaddrinfo", _mock_getaddrinfo("169.254.1.1"))
-    with pytest.raises(ValueError, match="non-public IP"):
-        _resolve_and_check_ssrf("metadata.internal")
-
-
-def test_check_ssrf_allows_public_ip(monkeypatch):
-    monkeypatch.setattr("ace.discovery.socket.getaddrinfo", _mock_getaddrinfo("93.184.216.34"))
-    _resolve_and_check_ssrf("example.com")  # should not raise
-
-
-def test_check_ssrf_rejects_dns_failure(monkeypatch):
-    import socket
-    def fail(*args, **kwargs):
-        raise socket.gaierror("Name resolution failed")
-    monkeypatch.setattr("ace.discovery.socket.getaddrinfo", fail)
-    with pytest.raises(ValueError, match="DNS resolution failed"):
-        _resolve_and_check_ssrf("nonexistent.invalid")
-
-
-def test_fetch_rejects_loopback_domain(monkeypatch):
-    monkeypatch.setattr("ace.discovery.socket.getaddrinfo", _mock_getaddrinfo("127.0.0.1"))
-    with pytest.raises(ValueError, match="non-public IP"):
-        fetch_registration_file("evil.example.com")
+    monkeypatch.setattr(disc.http.client, "HTTPSConnection", Conn)

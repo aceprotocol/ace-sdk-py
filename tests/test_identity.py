@@ -1,133 +1,87 @@
-import re
+"""SoftwareIdentity, seed helpers and encryption errors."""
 
-from ace import SoftwareIdentity
+import os
 
+import pytest
 
-def test_ed25519_generate():
-    id_ = SoftwareIdentity.generate("ed25519")
-    assert id_.get_signing_scheme() == "ed25519"
-    assert id_.get_tier() == 0
-    assert len(id_.get_signing_public_key()) == 32
-    assert len(id_.get_encryption_public_key()) == 1216
-    assert len(id_.get_encryption_seed()) == 32
+from ace import (
+    SoftwareIdentity,
+    compute_conversation_id,
+    decrypt_with_seed,
+    generate_kem_seed,
+    kem_public_key_from_seed,
+)
+from ace._signing import verify_signature
+from ace.encryption import encrypt
 
-
-def test_ed25519_ace_id():
-    id_ = SoftwareIdentity.generate("ed25519")
-    ace_id = id_.get_ace_id()
-    assert re.match(r"^ace:sha256:[a-f0-9]{64}$", ace_id)
-    assert id_.get_ace_id() == ace_id  # deterministic
+from .helpers import raises
 
 
-def test_ed25519_address():
-    id_ = SoftwareIdentity.generate("ed25519")
-    addr = id_.get_address()
-    assert len(addr) > 0
-    assert not addr.startswith("0x")
+@pytest.mark.parametrize("scheme", ["ed25519", "secp256k1"])
+def test_export_round_trip_and_sign(scheme):
+    ident = SoftwareIdentity.generate(scheme)
+    exported = ident.export_private_key()
+    assert set(exported) == {"scheme", "signingPrivateKey", "encryptionPrivateKey"}
+    restored = SoftwareIdentity.from_export(exported)
+    assert restored.get_ace_id() == ident.get_ace_id()
+    assert restored.get_encryption_public_key() == ident.get_encryption_public_key()
+    data = os.urandom(32)
+    sig = ident.sign(data)
+    assert isinstance(sig, bytes) and len(sig) == (64 if scheme == "ed25519" else 65)
+    assert verify_signature(data, sig, scheme, ident.get_signing_public_key())
 
 
-def test_two_identities_differ():
-    a = SoftwareIdentity.generate("ed25519")
-    b = SoftwareIdentity.generate("ed25519")
-    assert a.get_ace_id() != b.get_ace_id()
-
-
-def test_ed25519_sign():
-    id_ = SoftwareIdentity.generate("ed25519")
-    sig, scheme = id_.sign(b"\x01\x02\x03\x04")
-    assert scheme == "ed25519"
-    assert len(sig) == 64
-
-
-def test_ed25519_export_import():
-    id_ = SoftwareIdentity.generate("ed25519")
-    d = id_.to_dict(include_private_keys=True)
-    restored = SoftwareIdentity.from_dict(d)
-    assert restored.get_ace_id() == id_.get_ace_id()
-    assert restored.get_address() == id_.get_address()
-    assert restored.get_encryption_public_key() == id_.get_encryption_public_key()
-
-
-def test_export_encryption_private_key_is_32_byte_seed():
-    import base64
-    id_ = SoftwareIdentity.generate("ed25519")
-    d = id_.to_dict(include_private_keys=True)
-    seed = base64.b64decode(d["encryptionPrivateKey"])
-    assert len(seed) == 32
-    assert seed == id_.get_encryption_seed()
-
-
-def test_constructor_rejects_wrong_length_encryption_seed():
-    import pytest
-    with pytest.raises(ValueError, match="seed must be exactly 32 bytes, got 31"):
+def test_invalid_constructor_inputs():
+    with raises("invalid_argument"):
+        SoftwareIdentity.generate("rsa")  # type: ignore[arg-type]
+    with raises("invalid_key"):
+        SoftwareIdentity("ed25519", b"\x01" * 31, b"\x02" * 32)
+    with raises("invalid_key"):
+        SoftwareIdentity("secp256k1", b"\x00" * 32, b"\x02" * 32)
+    with raises("invalid_key"):
         SoftwareIdentity("ed25519", b"\x01" * 32, b"\x02" * 31)
+    with raises("invalid_key"):
+        SoftwareIdentity.from_export({"scheme": "ed25519", "signingPrivateKey": "QR==", "encryptionPrivateKey": ""})
+    with raises("invalid_argument"):
+        SoftwareIdentity.generate("ed25519").sign(b"short")
 
 
-def test_registration_file_carries_1216_byte_encryption_key():
-    import base64
-    id_ = SoftwareIdentity.generate("secp256k1")
-    reg = id_.to_registration_file(name="T", endpoint="https://t.example.com/ace")
-    assert len(base64.b64decode(reg.signing.encryption_public_key)) == 1216
+def test_registration_file_tier_and_validation():
+    ident = SoftwareIdentity.generate("secp256k1")
+    reg = ident.to_registration_file(name="Agent", endpoint="https://agent.example/ace", tier=1)
+    assert reg.tier == 1 and reg.signing.signing_public_key is not None
+    assert SoftwareIdentity.generate("ed25519").to_registration_file(name="A", endpoint="https://a.example").tier == 0
+    with raises("invalid_registration"):
+        ident.to_registration_file(name="Agent", endpoint="http://agent.example")
+    with raises("invalid_registration"):
+        ident.to_registration_file(name="", endpoint="https://agent.example")
 
 
-def test_ed25519_registration_file():
-    id_ = SoftwareIdentity.generate("ed25519")
-    reg = id_.to_registration_file(name="TestAgent", endpoint="https://test.example.com/ace")
-    assert reg.ace == "1.0"
-    assert reg.id == id_.get_ace_id()
-    assert reg.name == "TestAgent"
-    assert reg.tier == 0
-    assert reg.signing.scheme == "ed25519"
-
-
-def test_secp256k1_generate():
-    id_ = SoftwareIdentity.generate("secp256k1")
-    assert id_.get_signing_scheme() == "secp256k1"
-    assert len(id_.get_signing_public_key()) == 33  # compressed
-    assert len(id_.get_encryption_public_key()) == 1216
-
-
-def test_secp256k1_address():
-    id_ = SoftwareIdentity.generate("secp256k1")
-    addr = id_.get_address()
-    assert re.match(r"^0x[a-fA-F0-9]{40}$", addr)
-
-
-def test_secp256k1_sign():
-    id_ = SoftwareIdentity.generate("secp256k1")
-    sig, scheme = id_.sign(b"\x01\x02\x03\x04" + b"\x00" * 28)  # 32 bytes for digest
-    assert scheme == "secp256k1"
-    assert len(sig) == 65  # r(32) + s(32) + v(1)
-
-
-def test_secp256k1_export_import():
-    id_ = SoftwareIdentity.generate("secp256k1")
-    d = id_.to_dict(include_private_keys=True)
-    restored = SoftwareIdentity.from_dict(d)
-    assert restored.get_ace_id() == id_.get_ace_id()
-    assert restored.get_address() == id_.get_address()
-    assert restored.get_signing_scheme() == "secp256k1"
-
-
-def test_eip55_checksum_address():
-    """EIP-55 addresses have mixed case."""
-    id_ = SoftwareIdentity.generate("secp256k1")
-    addr = id_.get_address()
-    assert addr.startswith("0x")
-    assert addr != addr.lower()  # should have uppercase chars (EIP-55)
-    # Verify checksum is deterministic
-    assert id_.get_address() == addr
-
-
-def test_decrypt_payload():
-    """SoftwareIdentity.decrypt_payload decrypts correctly."""
-    from ace.encryption import compute_conversation_id, encrypt
-    sender = SoftwareIdentity.generate("ed25519")
-    receiver = SoftwareIdentity.generate("ed25519")
-    conv_id = compute_conversation_id(
-        sender.get_encryption_public_key(), receiver.get_encryption_public_key()
-    )
-    plaintext = b"test payload"
-    kem_ct, payload = encrypt(plaintext, receiver.get_encryption_public_key(), conv_id)
-    decrypted = receiver.decrypt_payload(kem_ct, payload, conv_id)
-    assert decrypted == plaintext
+def test_seed_helpers_and_decrypt_errors():
+    seed = generate_kem_seed()
+    pk = kem_public_key_from_seed(seed)
+    me = SoftwareIdentity("ed25519", b"\x05" * 32, seed)
+    assert me.get_encryption_public_key() == pk
+    other = SoftwareIdentity.generate("ed25519").get_encryption_public_key()
+    cid = compute_conversation_id(pk, other)
+    kem, payload = encrypt(b"hello", pk, cid)
+    assert decrypt_with_seed(kem, payload, seed, cid) == b"hello"
+    assert me.decrypt(kem, payload, cid) == b"hello"
+    with raises("decryption_failed"):
+        decrypt_with_seed(kem, payload[:-1] + bytes([payload[-1] ^ 1]), seed, cid)
+    with raises("decryption_failed"):
+        decrypt_with_seed(kem[:-1], payload, seed, cid)
+    with raises("decryption_failed"):
+        decrypt_with_seed(kem, payload[:27], seed, cid)
+    with raises("decryption_failed"):
+        decrypt_with_seed(kem, payload, generate_kem_seed(), cid)
+    with raises("invalid_key"):
+        decrypt_with_seed(kem, payload, seed[:31], cid)
+    with raises("invalid_argument"):
+        decrypt_with_seed(kem, payload, seed, "x")
+    with raises("invalid_key"):
+        kem_public_key_from_seed(b"")
+    with raises("invalid_key"):
+        compute_conversation_id(pk, pk[:-1])
+    with raises("limit_exceeded"):
+        encrypt(b"x" * 65509, pk, cid)

@@ -3,58 +3,88 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol
+from typing import Any, Dict, List, Literal, Protocol, TypedDict, Union
+
+from .errors import ACEError, ACEErrorCode
 
 SigningScheme = Literal["ed25519", "secp256k1"]
 IdentityTier = Literal[0, 1]
 HardwareBacking = Literal["secure-enclave", "tpm", "hsm", "tee"]
 
 MessageType = Literal[
-    "rfq", "offer", "accept", "reject",
-    "invoice", "receipt",
-    "deliver", "confirm",
-    "info", "text",
+    "rfq", "offer", "accept", "reject", "invoice", "receipt", "deliver", "confirm", "info", "text",
 ]
 
-ECONOMIC_TYPES: frozenset[str] = frozenset({
-    "rfq", "offer", "accept", "reject",
-    "invoice", "receipt",
-    "deliver", "confirm",
-})
+MESSAGE_TYPES: tuple[str, ...] = (
+    "rfq", "offer", "accept", "reject", "invoice", "receipt", "deliver", "confirm", "info", "text",
+)
+ECONOMIC_TYPES: tuple[str, ...] = MESSAGE_TYPES[:8]
 
-SYSTEM_TYPES: frozenset[str] = frozenset({"info"})
-SOCIAL_TYPES: frozenset[str] = frozenset({"text"})
-MESSAGE_TYPES: frozenset[str] = ECONOMIC_TYPES | SYSTEM_TYPES | SOCIAL_TYPES
+SIGNING_SCHEMES: tuple[str, ...] = ("ed25519", "secp256k1")
+
+JSONValue = Union[None, bool, int, float, str, List["JSONValue"], Dict[str, "JSONValue"]]
+JSONObject = Dict[str, JSONValue]
 
 
 def is_message_type(t: object) -> bool:
     return isinstance(t, str) and t in MESSAGE_TYPES
 
 
-def is_economic_type(t: str) -> bool:
-    return t in ECONOMIC_TYPES
-
-
-def is_system_type(t: str) -> bool:
-    return t in SYSTEM_TYPES
-
-
-def is_social_type(t: str) -> bool:
-    return t in SOCIAL_TYPES
+def is_economic_type(t: object) -> bool:
+    return isinstance(t, str) and t in ECONOMIC_TYPES
 
 
 class ACEIdentity(Protocol):
-    """Interface that all ACE identity implementations must satisfy."""
+    """What the SDK needs from an identity (software, Secure Enclave, HSM, ...).
 
-    def get_encryption_public_key(self) -> bytes: ...
-    def get_signing_public_key(self) -> bytes: ...
-    def sign(self, data: bytes) -> tuple[bytes, SigningScheme]: ...
-    def get_address(self) -> str: ...
-    def get_signing_scheme(self) -> SigningScheme: ...
-    def get_tier(self) -> IdentityTier: ...
+    ``decrypt``: an :class:`ACEError` passes through unchanged; any other exception
+    is reported by the SDK as ``identity_unavailable`` (local, retryable).
+    """
+
     def get_ace_id(self) -> str: ...
-    def decrypt_payload(self, kem_ciphertext: bytes, payload: bytes, conversation_id: str) -> bytes: ...
+    def get_signing_scheme(self) -> SigningScheme: ...
+    def get_signing_public_key(self) -> bytes: ...
+    def get_encryption_public_key(self) -> bytes: ...
+    def sign(self, data: bytes) -> bytes: ...
+    def decrypt(self, kem_ciphertext: bytes, payload: bytes, conversation_id: str) -> bytes: ...
 
+
+class SoftwareIdentityExport(TypedDict):
+    scheme: SigningScheme
+    signingPrivateKey: str
+    encryptionPrivateKey: str
+
+
+# --- strict dict readers ------------------------------------------------------
+
+_ABSENT = object()
+
+
+def _opt(d: dict, key: str, kind: type, code: ACEErrorCode, what: str) -> Any:
+    """Optional field: absent or null -> None; otherwise must be ``kind``."""
+    v = d.get(key)
+    if v is None:
+        return None
+    if not isinstance(v, kind) or isinstance(v, bool) and kind is not bool:
+        raise ACEError(code, f"{what}.{key} must be a {kind.__name__}")
+    return v
+
+
+def _req(d: dict, key: str, kind: type, code: ACEErrorCode, what: str) -> Any:
+    v = _opt(d, key, kind, code, what)
+    if v is None:
+        raise ACEError(code, f"{what}.{key} is required")
+    return v
+
+
+def _opt_str_list(d: dict, key: str, code: ACEErrorCode, what: str) -> list[str] | None:
+    v = _opt(d, key, list, code, what)
+    if v is not None and not all(isinstance(x, str) for x in v):
+        raise ACEError(code, f"{what}.{key} must be an array of strings")
+    return None if v is None else list(v)
+
+
+# --- registration file ----------------------------------------------------------
 
 @dataclass
 class PricingInfo:
@@ -87,7 +117,7 @@ class Capability:
 
 @dataclass
 class ChainInfo:
-    network: str  # CAIP-2 format
+    network: str  # CAIP-2
     address: str
 
 
@@ -96,12 +126,12 @@ class SigningConfig:
     scheme: SigningScheme
     address: str
     encryption_public_key: str  # Base64 of the 1216-byte X-Wing public key
-    signing_public_key: str | None = None  # Base64, required for secp256k1
+    signing_public_key: str | None = None  # Base64; required for secp256k1
 
 
 @dataclass
 class RegistrationFile:
-    ace: str  # "1.0"
+    ace: str
     id: str
     name: str
     endpoint: str
@@ -114,37 +144,221 @@ class RegistrationFile:
     chains: list[ChainInfo] | None = None
 
     def to_dict(self) -> dict[str, Any]:
+        signing: dict[str, Any] = {
+            "scheme": self.signing.scheme,
+            "address": self.signing.address,
+            "encryptionPublicKey": self.signing.encryption_public_key,
+        }
+        if self.signing.signing_public_key is not None:
+            signing["signingPublicKey"] = self.signing.signing_public_key
         d: dict[str, Any] = {
-            "ace": self.ace,
-            "id": self.id,
-            "name": self.name,
-            "endpoint": self.endpoint,
-            "tier": self.tier,
-            "signing": {
-                "scheme": self.signing.scheme,
-                "address": self.signing.address,
-                "encryptionPublicKey": self.signing.encryption_public_key,
-            },
+            "ace": self.ace, "id": self.id, "name": self.name, "endpoint": self.endpoint,
+            "tier": self.tier, "signing": signing,
         }
         if self.hardware_backing is not None:
             d["hardwareBacking"] = self.hardware_backing
         if self.description is not None:
             d["description"] = self.description
-        if self.signing.signing_public_key is not None:
-            d["signing"]["signingPublicKey"] = self.signing.signing_public_key
         if self.capabilities is not None:
             d["capabilities"] = [c.to_dict() for c in self.capabilities]
         if self.settlement is not None:
-            d["settlement"] = self.settlement
+            d["settlement"] = list(self.settlement)
         if self.chains is not None:
             d["chains"] = [{"network": c.network, "address": c.address} for c in self.chains]
         return d
 
+    @staticmethod
+    def from_dict(d: object) -> "RegistrationFile":
+        """Parse the wire JSON shape. Type errors raise ``ACEError(invalid_registration)``.
+
+        Unknown fields are ignored; optional fields that are ``null`` are absent.
+        Semantic checks (ID hash, keys, URL grammar) are in ``verify_registration_file``.
+        """
+        code: ACEErrorCode = "invalid_registration"
+        if not isinstance(d, dict):
+            raise ACEError(code, "registration file must be a JSON object")
+        signing = _req(d, "signing", dict, code, "registration")
+        tier = d.get("tier")
+        if isinstance(tier, bool) or not isinstance(tier, (int, float)) or tier not in (0, 1):
+            raise ACEError(code, "registration.tier must be 0 or 1")
+        caps = _opt(d, "capabilities", list, code, "registration")
+        capabilities = None
+        if caps is not None:
+            capabilities = []
+            for c in caps:
+                if not isinstance(c, dict):
+                    raise ACEError(code, "registration.capabilities entries must be objects")
+                p = _opt(c, "pricing", dict, code, "capability")
+                capabilities.append(Capability(
+                    id=_req(c, "id", str, code, "capability"),
+                    description=_req(c, "description", str, code, "capability"),
+                    input=_opt(c, "input", str, code, "capability"),
+                    output=_opt(c, "output", str, code, "capability"),
+                    pricing=None if p is None else PricingInfo(
+                        model=_req(p, "model", str, code, "capability.pricing"),
+                        amount=_req(p, "amount", str, code, "capability.pricing"),
+                        currency=_req(p, "currency", str, code, "capability.pricing"),
+                    ),
+                ))
+        raw_chains = _opt(d, "chains", list, code, "registration")
+        chains = None
+        if raw_chains is not None:
+            if not all(isinstance(c, dict) for c in raw_chains):
+                raise ACEError(code, "registration.chains entries must be objects")
+            chains = [ChainInfo(network=_req(c, "network", str, code, "chain"),
+                                address=_req(c, "address", str, code, "chain")) for c in raw_chains]
+        return RegistrationFile(
+            ace=_req(d, "ace", str, code, "registration"),
+            id=_req(d, "id", str, code, "registration"),
+            name=_req(d, "name", str, code, "registration"),
+            endpoint=_req(d, "endpoint", str, code, "registration"),
+            tier=int(tier),  # type: ignore[arg-type]
+            signing=SigningConfig(
+                scheme=_req(signing, "scheme", str, code, "signing"),
+                address=_req(signing, "address", str, code, "signing"),
+                encryption_public_key=_req(signing, "encryptionPublicKey", str, code, "signing"),
+                signing_public_key=_opt(signing, "signingPublicKey", str, code, "signing"),
+            ),
+            hardware_backing=_opt(d, "hardwareBacking", str, code, "registration"),
+            description=_opt(d, "description", str, code, "registration"),
+            capabilities=capabilities,
+            settlement=_opt_str_list(d, "settlement", code, "registration"),
+            chains=chains,
+        )
+
+
+# --- discovery profile ------------------------------------------------------------
+
+@dataclass
+class ProfilePricing:
+    currency: str
+    max_amount: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"currency": self.currency}
+        if self.max_amount is not None:
+            d["maxAmount"] = self.max_amount
+        return d
+
+
+@dataclass
+class AgentProfile:
+    """Relay discovery profile (self-asserted metadata). All fields optional."""
+
+    name: str | None = None
+    description: str | None = None
+    image: str | None = None
+    tags: list[str] | None = None
+    capabilities: list[str] | None = None
+    chains: list[str] | None = None
+    endpoint: str | None = None
+    pricing: ProfilePricing | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {}
+        for key in ("name", "description", "image"):
+            if getattr(self, key) is not None:
+                d[key] = getattr(self, key)
+        for key in ("tags", "capabilities", "chains"):
+            if getattr(self, key) is not None:
+                d[key] = list(getattr(self, key))
+        if self.endpoint is not None:
+            d["endpoint"] = self.endpoint
+        if self.pricing is not None:
+            d["pricing"] = self.pricing.to_dict()
+        return d
+
+    @staticmethod
+    def from_dict(d: object) -> "AgentProfile":
+        """Parse the wire shape; type errors raise ``ACEError(invalid_profile)``.
+
+        Unknown top-level profile fields are ignored (never stored or signed);
+        ``pricing`` must contain only ``currency`` and optional ``maxAmount``.
+        """
+        code: ACEErrorCode = "invalid_profile"
+        if not isinstance(d, dict):
+            raise ACEError(code, "profile must be a JSON object")
+        p = _opt(d, "pricing", dict, code, "profile")
+        pricing = None
+        if p is not None:
+            extra = set(p) - {"currency", "maxAmount"}
+            if extra:
+                raise ACEError(code, f"profile.pricing has unknown fields: {sorted(extra)[:3]}")
+            pricing = ProfilePricing(
+                currency=_req(p, "currency", str, code, "profile.pricing"),
+                max_amount=_opt(p, "maxAmount", str, code, "profile.pricing"),
+            )
+        return AgentProfile(
+            name=_opt(d, "name", str, code, "profile"),
+            description=_opt(d, "description", str, code, "profile"),
+            image=_opt(d, "image", str, code, "profile"),
+            tags=_opt_str_list(d, "tags", code, "profile"),
+            capabilities=_opt_str_list(d, "capabilities", code, "profile"),
+            chains=_opt_str_list(d, "chains", code, "profile"),
+            endpoint=_opt(d, "endpoint", str, code, "profile"),
+            pricing=pricing,
+        )
+
+
+@dataclass
+class DiscoverQuery:
+    """Query parameters for GET /v1/discover."""
+
+    q: str | None = None
+    tags: str | None = None
+    chain: str | None = None
+    scheme: str | None = None
+    online: bool | None = None
+    limit: int | None = None
+    cursor: str | None = None
+
+
+class _PeerRecordRequired(TypedDict):
+    aceId: str
+    scheme: SigningScheme
+    encryptionPublicKey: str
+    signingPublicKey: str
+    registrationSignature: str
+    registeredAt: int
+
+
+class PeerRecord(_PeerRecordRequired, total=False):
+    """Wire shape of ``GET /v1/peer`` and each ``/v1/discover`` entry."""
+
+    profile: dict
+
+
+class _RegistrationRequestRequired(TypedDict):
+    aceId: str
+    encryptionPublicKey: str
+    signingPublicKey: str
+    scheme: SigningScheme
+    timestamp: int
+    signature: str
+    authorization: str
+
+
+class RegistrationRequest(_RegistrationRequestRequired, total=False):
+    """``POST /v1/register`` body. Omitted profile = keep, None = remove, dict = replace."""
+
+    profile: dict | None
+
+
+class ReplayState(TypedDict):
+    """Canonical replay.json: entries sorted by (timestamp, sender, messageId)."""
+
+    entries: list[list[Any]]
+    horizon: int
+    senderHorizons: dict[str, int]
+    version: int
+
+
+# --- envelope -----------------------------------------------------------------------
 
 @dataclass
 class EncryptionEnvelope:
-    kem_ciphertext: str  # Base64 of the 1120-byte X-Wing ciphertext (wire: kemCiphertext)
-    payload: str  # Base64 of nonce[12] || ciphertext || tag[16]
+    kem_ciphertext: str  # wire: kemCiphertext
+    payload: str
 
 
 @dataclass
@@ -155,6 +369,8 @@ class SignatureEnvelope:
 
 @dataclass
 class ACEMessage:
+    """A decoded envelope. Obtain from ``decode_envelope`` or ``create_message``."""
+
     ace: str
     message_id: str
     from_id: str
@@ -175,52 +391,12 @@ class ACEMessage:
             "conversationId": self.conversation_id,
             "type": self.type,
             "timestamp": self.timestamp,
-            "encryption": {
-                "kemCiphertext": self.encryption.kem_ciphertext,
-                "payload": self.encryption.payload,
-            },
-            "signature": {
-                "scheme": self.signature.scheme,
-                "value": self.signature.value,
-            },
+            "encryption": {"kemCiphertext": self.encryption.kem_ciphertext, "payload": self.encryption.payload},
+            "signature": {"scheme": self.signature.scheme, "value": self.signature.value},
         }
         if self.thread_id is not None:
             d["threadId"] = self.thread_id
         return d
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> "ACEMessage":
-        _REQUIRED_FIELDS = ("ace", "messageId", "from", "to", "conversationId", "type", "timestamp", "encryption", "signature")
-        missing = [f for f in _REQUIRED_FIELDS if f not in d]
-        if missing:
-            raise ValueError(f"ACEMessage missing required fields: {missing}")
-
-        enc = d["encryption"]
-        if not isinstance(enc, dict) or "kemCiphertext" not in enc or "payload" not in enc:
-            raise ValueError("ACEMessage.encryption must contain 'kemCiphertext' and 'payload'")
-
-        sig = d["signature"]
-        if not isinstance(sig, dict) or "scheme" not in sig or "value" not in sig:
-            raise ValueError("ACEMessage.signature must contain 'scheme' and 'value'")
-
-        return ACEMessage(
-            ace=d["ace"],
-            message_id=d["messageId"],
-            from_id=d["from"],
-            to_id=d["to"],
-            conversation_id=d["conversationId"],
-            type=d["type"],
-            timestamp=d["timestamp"],
-            encryption=EncryptionEnvelope(
-                kem_ciphertext=enc["kemCiphertext"],
-                payload=enc["payload"],
-            ),
-            signature=SignatureEnvelope(
-                scheme=sig["scheme"],
-                value=sig["value"],
-            ),
-            thread_id=d.get("threadId"),
-        )
 
 
 @dataclass
@@ -230,172 +406,82 @@ class ParsedMessage:
     to_id: str
     conversation_id: str
     type: MessageType
+    thread_id: str | None
     timestamp: int
     body: dict[str, Any]
-    thread_id: str | None = None
 
 
-# --- Discovery Profile ---
+# --- bodies -------------------------------------------------------------------------
+
+class _RfqRequired(TypedDict):
+    need: str
 
 
-def _get_wire_value(d: dict[str, Any], *keys: str) -> Any:
-    for key in keys:
-        if key in d:
-            return d[key]
-    raise KeyError(keys[0])
-
-@dataclass
-class ProfilePricing:
-    """Pricing reference for agent discovery."""
+class RfqBody(_RfqRequired, total=False):
+    maxPrice: str
     currency: str
-    max_amount: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"currency": self.currency}
-        if self.max_amount is not None:
-            d["maxAmount"] = self.max_amount
-        return d
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> "ProfilePricing":
-        if not isinstance(d, dict):
-            raise TypeError("ProfilePricing.from_dict expects a dict")
-        return ProfilePricing(
-            currency=d["currency"],
-            max_amount=d.get("maxAmount", d.get("max_amount")),
-        )
+    ttl: int
 
 
-@dataclass
-class AgentProfile:
-    """Agent profile for relay discovery. All fields optional."""
-    name: str | None = None
-    description: str | None = None
-    image: str | None = None
-    tags: list[str] | None = None
-    capabilities: list[str] | None = None
-    chains: list[str] | None = None
-    endpoint: str | None = None
-    pricing: ProfilePricing | None = None
-
-    def __post_init__(self) -> None:
-        if isinstance(self.pricing, dict):
-            self.pricing = ProfilePricing.from_dict(self.pricing)
-        elif self.pricing is not None and not isinstance(self.pricing, ProfilePricing):
-            raise TypeError("AgentProfile.pricing must be a ProfilePricing or dict")
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {}
-        if self.name is not None:
-            d["name"] = self.name
-        if self.description is not None:
-            d["description"] = self.description
-        if self.image is not None:
-            d["image"] = self.image
-        if self.tags is not None:
-            d["tags"] = list(self.tags)
-        if self.capabilities is not None:
-            d["capabilities"] = list(self.capabilities)
-        if self.chains is not None:
-            d["chains"] = list(self.chains)
-        if self.endpoint is not None:
-            d["endpoint"] = self.endpoint
-        if self.pricing is not None:
-            d["pricing"] = self.pricing.to_dict()
-        return d
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> "AgentProfile":
-        if not isinstance(d, dict):
-            raise TypeError("AgentProfile.from_dict expects a dict")
-        pricing = d.get("pricing")
-        return AgentProfile(
-            name=d.get("name"),
-            description=d.get("description"),
-            image=d.get("image"),
-            tags=d.get("tags"),
-            capabilities=d.get("capabilities"),
-            chains=d.get("chains"),
-            endpoint=d.get("endpoint"),
-            pricing=ProfilePricing.from_dict(pricing) if isinstance(pricing, dict) else pricing,
-        )
+class _OfferRequired(TypedDict):
+    price: str
+    currency: str
 
 
-@dataclass
-class DiscoverQuery:
-    """Query parameters for GET /v1/discover."""
-    q: str | None = None
-    tags: str | None = None
-    chain: str | None = None
-    scheme: str | None = None
-    online: bool | None = None
-    limit: int | None = None
-    cursor: str | None = None
+class OfferBody(_OfferRequired, total=False):
+    terms: str
+    ttl: int
 
 
-@dataclass
-class DiscoverAgent:
-    """Agent entry in discover response."""
-    ace_id: str
-    encryption_public_key: str
-    signing_public_key: str
-    scheme: SigningScheme
-    profile: AgentProfile
-
-    def __post_init__(self) -> None:
-        if isinstance(self.profile, dict):
-            self.profile = AgentProfile.from_dict(self.profile)
-        elif not isinstance(self.profile, AgentProfile):
-            raise TypeError("DiscoverAgent.profile must be an AgentProfile or dict")
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "aceId": self.ace_id,
-            "encryptionPublicKey": self.encryption_public_key,
-            "signingPublicKey": self.signing_public_key,
-            "scheme": self.scheme,
-            "profile": self.profile.to_dict(),
-        }
-
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> "DiscoverAgent":
-        if not isinstance(d, dict):
-            raise TypeError("DiscoverAgent.from_dict expects a dict")
-        return DiscoverAgent(
-            ace_id=_get_wire_value(d, "aceId", "ace_id"),
-            encryption_public_key=_get_wire_value(d, "encryptionPublicKey", "encryption_public_key"),
-            signing_public_key=_get_wire_value(d, "signingPublicKey", "signing_public_key"),
-            scheme=d["scheme"],
-            profile=AgentProfile.from_dict(d["profile"]) if isinstance(d["profile"], dict) else d["profile"],
-        )
+class AcceptBody(TypedDict):
+    offerId: str
 
 
-@dataclass
-class DiscoverResult:
-    """Response from GET /v1/discover."""
-    agents: list[DiscoverAgent]
-    cursor: str | None = None
+class RejectBody(TypedDict, total=False):
+    reason: str
 
-    def __post_init__(self) -> None:
-        self.agents = [
-            agent if isinstance(agent, DiscoverAgent) else DiscoverAgent.from_dict(agent)
-            for agent in self.agents
-        ]
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "agents": [agent.to_dict() for agent in self.agents],
-            "cursor": self.cursor,
-        }
+class _InvoiceRequired(TypedDict):
+    offerId: str
+    amount: str
+    currency: str
+    settlementMethod: str
 
-    @staticmethod
-    def from_dict(d: dict[str, Any]) -> "DiscoverResult":
-        if not isinstance(d, dict):
-            raise TypeError("DiscoverResult.from_dict expects a dict")
-        return DiscoverResult(
-            agents=[
-                agent if isinstance(agent, DiscoverAgent) else DiscoverAgent.from_dict(agent)
-                for agent in d.get("agents", [])
-            ],
-            cursor=d.get("cursor"),
-        )
+
+class InvoiceBody(_InvoiceRequired, total=False):
+    settlementDetails: dict
+
+
+class ReceiptBody(TypedDict):
+    referenceId: str
+    amount: str
+    currency: str
+    settlementMethod: str
+    proof: dict
+
+
+class _DeliverRequired(TypedDict):
+    type: Literal["inline", "reference"]
+
+
+class DeliverBody(_DeliverRequired, total=False):
+    content: str
+    contentType: str
+    uri: str
+    metadata: dict
+
+
+class _ConfirmRequired(TypedDict):
+    deliverId: str
+
+
+class ConfirmBody(_ConfirmRequired, total=False):
+    message: str
+
+
+class InfoBody(TypedDict):
+    message: str
+
+
+class TextBody(TypedDict):
+    message: str

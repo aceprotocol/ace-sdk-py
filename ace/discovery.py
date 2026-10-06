@@ -1,4 +1,4 @@
-"""ACE Protocol discovery: registration file validation and well-known fetch."""
+"""Peers: relay peer records, registration files, well-known fetch, profiles."""
 
 from __future__ import annotations
 
@@ -8,528 +8,357 @@ import json
 import re
 import socket
 import ssl
+import threading
+import time
 from dataclasses import dataclass
-from typing import Any, NamedTuple
-from urllib.parse import urlparse
+from typing import Any, Callable, Literal
 
 import base58
-from coincurve import PublicKey as SecpPublicKey
 
-from ._utils import CONTROL_CHAR_RE, from_base64, secp_pubkey_to_address
-from .encryption import decode_kem_public_key
-from .identity import compute_ace_id
-from .signing import build_sign_data, decode_signature, encode_payload, verify_signature
-from .types import (
-    AgentProfile,
-    Capability,
-    ChainInfo,
-    PricingInfo,
-    ProfilePricing,
-    RegistrationFile,
-    SigningConfig,
-    SigningScheme,
+from ._encoding import (
+    CONTROL_CHAR_RE,
+    decode_b64,
+    decode_signature,
+    is_ace_id,
+    is_https_url,
+    wire_int,
 )
+from ._signing import build_sign_data, encode_payload, is_valid_signing_public_key, verify_signature
+from .errors import ACEError, ACEErrorCode
+from .identity import compute_ace_id, signing_address
+from .limits import KEM_PUBLIC_KEY_SIZE, MAX_REGISTRATION_FILE_BYTES, TIMESTAMP_WINDOW_SECONDS
+from .types import SIGNING_SCHEMES, AgentProfile, ProfilePricing, RegistrationFile, SigningScheme
 
-_VALID_SCHEMES: frozenset[str] = frozenset({"ed25519", "secp256k1"})
-
-# All validation patterns are applied with fullmatch: `$` would accept a trailing "\n".
-_ACE_ID_PATTERN = re.compile(r"ace:sha256:[a-f0-9]{64}")
-_VALID_DOMAIN_PATTERN = re.compile(
-    r"[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?"
-    r"(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*"
-    r"\.[a-zA-Z]{2,}"
+_MINTING = threading.local()  # module-private construction token
+_CAIP2_RE = re.compile(r"[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}")
+_TAG_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+_AMOUNT_RE = re.compile(r"[0-9]+(\.[0-9]+)?")
+_DOMAIN_RE = re.compile(
+    r"[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}"
 )
-_CAIP2_PATTERN = re.compile(r"[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}")
-
-_DEFAULT_MAX_REGISTRATION_BYTES = 1_048_576
-
-
-_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
-
-
-def _resolve_and_check_ssrf(domain: str) -> list[str]:
-    """Resolve ``domain`` and reject if ANY address is private/internal.
-
-    Returns the vetted IP strings so the caller can connect to exactly the address
-    that was checked. Resolving here and connecting to the returned IP (rather than
-    re-resolving the hostname) removes the DNS-rebinding TOCTOU window: the IP that
-    passed the check is the IP we connect to.
-    """
-    try:
-        results = socket.getaddrinfo(domain, 443, proto=socket.IPPROTO_TCP)
-    except socket.gaierror as exc:
-        raise ValueError(f"DNS resolution failed for '{domain[:100]}': {exc}") from exc
-
-    vetted: list[str] = []
-    for _family, _type, _proto, _canon, sockaddr in results:
-        ip = ipaddress.ip_address(sockaddr[0])
-        if (
-            ip.is_private or ip.is_loopback or ip.is_link_local
-            or ip.is_reserved or ip.is_multicast or ip.is_unspecified
-        ):
-            raise ValueError(
-                f"Refusing to connect to non-public IP {ip} resolved from '{domain[:100]}'"
-            )
-        if sockaddr[0] not in vetted:
-            vetted.append(sockaddr[0])
-    if not vetted:
-        raise ValueError(f"No addresses resolved for '{domain[:100]}'")
-    return vetted
-
-
-def _decode_ed25519_address(address: str) -> bytes:
-    pub_key = base58.b58decode(address)
-    if len(pub_key) != 32:
-        raise ValueError(f"ed25519 signing.address must decode to 32 bytes, got {len(pub_key)}")
-    return pub_key
-
-
-def validate_ace_id(ace_id: str) -> bool:
-    """Validate ACE ID format: ace:sha256:<64 hex chars>."""
-    return isinstance(ace_id, str) and bool(_ACE_ID_PATTERN.fullmatch(ace_id))
-
-
-def _is_https_url(value: object) -> bool:
-    """Absolute URL with scheme ``https`` (case-insensitive) and a non-empty host."""
-    if not isinstance(value, str):
-        return False
-    try:
-        parsed = urlparse(value)
-    except ValueError:
-        return False
-    return parsed.scheme.lower() == "https" and bool(parsed.hostname)
-
-
-class RegistrationKeys(NamedTuple):
-    """Decoded public keys of a validated registration file."""
-
-    signing_public_key: bytes
-    encryption_public_key: bytes
-
-
-def _secp_address(signing_public_key: bytes) -> str:
-    return secp_pubkey_to_address(SecpPublicKey(signing_public_key).format(compressed=False))
-
-
-def validate_registration_file(reg: RegistrationFile) -> RegistrationKeys:
-    """Validate a registration file has all required fields and correct format.
-
-    Returns the decoded keys so callers need not decode them a second time.
-    """
-    if reg.ace != "1.0":
-        raise ValueError(f"Invalid ace version: expected '1.0', got '{reg.ace}'")
-    if not reg.id or not validate_ace_id(reg.id):
-        raise ValueError(f"Invalid or missing ACE id: '{reg.id}'")
-    if not isinstance(reg.name, str) or not reg.name:
-        raise ValueError("Missing required field: name")
-    if CONTROL_CHAR_RE.search(reg.name):
-        raise ValueError("Registration name must not contain control characters")
-    if not reg.endpoint:
-        raise ValueError("Missing required field: endpoint")
-    if not _is_https_url(reg.endpoint):
-        raise ValueError("endpoint must be an HTTPS URL with host")
-    # JSON does not distinguish 1 from 1.0 (TS/Swift cannot either); only bool is excluded.
-    if isinstance(reg.tier, bool) or reg.tier not in (0, 1):
-        raise ValueError(f"Invalid tier: {str(reg.tier)[:32]}")
-    if not reg.signing:
-        raise ValueError("Missing required field: signing")
-    if not reg.signing.scheme:
-        raise ValueError("Missing required field: signing.scheme")
-    if reg.signing.scheme not in _VALID_SCHEMES:
-        raise ValueError(f"Unsupported signing.scheme: '{str(reg.signing.scheme)[:32]}'")
-    if not reg.signing.address:
-        raise ValueError("Missing required field: signing.address")
-    if not reg.signing.encryption_public_key:
-        raise ValueError("Missing required field: signing.encryptionPublicKey")
-    encryption_public_key = get_registration_encryption_public_key(reg)
-    signing_public_key = get_registration_signing_public_key(reg)
-    if reg.signing.scheme == "secp256k1" and reg.signing.address != _secp_address(signing_public_key):
-        raise ValueError("signing.address does not match signing.signingPublicKey")
-    return RegistrationKeys(signing_public_key, encryption_public_key)
-
-
-def verify_registration_id(reg: RegistrationFile) -> bool:
-    """Verify that a registration file's ACE ID matches its signing key."""
-    signing_pub_key_bytes = get_registration_signing_public_key(reg)
-
-    expected_id = compute_ace_id(signing_pub_key_bytes)
-    if reg.id != expected_id:
-        return False
-    if reg.signing.scheme == "secp256k1":
-        return reg.signing.address == _secp_address(signing_pub_key_bytes)
-    return True
-
-
-def get_registration_signing_public_key(reg: RegistrationFile) -> bytes:
-    """Extract the signing public key from a validated registration file."""
-    if reg.signing.scheme == "ed25519":
-        address_pub_key = _decode_ed25519_address(reg.signing.address)
-        if reg.signing.signing_public_key:
-            signing_pub_key_bytes = from_base64(reg.signing.signing_public_key)
-            if signing_pub_key_bytes != address_pub_key:
-                raise ValueError("ed25519 signing.signingPublicKey does not match signing.address")
-        return address_pub_key
-    if reg.signing.signing_public_key:
-        return from_base64(reg.signing.signing_public_key)
-    raise ValueError(f"{reg.signing.scheme} scheme requires signing.signingPublicKey")
-
-
-def get_registration_encryption_public_key(reg: RegistrationFile) -> bytes:
-    """Extract the X-Wing encryption public key (1216 bytes) from a validated registration file."""
-    return decode_kem_public_key(reg.signing.encryption_public_key)
-
-
-# === Encryption-key binding (relay-sourced peer keys) ===
-#
-# ``ace_id`` self-certifies only the *signing* key (ace_id == sha256(signingKey)).
-# The X-Wing *encryption* key is a separate key; on its own it is an unauthenticated
-# claim.  A relay that routes ciphertext is untrusted by design, so a relay could
-# hand a client its own encryption key and read messages the client believes are E2E
-# encrypted.  The binding below is the proof that closes that gap: it is the very
-# same signature the relay requires at registration, so verifying it needs no new
-# trust anchor — just the identity's own signing key.
-
-_MISSING = object()
-
-
-def verify_encryption_key_binding(
-    ace_id: str,
-    scheme: SigningScheme,
-    encryption_public_key: str,
-    signing_public_key: str,
-    timestamp: int,
-    signature: str,
-) -> bool:
-    """Verify that ``encryption_public_key`` was authorized by ``ace_id``.
-
-    The binding is identical to what ``POST /v1/register`` signs:
-
-        build_sign_data("register", ace_id, timestamp,
-                        encode_payload(encryptionPublicKey, signingPublicKey))
-
-    signed by the identity's signing key.  This function also re-checks that
-    ``ace_id == sha256(signingPublicKey)``, so a ``True`` result means: *this exact
-    encryption key was signed by the key that defines this identity*.
-
-    ``encryption_public_key`` and ``signing_public_key`` MUST be the Base64 wire
-    strings (the signature commits to those strings, not to raw bytes).  Returns
-    ``False`` on any malformed input rather than raising, so callers can treat all
-    verification failures uniformly.
-    """
-    return _verify_binding(
-        ace_id, scheme, encryption_public_key, signing_public_key, timestamp, signature,
-    ) is not None
-
-
-def _verify_binding(
-    ace_id: str,
-    scheme: SigningScheme,
-    encryption_public_key: str,
-    signing_public_key: str,
-    timestamp: int,
-    signature: str,
-) -> RegistrationKeys | None:
-    """:func:`verify_encryption_key_binding`, returning the decoded keys on success."""
-    if scheme not in _VALID_SCHEMES:
-        return None
-    if isinstance(timestamp, bool):
-        return None
-    if isinstance(timestamp, float):
-        if not timestamp.is_integer():
-            return None
-        timestamp = int(timestamp)
-    if not isinstance(timestamp, int):
-        return None
-    try:
-        # The bound key must be a well-formed X-Wing public key.
-        enc_pub_bytes = decode_kem_public_key(encryption_public_key)
-        signing_pub_bytes = from_base64(signing_public_key)
-    except (ValueError, TypeError):
-        return None
-    # The signing key must be the one that defines this identity.
-    if compute_ace_id(signing_pub_bytes) != ace_id:
-        return None
-    try:
-        payload = encode_payload(encryption_public_key, signing_public_key)
-        sign_data = build_sign_data("register", ace_id, timestamp, payload)
-        sig_bytes = decode_signature(signature, scheme)
-        valid = verify_signature(sign_data, sig_bytes, scheme, signing_pub_bytes)
-    except (ValueError, TypeError):
-        return None
-    return RegistrationKeys(signing_pub_bytes, enc_pub_bytes) if valid else None
 
 
 @dataclass(frozen=True)
 class VerifiedPeer:
-    """A peer's public keys AFTER verifying its identity and encryption-key binding.
-
-    Holding an instance is proof that ``ace_id`` matches the signing key AND that
-    the X-Wing ``encryption_public_key`` was signed by that identity.  Construct
-    ONLY via :meth:`from_relay_response`; the bare constructor bypasses verification
-    and must never be fed untrusted data.
-    """
+    """A peer whose keys were verified. Obtain only from ``verify_peer_record``,
+    ``verify_registration_file`` or ``verify_registration_request``."""
 
     ace_id: str
     scheme: SigningScheme
     signing_public_key: bytes
     encryption_public_key: bytes
     registered_at: int
+    registration_signature: str | None
+    source: Literal["relay", "registration"]
+    profile: AgentProfile | None
 
-    @classmethod
-    def from_relay_response(cls, data: dict[str, Any]) -> "VerifiedPeer":
-        """Build a verified peer from a relay ``GET /v1/peer`` or ``/v1/discover`` entry.
+    def __post_init__(self) -> None:
+        # Also blocks dataclasses.replace(): a modified peer would no longer be verified.
+        if getattr(_MINTING, "active", False) is not True:
+            raise ACEError("invalid_argument", "VerifiedPeer is created only by the verify_* functions")
 
-        Raises ``ValueError`` if the binding signature is absent or fails — a relay
-        that substitutes an encryption key cannot produce a passing binding, so an
-        instance can only be obtained for a genuine key.
-        """
-        if not isinstance(data, dict):
-            raise ValueError("Peer response must be a dict")
-        ace_id = _peer_field(data, "aceId", "ace_id")
-        scheme = _peer_field(data, "scheme")
-        enc_pub_b64 = _peer_field(data, "encryptionPublicKey", "encryption_public_key")
-        sign_pub_b64 = _peer_field(data, "signingPublicKey", "signing_public_key")
-        signature = _peer_field(data, "registrationSignature", "registration_signature", default=None)
-        registered_at = _peer_field(data, "registeredAt", "registered_at", default=None)
-
-        if not isinstance(ace_id, str) or not validate_ace_id(ace_id):
-            raise ValueError(f"Invalid peer aceId: '{str(ace_id)[:80]}'")
-        if scheme not in _VALID_SCHEMES:
-            raise ValueError(f"Unsupported peer signing scheme: '{str(scheme)[:32]}'")
-        if not isinstance(enc_pub_b64, str) or not isinstance(sign_pub_b64, str):
-            raise ValueError("Peer response signingPublicKey/encryptionPublicKey must be strings")
-        if signature is None or registered_at is None:
-            raise ValueError(
-                "Peer response is missing the encryption-key binding "
-                "(registrationSignature/registeredAt); its encryptionPublicKey cannot be "
-                "trusted.  Without the binding a relay could substitute its own encryption key "
-                "and read messages meant to be end-to-end encrypted."
-            )
-        keys = _verify_binding(ace_id, scheme, enc_pub_b64, sign_pub_b64, registered_at, signature)
-        if keys is None:
-            raise ValueError(
-                "Peer encryption-key binding failed verification: the encryptionPublicKey is "
-                "not signed by this identity's signing key (possible key substitution / relay MITM)."
-            )
-        return cls(
-            ace_id=ace_id,
-            scheme=scheme,  # type: ignore[arg-type]
-            signing_public_key=keys.signing_public_key,
-            encryption_public_key=keys.encryption_public_key,
-            registered_at=registered_at,
-        )
+    @property
+    def address(self) -> str:
+        """ed25519: Base58 of the signing key; secp256k1: EIP-55 address."""
+        return signing_address(self.scheme, self.signing_public_key)
 
 
-def _peer_field(d: dict[str, Any], *keys: str, default: Any = _MISSING) -> Any:
-    for key in keys:
-        if key in d:
-            return d[key]
-    if default is not _MISSING:
-        return default
-    raise ValueError(f"Peer response missing required field '{keys[0]}'")
-
-
-def _parse_registration_json(data: dict) -> RegistrationFile:
-    """Parse a raw JSON dict into a RegistrationFile dataclass."""
-    signing_raw = data.get("signing", {})
+def _make_peer(**kw: Any) -> VerifiedPeer:
+    _MINTING.active = True
     try:
-        signing = SigningConfig(
-            scheme=signing_raw["scheme"],
-            address=signing_raw["address"],
-            encryption_public_key=signing_raw["encryptionPublicKey"],
-            signing_public_key=signing_raw.get("signingPublicKey"),
-        )
-    except KeyError as e:
-        raise ValueError(f"Missing required signing field: {e}") from None
-
-    capabilities = None
-    if "capabilities" in data:
-        caps = []
-        for c in data["capabilities"]:
-            pricing = None
-            if "pricing" in c:
-                pricing = PricingInfo(
-                    model=c["pricing"]["model"],
-                    amount=c["pricing"]["amount"],
-                    currency=c["pricing"]["currency"],
-                )
-            caps.append(Capability(
-                id=c["id"],
-                description=c["description"],
-                input=c.get("input"),
-                output=c.get("output"),
-                pricing=pricing,
-            ))
-        capabilities = caps
-
-    chains = None
-    if "chains" in data:
-        chains = [ChainInfo(network=ch["network"], address=ch["address"]) for ch in data["chains"]]
-
-    try:
-        return RegistrationFile(
-            ace=data["ace"],
-            id=data["id"],
-            name=data["name"],
-            endpoint=data["endpoint"],
-            tier=data["tier"],
-            signing=signing,
-            hardware_backing=data.get("hardwareBacking"),
-            description=data.get("description"),
-            capabilities=capabilities,
-            settlement=data.get("settlement"),
-            chains=chains,
-        )
-    except KeyError as e:
-        raise ValueError(f"Missing required registration field: {e}") from None
+        return VerifiedPeer(**kw)
+    finally:
+        _MINTING.active = False
 
 
-def _urlopen_pinned(domain: str, timeout: float) -> tuple[http.client.HTTPSConnection, http.client.HTTPResponse]:
-    """IO shell: resolve+vet the domain, connect to the vetted IP, issue the GET.
+# --- profile ------------------------------------------------------------------------
 
-    Pins the TCP connection to the exact address that passed the SSRF check (no
-    re-resolution → no DNS-rebinding window) while validating TLS SNI/cert against
-    the real domain. Returns ``(conn, response)``; the caller must close ``conn``.
+def _tag_list(items: list[str], name: str, max_count: int) -> None:
+    if len(items) > max_count:
+        raise ACEError("invalid_profile", f"profile.{name} has more than {max_count} items")
+    for item in items:
+        if len(item) > 32 or _TAG_RE.fullmatch(item) is None:
+            raise ACEError("invalid_profile", f"profile.{name} items must be 1-32 of [a-z0-9-]")
+
+
+def validate_profile(profile: AgentProfile | dict) -> AgentProfile:
+    """Validate a discovery profile (``invalid_profile``); returns the parsed profile."""
+    if isinstance(profile, dict):
+        profile = AgentProfile.from_dict(profile)
+    if not isinstance(profile, AgentProfile):
+        raise ACEError("invalid_profile", "profile must be an AgentProfile")
+    p = AgentProfile.from_dict(_raw_profile(profile))
+
+    def text(value: str | None, name: str, lo: int, hi: int) -> None:
+        if value is not None and (not lo <= len(value) <= hi or CONTROL_CHAR_RE.search(value)):
+            raise ACEError("invalid_profile", f"profile.{name} must be {lo}-{hi} characters without control characters")
+
+    text(p.name, "name", 1, 64)
+    text(p.description, "description", 0, 256)
+    if p.image is not None and (len(p.image) > 512 or not is_https_url(p.image)):
+        raise ACEError("invalid_profile", "profile.image must be an HTTPS URL of at most 512 characters")
+    if p.tags is not None:
+        _tag_list(p.tags, "tags", 10)
+    if p.capabilities is not None:
+        _tag_list(p.capabilities, "capabilities", 20)
+    if p.chains is not None:
+        if len(p.chains) > 10 or not all(_CAIP2_RE.fullmatch(c) for c in p.chains):
+            raise ACEError("invalid_profile", "profile.chains must be at most 10 CAIP-2 identifiers")
+    if p.endpoint is not None and not is_https_url(p.endpoint):
+        raise ACEError("invalid_profile", "profile.endpoint must be an HTTPS URL")
+    if p.pricing is not None:
+        text(p.pricing.currency, "pricing.currency", 1, 16)
+        m = p.pricing.max_amount
+        if m is not None and (len(m) > 32 or _AMOUNT_RE.fullmatch(m) is None):
+            raise ACEError("invalid_profile", "profile.pricing.maxAmount must match ^[0-9]+(\\.[0-9]+)?$ (1-32 chars)")
+    return p
+
+
+def _raw_profile(p: AgentProfile) -> dict:
+    """The attribute values of a (possibly hand-built) profile, for strict re-parsing."""
+    d: dict[str, Any] = {k: getattr(p, k) for k in
+                         ("name", "description", "image", "tags", "capabilities", "chains", "endpoint")}
+    pr = p.pricing
+    d["pricing"] = {"currency": pr.currency, "maxAmount": pr.max_amount} if isinstance(pr, ProfilePricing) else pr
+    return d
+
+
+# --- keys / binding -------------------------------------------------------------------
+
+def decode_signing_key(scheme: object, text: object, code: ACEErrorCode) -> bytes:
+    raw = decode_b64(text, code, "signingPublicKey", max_bytes=64)
+    if scheme not in SIGNING_SCHEMES or not is_valid_signing_public_key(scheme, raw):  # type: ignore[arg-type]
+        raise ACEError(code, "signingPublicKey is not a valid key for the scheme")
+    return raw
+
+
+def decode_encryption_key(text: object, code: ACEErrorCode) -> bytes:
+    raw = decode_b64(text, code, "encryptionPublicKey", max_bytes=KEM_PUBLIC_KEY_SIZE + 3)
+    if len(raw) != KEM_PUBLIC_KEY_SIZE:
+        raise ACEError(code, f"encryptionPublicKey must be {KEM_PUBLIC_KEY_SIZE} bytes")
+    return raw
+
+
+def binding_sign_data(ace_id: str, timestamp: int, enc_b64: str, sig_b64: str) -> bytes:
+    return build_sign_data("register", ace_id, timestamp, encode_payload(enc_b64, sig_b64))
+
+
+def verify_peer_record(record: dict) -> VerifiedPeer:
+    """Verify a relay ``PeerRecord``; every failure is ``invalid_peer``."""
+    code: ACEErrorCode = "invalid_peer"
+    if not isinstance(record, dict):
+        raise ACEError(code, "peer record must be an object")
+    ace_id, scheme = record.get("aceId"), record.get("scheme")
+    if not is_ace_id(ace_id):
+        raise ACEError(code, "aceId is not an ACE ID")
+    if scheme not in SIGNING_SCHEMES:
+        raise ACEError(code, "unsupported scheme")
+    enc_b64, sig_b64 = record.get("encryptionPublicKey"), record.get("signingPublicKey")
+    signing_key = decode_signing_key(scheme, sig_b64, code)
+    if compute_ace_id(signing_key) != ace_id:
+        raise ACEError(code, "aceId does not match the signing key")
+    enc_key = decode_encryption_key(enc_b64, code)
+    registered_at = wire_int(record.get("registeredAt"))
+    if registered_at is None:
+        raise ACEError(code, "registeredAt must be an integer")
+    signature = record.get("registrationSignature")
+    sig = decode_signature(signature, scheme, code)  # type: ignore[arg-type]
+    if not verify_signature(binding_sign_data(ace_id, registered_at, enc_b64, sig_b64), sig, scheme, signing_key):  # type: ignore[arg-type]
+        raise ACEError(code, "registrationSignature does not verify")
+    profile = None
+    if record.get("profile") is not None:
+        try:
+            profile = validate_profile(record["profile"])
+        except ACEError as exc:
+            raise ACEError(code, exc.message) from None
+    return _make_peer(
+        ace_id=ace_id, scheme=scheme, signing_public_key=signing_key, encryption_public_key=enc_key,
+        registered_at=registered_at, registration_signature=signature, source="relay", profile=profile,
+    )
+
+
+def verify_registration_file(
+    reg: RegistrationFile | dict, *, pinned_at: int | None = None, clock: Callable[[], int] | None = None,
+) -> VerifiedPeer:
+    """Run all 01 rules (including the ID hash); failures are ``invalid_registration``.
+
+    The peer's ``registered_at`` is ``pinned_at`` or now (a file has no signed timestamp).
     """
-    vetted_ip = _resolve_and_check_ssrf(domain)[0]
-    context = ssl.create_default_context()
-    try:
-        raw_sock = socket.create_connection((vetted_ip, 443), timeout=timeout)
-    except OSError as exc:
-        raise ValueError(
-            f"Failed to connect to {vetted_ip} for '{domain[:100]}': {exc}"
-        ) from exc
+    code: ACEErrorCode = "invalid_registration"
+    if pinned_at is not None and (isinstance(pinned_at, bool) or not isinstance(pinned_at, int) or wire_int(pinned_at) is None):
+        raise ACEError("invalid_argument", "pinned_at must be an integer in [0, 2^53-1]")
+    if isinstance(reg, dict):
+        reg = RegistrationFile.from_dict(reg)
+    if not isinstance(reg, RegistrationFile):
+        raise ACEError("invalid_argument", "expected a RegistrationFile")
+    # Re-parse to type-check hand-built dataclasses (unknown fields cannot appear here).
+    reg = RegistrationFile.from_dict(reg.to_dict())
+    if reg.ace != "1.0":
+        raise ACEError(code, "ace must be '1.0'")
+    if not is_ace_id(reg.id):
+        raise ACEError(code, "id is not an ACE ID")
+    if not reg.name or CONTROL_CHAR_RE.search(reg.name):
+        raise ACEError(code, "name must be non-empty without control characters")
+    if not is_https_url(reg.endpoint):
+        raise ACEError(code, "endpoint must match the ACE HTTPS URL grammar")
+    s = reg.signing
+    if s.scheme not in SIGNING_SCHEMES:
+        raise ACEError(code, "unsupported signing.scheme")
+    if s.scheme == "ed25519":
+        try:
+            signing_key = base58.b58decode(s.address)
+        except ValueError:
+            raise ACEError(code, "signing.address is not Base58") from None
+        if len(signing_key) != 32 or base58.b58encode(signing_key).decode("ascii") != s.address:
+            raise ACEError(code, "signing.address must be the Base58 of a 32-byte key")
+        if s.signing_public_key is not None and decode_b64(s.signing_public_key, code, "signing.signingPublicKey") != signing_key:
+            raise ACEError(code, "signing.signingPublicKey must equal Base58Decode(signing.address)")
+    else:
+        if s.signing_public_key is None:
+            raise ACEError(code, "secp256k1 requires signing.signingPublicKey")
+        signing_key = decode_signing_key("secp256k1", s.signing_public_key, code)
+        if s.address.lower() != signing_address("secp256k1", signing_key).lower():
+            raise ACEError(code, "signing.address does not match signing.signingPublicKey")
+    if compute_ace_id(signing_key) != reg.id:
+        raise ACEError(code, "id does not match the signing key")
+    enc_key = decode_encryption_key(s.encryption_public_key, code)
+    now = int(clock()) if clock is not None else int(time.time())
+    return _make_peer(
+        ace_id=reg.id, scheme=s.scheme, signing_public_key=bytes(signing_key), encryption_public_key=enc_key,
+        registered_at=now if pinned_at is None else pinned_at, registration_signature=None,
+        source="registration", profile=None,
+    )
 
-    conn = http.client.HTTPSConnection(domain, 443, timeout=timeout)
+
+# --- peer binding (rollback barrier, 02) -------------------------------------------------
+
+AdoptOutcome = Literal["adopted", "unchanged", "rotated"]
+
+
+def adopt_decision(pin: VerifiedPeer | None, candidate: VerifiedPeer, now: int) -> tuple[VerifiedPeer, AdoptOutcome]:
+    """Internal pure rule used by PeerStore.adopt: returns the binding to store and the outcome.
+
+    Rotation to a different encryption key requires a signed (relay) binding with a
+    strictly newer ``registered_at``; an unsigned registration-file candidate is adopted
+    only without a pin, or as ``unchanged`` when its key equals the pin (pin kept as is).
+    """
+    if candidate.registered_at > now + TIMESTAMP_WINDOW_SECONDS:
+        raise ACEError("invalid_peer", "registeredAt is in the future")
+    if pin is None:
+        return candidate, "adopted"
+    if pin.signing_public_key != candidate.signing_public_key or pin.scheme != candidate.scheme:
+        raise ACEError("invalid_peer", "signing key or scheme differs from the pinned binding")
+    unsigned = candidate.registration_signature is None
+    if pin.encryption_public_key == candidate.encryption_public_key:
+        if unsigned:
+            # An unsigned (registration-file) source never changes the pinned binding.
+            return pin, "unchanged"
+        newer = candidate if candidate.registered_at > pin.registered_at else pin
+        merged = _make_peer(
+            ace_id=pin.ace_id, scheme=pin.scheme, signing_public_key=pin.signing_public_key,
+            encryption_public_key=pin.encryption_public_key, registered_at=newer.registered_at,
+            registration_signature=newer.registration_signature, source=newer.source,
+            profile=candidate.profile if candidate.source == "relay" else pin.profile,
+        )
+        return merged, "unchanged"
+    if unsigned:
+        raise ACEError("stale_peer_binding", "an unsigned source cannot rotate a pinned encryption key")
+    if candidate.registered_at > pin.registered_at:
+        return candidate, "rotated"
+    raise ACEError("stale_peer_binding", "a different encryption key requires a newer registeredAt")
+
+
+# --- well-known fetch --------------------------------------------------------------------
+
+_V4_BLOCKED = [ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+    "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+)]
+_V6_BLOCKED = [ipaddress.ip_network(n) for n in (
+    "::/128", "::1/128", "100::/64", "2001:db8::/32", "fc00::/7", "fe80::/10", "ff00::/8",
+)]
+_V6_EMBEDDED = [ipaddress.ip_network("::ffff:0:0/96"), ipaddress.ip_network("64:ff9b::/96")]
+
+
+def is_blocked_address(ip: str) -> bool:
+    addr = ipaddress.ip_address(ip.split("%", 1)[0])
+    if isinstance(addr, ipaddress.IPv6Address):
+        for net in _V6_EMBEDDED:
+            if addr in net:
+                addr = ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
+                break
+        else:
+            return any(addr in n for n in _V6_BLOCKED)
+    return any(addr in n for n in _V4_BLOCKED)
+
+
+def _resolve(domain: str, allow_private: bool) -> list[str]:
     try:
-        # Pin the pre-vetted socket; wrap_socket(server_hostname=domain) sets SNI
-        # and verifies the certificate against the real domain, not the IP.
-        conn.sock = context.wrap_socket(raw_sock, server_hostname=domain)
-        conn.request("GET", "/.well-known/ace.json", headers={"Accept": "application/json"})
-        return conn, conn.getresponse()
-    except (OSError, ssl.SSLError) as exc:
-        conn.close()
-        raise ValueError(
-            f"Failed to fetch registration file from https://{domain}/.well-known/ace.json: {exc}"
-        ) from exc
+        infos = socket.getaddrinfo(domain, 443, proto=socket.IPPROTO_TCP)
+    except (socket.gaierror, OSError) as exc:
+        raise ACEError("fetch_failed", f"DNS resolution failed: {exc}") from None
+    ips: list[str] = []
+    for *_, sockaddr in infos:
+        ip = str(sockaddr[0])
+        if not allow_private and is_blocked_address(ip):
+            raise ACEError("blocked_address", f"{domain[:100]} resolves to a blocked address")
+        if ip not in ips:
+            ips.append(ip)
+    if not ips:
+        raise ACEError("fetch_failed", "no addresses resolved")
+    return ips
 
 
 def fetch_registration_file(
-    domain: str, *, timeout: float = 10.0, max_bytes: int = _DEFAULT_MAX_REGISTRATION_BYTES
+    domain: str,
+    *,
+    timeout: float = 10.0,
+    max_bytes: int = MAX_REGISTRATION_FILE_BYTES,
+    allow_private_addresses: bool = False,
 ) -> RegistrationFile:
-    """Fetch and validate a registration file from a well-known URL.
+    """GET ``https://<domain>/.well-known/ace.json`` with SSRF protection, then verify it.
 
-    Resolves ``https://<domain>/.well-known/ace.json``, validates the
-    registration file structure, and verifies the ACE ID matches the
-    signing key.
+    Connects to the vetted IP (no re-resolution), never follows redirects, requires
+    ``application/json`` and reads at most ``max_bytes + 1`` bytes. Network errors,
+    timeouts, 5xx and 429 are ``fetch_failed``; everything else ``invalid_registration``.
     """
-    if not _VALID_DOMAIN_PATTERN.fullmatch(domain):
-        raise ValueError(f"Invalid domain: '{domain[:100]}'")
-    if timeout <= 0:
-        raise ValueError(f"Invalid timeout: expected positive seconds, got {timeout!r}")
-    if max_bytes <= 0:
-        raise ValueError(f"Invalid max_bytes: expected positive integer, got {max_bytes!r}")
-
-    conn, resp = _urlopen_pinned(domain, timeout)
+    if not isinstance(domain, str) or _DOMAIN_RE.fullmatch(domain) is None:
+        raise ACEError("invalid_argument", "invalid domain")
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not timeout > 0:
+        raise ACEError("invalid_argument", "timeout must be positive")
+    if type(max_bytes) is not int or max_bytes < 1:
+        raise ACEError("invalid_argument", "max_bytes must be a positive integer")
+    ip = _resolve(domain, allow_private_addresses)[0]
+    conn = http.client.HTTPSConnection(domain, 443, timeout=timeout)
     try:
-        # Do NOT follow redirects — a redirect target would bypass SSRF vetting.
-        if resp.status in _REDIRECT_STATUSES:
-            location = resp.getheader("Location", "") or ""
-            raise ValueError(
-                f"Refusing to follow redirect ({resp.status}) to '{location[:100]}' "
-                f"when fetching registration file"
-            )
+        try:
+            raw_sock = socket.create_connection((ip, 443), timeout=timeout)
+            conn.sock = ssl.create_default_context().wrap_socket(raw_sock, server_hostname=domain)
+            conn.request("GET", "/.well-known/ace.json", headers={"Accept": "application/json"})
+            resp = conn.getresponse()
+        except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+            raise ACEError("fetch_failed", f"fetch failed: {exc}") from None
+        if resp.status >= 500 or resp.status == 429:
+            raise ACEError("fetch_failed", f"HTTP {resp.status}", status=resp.status)
         if resp.status != 200:
-            raise ValueError(
-                f"Failed to fetch registration file: {resp.status} {resp.reason}"
-            )
-
-        content_type = resp.getheader("Content-Type", "") or ""
-        if "application/json" not in content_type:
-            raise ValueError(
-                f"Invalid or missing content-type: expected application/json, got '{content_type}'"
-            )
-
-        content_length = resp.getheader("Content-Length")
-        if content_length is not None:
-            declared_length = int(content_length)
-            if declared_length > max_bytes:
-                raise ValueError(
-                    f"Registration file too large: {declared_length} bytes exceeds max {max_bytes}"
-                )
-
-        raw_bytes = resp.read(max_bytes + 1)
-        if len(raw_bytes) > max_bytes:
-            raise ValueError(
-                f"Registration file too large: {len(raw_bytes)} bytes exceeds max {max_bytes}"
-            )
-        raw = json.loads(raw_bytes)
+            raise ACEError("invalid_registration", f"HTTP {resp.status} (redirects are not followed)", status=resp.status)
+        media = (resp.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if media != "application/json":
+            raise ACEError("invalid_registration", "content-type must be application/json")
+        try:
+            body = resp.read(max_bytes + 1)
+        except (OSError, http.client.HTTPException) as exc:
+            raise ACEError("fetch_failed", f"read failed: {exc}") from None
     finally:
         conn.close()
-
-    reg = _parse_registration_json(raw)
-    keys = validate_registration_file(reg)
-    if compute_ace_id(keys.signing_public_key) != reg.id:
-        raise ValueError("Registration ACE ID does not match signing key")
-
+    if len(body) > max_bytes:
+        raise ACEError("invalid_registration", f"registration file exceeds {max_bytes} bytes")
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        raise ACEError("invalid_registration", "registration file is not JSON") from None
+    reg = RegistrationFile.from_dict(data)
+    verify_registration_file(reg)
     return reg
 
-
-_TAG_PATTERN = re.compile(r'[a-z0-9][a-z0-9-]*')
-
-
-def _validate_tag_like_list(items: list, field_name: str, max_count: int) -> None:
-    """Validate a list of tag-like strings (tags or capabilities)."""
-    if not isinstance(items, list) or len(items) > max_count:
-        raise ValueError(f"Invalid profile: {field_name} must be a list of at most {max_count} items")
-    for item in items:
-        if not isinstance(item, str) or len(item) > 32 or not _TAG_PATTERN.fullmatch(item):
-            raise ValueError(
-                f"Invalid profile: each {field_name[:-1]} must be 1-32 lowercase alphanumeric chars or hyphens ({field_name})"
-            )
-
-
-def validate_profile(profile: "AgentProfile") -> None:
-    """Validate an AgentProfile. Raises ValueError on invalid fields."""
-    if profile.name is not None:
-        if not isinstance(profile.name, str) or len(profile.name) < 1 or len(profile.name) > 64:
-            raise ValueError("Invalid profile: name must be 1-64 characters")
-        if CONTROL_CHAR_RE.search(profile.name):
-            raise ValueError("Invalid profile: name must not contain control characters")
-
-    if profile.description is not None:
-        if not isinstance(profile.description, str) or len(profile.description) > 256:
-            raise ValueError("Invalid profile: description must be at most 256 characters")
-        if CONTROL_CHAR_RE.search(profile.description):
-            raise ValueError("Invalid profile: description must not contain control characters")
-
-    if profile.image is not None:
-        if not isinstance(profile.image, str) or len(profile.image) > 512:
-            raise ValueError("Invalid profile: image must be at most 512 characters")
-        if not _is_https_url(profile.image):
-            raise ValueError("Invalid profile: image must be a valid HTTPS URL (image)")
-
-    if profile.tags is not None:
-        _validate_tag_like_list(profile.tags, "tags", 10)
-
-    if profile.capabilities is not None:
-        _validate_tag_like_list(profile.capabilities, "capabilities", 20)
-
-    if profile.chains is not None:
-        if not isinstance(profile.chains, list) or len(profile.chains) > 10:
-            raise ValueError("Invalid profile: chains must be a list of at most 10 items")
-        for chain in profile.chains:
-            if not isinstance(chain, str) or not _CAIP2_PATTERN.fullmatch(chain):
-                raise ValueError("Invalid profile: each chain must be a CAIP-2 identifier (chains)")
-
-    if profile.endpoint is not None:
-        if not isinstance(profile.endpoint, str):
-            raise ValueError("Invalid profile: endpoint must be a string")
-        if not _is_https_url(profile.endpoint):
-            raise ValueError("Invalid profile: endpoint must be a valid HTTPS URL with host (endpoint)")
-
-    if profile.pricing is not None:
-        if not isinstance(profile.pricing, ProfilePricing):
-            raise ValueError("Invalid profile: pricing must be a ProfilePricing object (pricing)")
-        if not profile.pricing.currency:
-            raise ValueError("Invalid profile: pricing.currency is required (pricing)")

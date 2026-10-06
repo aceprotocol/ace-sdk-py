@@ -1,143 +1,118 @@
-"""ACE Protocol identity: SoftwareIdentity implementation.
+"""SoftwareIdentity (Tier 0): keys held in process memory.
 
-Security note on key material lifetime:
-    SoftwareIdentity (Tier 0) stores private keys as Python objects in memory.
-    Python does not provide deterministic memory zeroization — key bytes persist
-    until garbage-collected and may be swapped to disk.  For production
-    deployments handling high-value transactions, use Tier 1 (secure enclave /
-    TPM) or Tier 2 (HSM) identity providers.
+Python cannot zeroize memory; key bytes live until garbage-collected. Use a hardware
+identity (Secure Enclave, TPM, HSM) for high-value deployments.
 """
 
 from __future__ import annotations
 
 import hashlib
 import os
-from typing import Any
 
 import base58
 from coincurve import PrivateKey as SecpPrivateKey
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from . import xwing
-from ._utils import from_base64, secp_pubkey_to_address, to_base64
+from . import _xwing
+from ._encoding import decode_b64, eip55, keccak256, to_base64
+from .encryption import decrypt_with_key
+from .errors import ACEError
+from .limits import KEM_SEED_SIZE
 from .types import (
+    SIGNING_SCHEMES,
+    Capability,
+    ChainInfo,
     HardwareBacking,
     IdentityTier,
     RegistrationFile,
     SigningConfig,
     SigningScheme,
+    SoftwareIdentityExport,
 )
 
-_VALID_SCHEMES: frozenset[str] = frozenset({"ed25519", "secp256k1"})
+
+def compute_ace_id(signing_public_key: bytes) -> str:
+    """``ace:sha256:hex(SHA-256(signingPublicKey))``."""
+    return "ace:sha256:" + hashlib.sha256(bytes(signing_public_key)).hexdigest()
 
 
-def compute_ace_id(signing_public_key_bytes: bytes) -> str:
-    """Compute ACE ID from signing public key bytes."""
-    h = hashlib.sha256(signing_public_key_bytes).hexdigest()
-    return f"ace:sha256:{h}"
+def signing_address(scheme: str, signing_public_key: bytes) -> str:
+    """ed25519: Base58 of the key. secp256k1: EIP-55 address of the compressed key."""
+    if scheme == "ed25519":
+        return base58.b58encode(bytes(signing_public_key)).decode("ascii")
+    from coincurve import PublicKey
+
+    uncompressed = PublicKey(bytes(signing_public_key)).format(compressed=False)
+    return eip55(keccak256(uncompressed[1:])[-20:].hex())
 
 
 class SoftwareIdentity:
-    """Software-based ACE identity (Tier 0)."""
+    """Software ACE identity. Caches its expanded X-Wing key in memory (never persisted)."""
 
-    def __init__(
-        self,
-        scheme: SigningScheme,
-        signing_private_key: bytes,
-        encryption_seed: bytes,
-    ) -> None:
-        """
-        Args:
-            scheme: ``"ed25519"`` or ``"secp256k1"``.
-            signing_private_key: 32-byte signing private key.
-            encryption_seed: 32-byte X-Wing private seed (the encryption private key).
-        """
-        if scheme not in _VALID_SCHEMES:
-            raise ValueError(f"Unsupported signing scheme: '{scheme}' (expected one of {sorted(_VALID_SCHEMES)})")
-        # Validates the seed length and expands the key once for every later decrypt.
-        self._decapsulation_key = xwing.DecapsulationKey(encryption_seed)
-
-        self._scheme = scheme
-        self._signing_private_key = signing_private_key
+    def __init__(self, scheme: SigningScheme, signing_private_key: bytes, encryption_seed: bytes) -> None:
+        if scheme not in SIGNING_SCHEMES:
+            raise ACEError("invalid_argument", f"unsupported signing scheme {str(scheme)[:32]!r}")
+        if not isinstance(signing_private_key, (bytes, bytearray)) or len(signing_private_key) != 32:
+            raise ACEError("invalid_key", "signing private key must be 32 bytes")
+        if not isinstance(encryption_seed, (bytes, bytearray)) or len(encryption_seed) != KEM_SEED_SIZE:
+            raise ACEError("invalid_key", f"encryption seed must be {KEM_SEED_SIZE} bytes")
+        self._scheme: SigningScheme = scheme
+        self._signing_private_key = bytes(signing_private_key)
         self._encryption_seed = bytes(encryption_seed)
-
-        # Derive public keys and address
+        self._decapsulation_key = _xwing.DecapsulationKey(self._encryption_seed)
         if scheme == "ed25519":
-            ed_priv = Ed25519PrivateKey.from_private_bytes(signing_private_key)
-            self._signing_public_key = ed_priv.public_key().public_bytes_raw()
-            self._ed_private_key = ed_priv
-            self._address = base58.b58encode(self._signing_public_key).decode("ascii")
+            self._ed = Ed25519PrivateKey.from_private_bytes(self._signing_private_key)
+            self._signing_public_key = self._ed.public_key().public_bytes_raw()
         else:
-            sk = SecpPrivateKey(signing_private_key)
-            self._signing_public_key = sk.public_key.format(compressed=True)
-            self._secp_private_key = sk
-            uncompressed = sk.public_key.format(compressed=False)
-            self._address = secp_pubkey_to_address(uncompressed)
-
+            try:
+                self._secp = SecpPrivateKey(self._signing_private_key)
+            except Exception:
+                raise ACEError("invalid_key", "secp256k1 private key out of range") from None
+            self._signing_public_key = self._secp.public_key.format(compressed=True)
         self._encryption_public_key = self._decapsulation_key.public_key
         self._ace_id = compute_ace_id(self._signing_public_key)
 
     @classmethod
     def generate(cls, scheme: SigningScheme) -> "SoftwareIdentity":
-        """Generate a new random identity."""
-        encryption_seed = os.urandom(xwing.SEED_SIZE)
         if scheme == "ed25519":
-            signing_private_key = Ed25519PrivateKey.generate().private_bytes_raw()
+            signing = Ed25519PrivateKey.generate().private_bytes_raw()
+        elif scheme == "secp256k1":
+            signing = SecpPrivateKey().secret
         else:
-            signing_private_key = SecpPrivateKey().secret
-        return cls(scheme, signing_private_key, encryption_seed)
+            raise ACEError("invalid_argument", f"unsupported signing scheme {str(scheme)[:32]!r}")
+        return cls(scheme, signing, os.urandom(KEM_SEED_SIZE))
 
-    def get_encryption_public_key(self) -> bytes:
-        """Return the 1216-byte X-Wing encryption public key."""
-        return self._encryption_public_key
-
-    def get_signing_public_key(self) -> bytes:
-        return self._signing_public_key
-
-    def get_encryption_seed(self) -> bytes:
-        """Return the 32-byte X-Wing private seed (the encryption private key)."""
-        return self._encryption_seed
-
-    def sign(self, data: bytes) -> tuple[bytes, SigningScheme]:
-        """Sign data and return (signature, scheme). Data must be pre-hashed (32 bytes)."""
-        if self._scheme == "ed25519":
-            signature = self._ed_private_key.sign(data)
-            return signature, "ed25519"
-        else:
-            # coincurve returns r[32] || s[32] || v[1], the ACE wire order.
-            # libsecp256k1 always emits low-S, as ACE verifiers require.
-            return self._secp_private_key.sign_recoverable(data, hasher=None), "secp256k1"
-
-    def get_address(self) -> str:
-        return self._address
-
-    def get_signing_scheme(self) -> SigningScheme:
-        return self._scheme
-
-    def get_tier(self) -> IdentityTier:
-        return 0
+    # --- ACEIdentity ---
 
     def get_ace_id(self) -> str:
         return self._ace_id
 
-    def decrypt_payload(self, kem_ciphertext: bytes, payload: bytes, conversation_id: str) -> bytes:
-        """Decrypt an encrypted payload using this identity's X-Wing private seed."""
-        from .encryption import decrypt
-        return decrypt(kem_ciphertext, payload, self._decapsulation_key, conversation_id)
+    def get_signing_scheme(self) -> SigningScheme:
+        return self._scheme
 
-    def to_dict(self, *, include_private_keys: bool = False) -> dict[str, Any]:
-        """Export identity for persistence.
+    def get_signing_public_key(self) -> bytes:
+        return self._signing_public_key
 
-        Args:
-            include_private_keys: Must be explicitly set to ``True`` to include
-                private key material in the output.  This guard prevents
-                accidental leakage via logging or serialization.
-        """
-        if not include_private_keys:
-            raise ValueError(
-                "to_dict() requires include_private_keys=True to export "
-                "private key material.  This guard prevents accidental leakage."
-            )
+    def get_encryption_public_key(self) -> bytes:
+        return self._encryption_public_key
+
+    def sign(self, data: bytes) -> bytes:
+        """Sign a 32-byte signData digest. secp256k1 returns r||s||v (low-S, v in {0,1})."""
+        if not isinstance(data, (bytes, bytearray)) or len(data) != 32:
+            raise ACEError("invalid_argument", "signData must be 32 bytes")
+        if self._scheme == "ed25519":
+            return self._ed.sign(bytes(data))
+        return self._secp.sign_recoverable(bytes(data), hasher=None)
+
+    def decrypt(self, kem_ciphertext: bytes, payload: bytes, conversation_id: str) -> bytes:
+        return decrypt_with_key(self._decapsulation_key, kem_ciphertext, payload, conversation_id)
+
+    # --- convenience ---
+
+    def get_address(self) -> str:
+        return signing_address(self._scheme, self._signing_public_key)
+
+    def export_private_key(self) -> SoftwareIdentityExport:
         return {
             "scheme": self._scheme,
             "signingPrivateKey": to_base64(self._signing_private_key),
@@ -145,45 +120,47 @@ class SoftwareIdentity:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "SoftwareIdentity":
-        """Restore identity from exported dict."""
-        scheme = d["scheme"]
-        signing_priv = from_base64(d["signingPrivateKey"])
-        encryption_seed = from_base64(d["encryptionPrivateKey"])
-        return cls(scheme, signing_priv, encryption_seed)
+    def from_export(cls, data: SoftwareIdentityExport) -> "SoftwareIdentity":
+        if not isinstance(data, dict):
+            raise ACEError("invalid_argument", "export must be a dict")
+        return cls(
+            data.get("scheme"),  # type: ignore[arg-type]
+            decode_b64(data.get("signingPrivateKey"), "invalid_key", "signingPrivateKey"),
+            decode_b64(data.get("encryptionPrivateKey"), "invalid_key", "encryptionPrivateKey"),
+        )
 
     def to_registration_file(
         self,
+        *,
         name: str,
         endpoint: str,
         description: str | None = None,
+        tier: IdentityTier = 0,
         hardware_backing: HardwareBacking | None = None,
-        capabilities: list | None = None,
+        capabilities: list[Capability] | None = None,
         settlement: list[str] | None = None,
-        chains: list | None = None,
+        chains: list[ChainInfo] | None = None,
     ) -> RegistrationFile:
-        """Generate a registration file for this identity."""
-        signing_config = SigningConfig(
-            scheme=self._scheme,
-            address=self.get_address(),
-            encryption_public_key=to_base64(self._encryption_public_key),
-            signing_public_key=(
-                to_base64(self._signing_public_key)
-                if self._scheme == "secp256k1"
-                else None
-            ),
-        )
+        """Build this identity's registration file; raises ``invalid_registration`` if invalid."""
+        from .discovery import verify_registration_file
 
-        return RegistrationFile(
+        reg = RegistrationFile(
             ace="1.0",
-            id=self.get_ace_id(),
+            id=self._ace_id,
             name=name,
             endpoint=endpoint,
-            tier=self.get_tier(),
-            signing=signing_config,
+            tier=tier,
+            signing=SigningConfig(
+                scheme=self._scheme,
+                address=self.get_address(),
+                encryption_public_key=to_base64(self._encryption_public_key),
+                signing_public_key=to_base64(self._signing_public_key) if self._scheme == "secp256k1" else None,
+            ),
             hardware_backing=hardware_backing,
             description=description,
             capabilities=capabilities,
             settlement=settlement,
             chains=chains,
         )
+        verify_registration_file(reg, pinned_at=0)
+        return reg

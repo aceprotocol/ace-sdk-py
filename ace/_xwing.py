@@ -1,4 +1,4 @@
-"""X-Wing hybrid KEM (draft-connolly-cfrg-xwing-kem-11).
+"""X-Wing hybrid KEM (draft-connolly-cfrg-xwing-kem-11). Internal module.
 
 X-Wing = ML-KEM-768 + X25519, combined with SHA3-256 and a fixed label. It is the
 general-purpose hybrid KEM standardised by the CFRG; the ML-KEM-768 component gives
@@ -37,20 +37,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
     X25519PublicKey,
 )
 
-__all__ = [
-    "SEED_SIZE",
-    "PUBLIC_KEY_SIZE",
-    "CIPHERTEXT_SIZE",
-    "SHARED_SECRET_SIZE",
-    "XWING_LABEL",
-    "check_public_key",
-    "check_ciphertext",
-    "check_seed",
-    "DecapsulationKey",
-    "public_key_from_seed",
-    "encapsulate",
-    "decapsulate",
-]
+from .errors import ACEError
 
 SEED_SIZE = 32
 PUBLIC_KEY_SIZE = 1216
@@ -69,23 +56,23 @@ _EXPANDED_SIZE = _MLKEM_SEED_SIZE + _X_SIZE  # 96
 
 def _check_length(value: bytes, expected: int, what: str) -> None:
     if not isinstance(value, (bytes, bytearray)):
-        raise ValueError(f"X-Wing {what} must be bytes, got {type(value).__name__}")
+        raise ACEError("invalid_argument", f"X-Wing {what} must be bytes, got {type(value).__name__}")
     if len(value) != expected:
-        raise ValueError(f"X-Wing {what} must be exactly {expected} bytes, got {len(value)}")
+        raise ACEError("invalid_argument", f"X-Wing {what} must be exactly {expected} bytes, got {len(value)}")
 
 
 def check_public_key(public_key: bytes) -> None:
-    """Raise ``ValueError`` unless ``public_key`` is exactly 1216 bytes."""
+    """Raise ``ACEError(invalid_argument)`` unless ``public_key`` is exactly 1216 bytes."""
     _check_length(public_key, PUBLIC_KEY_SIZE, "public key")
 
 
 def check_ciphertext(ciphertext: bytes) -> None:
-    """Raise ``ValueError`` unless ``ciphertext`` is exactly 1120 bytes."""
+    """Raise ``ACEError(invalid_argument)`` unless ``ciphertext`` is exactly 1120 bytes."""
     _check_length(ciphertext, CIPHERTEXT_SIZE, "ciphertext")
 
 
 def check_seed(seed: bytes) -> None:
-    """Raise ``ValueError`` unless ``seed`` is exactly 32 bytes."""
+    """Raise ``ACEError(invalid_argument)`` unless ``seed`` is exactly 32 bytes."""
     _check_length(seed, SEED_SIZE, "seed")
 
 

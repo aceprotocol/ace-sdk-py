@@ -1,794 +1,104 @@
-"""Tests for the ACE Protocol thread state machine."""
-
-from __future__ import annotations
-
-import uuid
-
-import pytest
-
-from ace.state_machine import (
-    InvalidTransitionError,
-    ThreadStateMachine,
-    validate_thread_id,
-)
-from ace.types import ECONOMIC_TYPES
-
-
-def _uuid() -> str:
-    return str(uuid.uuid4())
-
-
-NOW = 1_700_000_000
-CONV_A = 'a' * 64
-CONV_B = 'b' * 64
-
-
-# ============================================================
-# Standard Flow
-# ============================================================
-
-class TestStandardFlow:
-    def test_full_7_step_flow(self):
-        sm = ThreadStateMachine()
-        assert sm.transition(CONV_A, 'deal-001', 'rfq', _uuid(), NOW) == 'rfq'
-        assert sm.transition(CONV_A, 'deal-001', 'offer', _uuid(), NOW) == 'offered'
-        assert sm.transition(CONV_A, 'deal-001', 'accept', _uuid(), NOW) == 'accepted'
-        assert sm.transition(CONV_A, 'deal-001', 'invoice', _uuid(), NOW) == 'invoiced'
-        assert sm.transition(CONV_A, 'deal-001', 'receipt', _uuid(), NOW) == 'paid'
-        assert sm.transition(CONV_A, 'deal-001', 'deliver', _uuid(), NOW) == 'delivered'
-        assert sm.transition(CONV_A, 'deal-001', 'confirm', _uuid(), NOW) == 'confirmed'
-
-
-# ============================================================
-# Valid Variations
-# ============================================================
-
-class TestValidVariations:
-    def test_counter_offer(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        assert sm.transition(CONV_A, 't', 'offer', _uuid(), NOW) == 'offered'
-        assert sm.transition(CONV_A, 't', 'offer', _uuid(), NOW) == 'offered'
-        assert sm.transition(CONV_A, 't', 'accept', _uuid(), NOW) == 'accepted'
-
-    def test_reject_after_offer(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        assert sm.transition(CONV_A, 't', 'reject', _uuid(), NOW) == 'rejected'
-        assert sm.is_terminal(CONV_A, 't') is True
-
-    def test_deliver_first(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        assert sm.transition(CONV_A, 't', 'deliver', _uuid(), NOW) == 'delivered'
-        assert sm.transition(CONV_A, 't', 'confirm', _uuid(), NOW) == 'confirmed'
-
-    def test_pre_paid(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        assert sm.transition(CONV_A, 't', 'receipt', _uuid(), NOW) == 'paid'
-        sm.transition(CONV_A, 't', 'deliver', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'confirm', _uuid(), NOW)
-
-
-# ============================================================
-# Real-World Commerce Scenarios
-# ============================================================
-
-class TestRealWorldScenarios:
-    def test_free_service(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'deliver', _uuid(), NOW)
-        assert sm.transition(CONV_A, 't', 'confirm', _uuid(), NOW) == 'confirmed'
-
-    def test_pre_paid_api_service(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'receipt', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'deliver', _uuid(), NOW)
-        assert sm.transition(CONV_A, 't', 'confirm', _uuid(), NOW) == 'confirmed'
-
-    def test_counter_offer_negotiation(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'invoice', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'receipt', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'deliver', _uuid(), NOW)
-        assert sm.transition(CONV_A, 't', 'confirm', _uuid(), NOW) == 'confirmed'
-
-
-# ============================================================
-# Invalid Transitions
-# ============================================================
-
-class TestInvalidTransitions:
-    def test_offer_before_rfq(self):
-        sm = ThreadStateMachine()
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-
-    def test_accept_before_offer(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-
-    def test_reject_before_offer(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'reject', _uuid(), NOW)
-
-    def test_invoice_before_accept(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'invoice', _uuid(), NOW)
-
-    def test_deliver_before_accept(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'deliver', _uuid(), NOW)
-
-    def test_confirm_before_deliver(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'confirm', _uuid(), NOW)
-
-    def test_no_double_rfq(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-
-    def test_no_double_accept(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-
-    def test_receipt_before_invoice_or_accept(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'receipt', _uuid(), NOW)
-
-    def test_no_offer_after_accept(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-
-    def test_no_rfq_after_offer(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-
-    def test_no_renegotiation_after_accept(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'reject', _uuid(), NOW)
-
-
-# ============================================================
-# Terminal State Enforcement
-# ============================================================
-
-class TestTerminalStateEnforcement:
-    def test_rejected_blocks_all_economic(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'reject', _uuid(), NOW)
-
-        for msg_type in ECONOMIC_TYPES:
-            with pytest.raises(InvalidTransitionError):
-                sm.transition(CONV_A, 't', msg_type, _uuid(), NOW)
-
-    def test_confirmed_is_terminal(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'deliver', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'confirm', _uuid(), NOW)
-
-        assert sm.is_terminal(CONV_A, 't') is True
-
-        for msg_type in ECONOMIC_TYPES:
-            with pytest.raises(InvalidTransitionError):
-                sm.transition(CONV_A, 't', msg_type, _uuid(), NOW)
-
-    def test_text_info_allowed_after_rejected(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'reject', _uuid(), NOW)
-
-        assert sm.transition(CONV_A, 't', 'text', _uuid(), NOW) == 'rejected'
-        assert sm.transition(CONV_A, 't', 'info', _uuid(), NOW) == 'rejected'
-
-    def test_text_info_allowed_after_confirmed(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'deliver', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'confirm', _uuid(), NOW)
-
-        assert sm.transition(CONV_A, 't', 'text', _uuid(), NOW) == 'confirmed'
-        assert sm.transition(CONV_A, 't', 'info', _uuid(), NOW) == 'confirmed'
-
-
-# ============================================================
-# Non-Economic Messages
-# ============================================================
-
-class TestNonEconomicMessages:
-    def test_text_always_allowed_no_state_change(self):
-        sm = ThreadStateMachine()
-        assert sm.transition(CONV_A, 't', 'text', _uuid(), NOW) == 'idle'
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        assert sm.transition(CONV_A, 't', 'text', _uuid(), NOW) == 'rfq'
-        assert sm.get_state(CONV_A, 't') == 'rfq'
-
-    def test_info_always_allowed_no_state_change(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        assert sm.transition(CONV_A, 't', 'info', _uuid(), NOW) == 'offered'
-
-    def test_text_info_do_not_require_valid_thread_id(self):
-        sm = ThreadStateMachine()
-        assert sm.transition(CONV_A, '', 'text', _uuid(), NOW) == 'idle'
-
-
-# ============================================================
-# Conversation Isolation
-# ============================================================
-
-class TestConversationIsolation:
-    def test_same_thread_id_different_conversations(self):
-        sm = ThreadStateMachine()
-        thread_id = 'deal-001'
-
-        sm.transition(CONV_A, thread_id, 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, thread_id, 'offer', _uuid(), NOW)
-
-        assert sm.get_state(CONV_B, thread_id) == 'idle'
-        sm.transition(CONV_B, thread_id, 'rfq', _uuid(), NOW)
-
-        assert sm.get_state(CONV_A, thread_id) == 'offered'
-        assert sm.get_state(CONV_B, thread_id) == 'rfq'
-
-    def test_different_thread_ids_same_conversation(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 'deal-a', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 'deal-a', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 'deal-b', 'rfq', _uuid(), NOW)
-
-        assert sm.get_state(CONV_A, 'deal-a') == 'offered'
-        assert sm.get_state(CONV_A, 'deal-b') == 'rfq'
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 'deal-b', 'accept', _uuid(), NOW)
-
-
-# ============================================================
-# ThreadId Validation
-# ============================================================
-
-class TestThreadIdValidation:
-    def test_empty_thread_id_for_economic(self):
-        sm = ThreadStateMachine()
-        with pytest.raises(ValueError, match="must not be empty"):
-            sm.transition(CONV_A, '', 'rfq', _uuid(), NOW)
-
-    def test_too_long_thread_id(self):
-        sm = ThreadStateMachine()
-        with pytest.raises(ValueError, match="exceeds max length"):
-            sm.transition(CONV_A, 'x' * 257, 'rfq', _uuid(), NOW)
-
-    def test_max_length_accepted(self):
-        sm = ThreadStateMachine()
-        assert sm.transition(CONV_A, 'x' * 256, 'rfq', _uuid(), NOW) == 'rfq'
-
-    def test_null_byte_rejected(self):
-        sm = ThreadStateMachine()
-        with pytest.raises(ValueError, match="control characters"):
-            sm.transition(CONV_A, 'deal\x00evil', 'rfq', _uuid(), NOW)
-
-    def test_newline_rejected(self):
-        sm = ThreadStateMachine()
-        with pytest.raises(ValueError, match="control characters"):
-            sm.transition(CONV_A, 'deal\nevil', 'rfq', _uuid(), NOW)
-
-    def test_tab_rejected(self):
-        sm = ThreadStateMachine()
-        with pytest.raises(ValueError, match="control characters"):
-            sm.transition(CONV_A, 'deal\tevil', 'rfq', _uuid(), NOW)
-
-    def test_del_rejected(self):
-        sm = ThreadStateMachine()
-        with pytest.raises(ValueError, match="control characters"):
-            sm.transition(CONV_A, 'deal\x7fevil', 'rfq', _uuid(), NOW)
-
-    def test_unicode_accepted(self):
-        sm = ThreadStateMachine()
-        assert sm.transition(CONV_A, 'deal-\u4ea4\u6613-\U0001f916', 'rfq', _uuid(), NOW) == 'rfq'
-
-    def test_special_printable_accepted(self):
-        sm = ThreadStateMachine()
-        assert sm.transition(CONV_A, 'deal-001/sub.task@2026', 'rfq', _uuid(), NOW) == 'rfq'
-
-
-class TestValidateThreadIdExported:
-    def test_empty(self):
-        with pytest.raises(ValueError, match="must not be empty"):
-            validate_thread_id('')
-
-    def test_control_chars(self):
-        with pytest.raises(ValueError, match="control characters"):
-            validate_thread_id('a\x00b')
-
-    def test_valid(self):
-        validate_thread_id('deal-001')  # Should not raise
-
-
-# ============================================================
-# Composite Key Safety
-# ============================================================
-
-class TestCompositeKeySafety:
-    def test_no_collision_colon_in_conv_id(self):
-        sm = ThreadStateMachine()
-        sm.transition('a:b', 'c', 'rfq', _uuid(), NOW)
-        assert sm.get_state('a:b', 'c') == 'rfq'
-        assert sm.get_state('a', 'b:c') == 'idle'
-
-    def test_no_collision_at_length_prefix_boundaries(self):
-        sm = ThreadStateMachine()
-        sm.transition('ab', 'cd', 'rfq', _uuid(), NOW)
-        assert sm.get_state('a', 'b:cd') == 'idle'
-        assert sm.get_state('ab:c', 'd') == 'idle'
-
-
-# ============================================================
-# canTransition
-# ============================================================
-
-class TestCanTransition:
-    def test_valid(self):
-        sm = ThreadStateMachine()
-        assert sm.can_transition(CONV_A, 'new', 'rfq') is True
-
-    def test_invalid(self):
-        sm = ThreadStateMachine()
-        assert sm.can_transition(CONV_A, 'new', 'offer') is False
-
-    def test_always_true_for_non_economic(self):
-        sm = ThreadStateMachine()
-        assert sm.can_transition(CONV_A, 'any', 'text') is True
-        assert sm.can_transition(CONV_A, 'any', 'info') is True
-
-    def test_false_for_invalid_thread_id(self):
-        sm = ThreadStateMachine()
-        assert sm.can_transition(CONV_A, '', 'rfq') is False
-
-    def test_false_for_terminal(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'reject', _uuid(), NOW)
-        assert sm.can_transition(CONV_A, 't', 'rfq') is False
-
-    def test_does_not_mutate_state(self):
-        sm = ThreadStateMachine()
-        sm.can_transition(CONV_A, 'new', 'rfq')
-        assert sm.get_state(CONV_A, 'new') == 'idle'
-
-
-# ============================================================
-# allowedTypes
-# ============================================================
-
-class TestAllowedTypes:
-    def test_idle_returns_rfq(self):
-        sm = ThreadStateMachine()
-        assert sm.allowed_types(CONV_A, 'new') == ['rfq']
-
-    def test_rfq_returns_offer(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        assert sm.allowed_types(CONV_A, 't') == ['offer']
-
-    def test_offered_returns_accept_reject_offer(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        allowed = sm.allowed_types(CONV_A, 't')
-        assert 'accept' in allowed
-        assert 'reject' in allowed
-        assert 'offer' in allowed
-
-    def test_accepted_returns_invoice_receipt_deliver(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        allowed = sm.allowed_types(CONV_A, 't')
-        assert 'invoice' in allowed
-        assert 'receipt' in allowed
-        assert 'deliver' in allowed
-
-    def test_confirmed_returns_empty(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'deliver', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'confirm', _uuid(), NOW)
-        assert sm.allowed_types(CONV_A, 't') == []
-
-    def test_rejected_returns_empty(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'reject', _uuid(), NOW)
-        assert sm.allowed_types(CONV_A, 't') == []
-
-
-# ============================================================
-# Snapshot & History
-# ============================================================
-
-class TestSnapshotAndHistory:
-    def test_records_history(self):
-        sm = ThreadStateMachine()
-        id1, id2 = _uuid(), _uuid()
-        sm.transition(CONV_A, 't', 'rfq', id1, 1000)
-        sm.transition(CONV_A, 't', 'offer', id2, 1001)
-
-        snap = sm.get_snapshot(CONV_A, 't')
-        assert snap.conversation_id == CONV_A
-        assert snap.thread_id == 't'
-        assert snap.state == 'offered'
-        assert len(snap.history) == 2
-        assert snap.history[0] == {'type': 'rfq', 'messageId': id1, 'timestamp': 1000}
-        assert snap.history[1] == {'type': 'offer', 'messageId': id2, 'timestamp': 1001}
-
-    def test_idle_snapshot_for_unknown(self):
-        sm = ThreadStateMachine()
-        snap = sm.get_snapshot(CONV_A, 'unknown')
-        assert snap.state == 'idle'
-        assert snap.history == []
-
-
-# ============================================================
-# Export / Import
-# ============================================================
-
-class TestExportImport:
-    def test_roundtrip(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't1', 'rfq', _uuid(), 1000)
-        sm.transition(CONV_A, 't1', 'offer', _uuid(), 1001)
-        sm.transition(CONV_B, 't2', 'rfq', _uuid(), 1002)
-
-        restored = ThreadStateMachine.from_export(sm.export_state())
-
-        assert restored.get_state(CONV_A, 't1') == 'offered'
-        assert restored.get_state(CONV_B, 't2') == 'rfq'
-        assert len(restored.get_snapshot(CONV_A, 't1').history) == 2
-
-        with pytest.raises(InvalidTransitionError):
-            restored.transition(CONV_A, 't1', 'rfq', _uuid(), NOW)
-        assert restored.transition(CONV_A, 't1', 'accept', _uuid(), NOW) == 'accepted'
-
-    def test_empty_export(self):
-        assert ThreadStateMachine().export_state() == []
-
-    def test_import_empty(self):
-        sm = ThreadStateMachine.from_export([])
-        assert sm.get_state(CONV_A, 'any') == 'idle'
-
-
-# ============================================================
-# Remove
-# ============================================================
-
-class TestRemove:
-    def test_remove_resets_to_idle(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        assert sm.remove(CONV_A, 't') is True
-        assert sm.get_state(CONV_A, 't') == 'idle'
-        assert sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW) == 'rfq'
-
-    def test_remove_nonexistent(self):
-        sm = ThreadStateMachine()
-        assert sm.remove(CONV_A, 'x') is False
-
-    def test_remove_only_targeted(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 'keep', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 'remove', 'rfq', _uuid(), NOW)
-        sm.remove(CONV_A, 'remove')
-        assert sm.get_state(CONV_A, 'keep') == 'rfq'
-        assert sm.get_state(CONV_A, 'remove') == 'idle'
-
-
-# ============================================================
-# Attack Scenarios
-# ============================================================
-
-class TestAttackScenarios:
-    def test_state_skip_idle_to_invoice(self):
-        sm = ThreadStateMachine()
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'invoice', _uuid(), NOW)
-
-    def test_state_skip_idle_to_accept(self):
-        sm = ThreadStateMachine()
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-
-    def test_state_skip_idle_to_deliver(self):
-        sm = ThreadStateMachine()
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'deliver', _uuid(), NOW)
-
-    def test_state_skip_idle_to_confirm(self):
-        sm = ThreadStateMachine()
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'confirm', _uuid(), NOW)
-
-    def test_state_skip_rfq_to_receipt(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'receipt', _uuid(), NOW)
-
-    def test_double_receipt_in_single_cycle(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'invoice', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'receipt', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'receipt', _uuid(), NOW)
-
-    def test_terminal_bypass_rejected(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'reject', _uuid(), NOW)
-
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'invoice', _uuid(), NOW)
-
-    def test_cross_conversation_hijack(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 'deal-001', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 'deal-001', 'offer', _uuid(), NOW)
-
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_B, 'deal-001', 'accept', _uuid(), NOW)
-
-    def test_null_byte_injection(self):
-        sm = ThreadStateMachine()
-        with pytest.raises(ValueError, match="control characters"):
-            sm.transition(CONV_A, 'deal\x00-001', 'rfq', _uuid(), NOW)
-
-    def test_oversized_thread_id(self):
-        sm = ThreadStateMachine()
-        with pytest.raises(ValueError, match="exceeds max length"):
-            sm.transition(CONV_A, 'A' * 10000, 'rfq', _uuid(), NOW)
-
-    def test_renegotiate_after_execution(self):
-        sm = ThreadStateMachine()
-        sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'accept', _uuid(), NOW)
-        sm.transition(CONV_A, 't', 'invoice', _uuid(), NOW)
-
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'rfq', _uuid(), NOW)
-        with pytest.raises(InvalidTransitionError):
-            sm.transition(CONV_A, 't', 'offer', _uuid(), NOW)
-
-
-# ============================================================
-# InvalidTransitionError properties
-# ============================================================
-
-class TestInvalidTransitionErrorProperties:
-    def test_exposes_properties(self):
-        sm = ThreadStateMachine()
-        with pytest.raises(InvalidTransitionError) as exc_info:
-            sm.transition(CONV_A, 'my-thread', 'offer', _uuid(), NOW)
-        err = exc_info.value
-        assert err.thread_id == 'my-thread'
-        assert err.current_state == 'idle'
-        assert err.message_type == 'offer'
-
-
-# ============================================================
-# Exhaustive: every MessageType x every state
-# ============================================================
-
-ALL_ECONOMIC_TYPES = [
-    'rfq', 'offer', 'accept', 'reject',
-    'invoice', 'receipt',
-    'deliver', 'confirm',
-]
-
-ALL_STATES = [
-    'idle', 'rfq', 'offered', 'accepted',
-    'invoiced', 'paid', 'delivered',
-    'confirmed', 'rejected',
-]
-
-PATHS_TO_STATE: dict[str, list[str]] = {
-    'idle': [],
-    'rfq': ['rfq'],
-    'offered': ['rfq', 'offer'],
-    'accepted': ['rfq', 'offer', 'accept'],
-    'invoiced': ['rfq', 'offer', 'accept', 'invoice'],
-    'paid': ['rfq', 'offer', 'accept', 'invoice', 'receipt'],
-    'delivered': ['rfq', 'offer', 'accept', 'invoice', 'receipt', 'deliver'],
-    'confirmed': ['rfq', 'offer', 'accept', 'invoice', 'receipt', 'deliver', 'confirm'],
-    'rejected': ['rfq', 'offer', 'reject'],
-}
-
-
-def _build_to_state(sm: ThreadStateMachine, conv: str, thread: str, target: str) -> None:
-    for msg_type in PATHS_TO_STATE[target]:
-        sm.transition(conv, thread, msg_type, _uuid(), NOW)
-
-
-@pytest.mark.parametrize(
-    "state,msg_type",
-    [(s, m) for s in ALL_STATES for m in ALL_ECONOMIC_TYPES],
-)
-def test_exhaustive_transition(state: str, msg_type: str):
-    sm = ThreadStateMachine()
-    thread = f"{state}-{msg_type}"
-    _build_to_state(sm, CONV_A, thread, state)
-
-    try:
-        result = sm.transition(CONV_A, thread, msg_type, _uuid(), NOW)
-        assert isinstance(result, str)
-    except InvalidTransitionError:
-        pass  # Expected for invalid transitions
-
-
-# ============================================================
-# Resource Limits (reject, never evict)
-# ============================================================
-
-def _snap(thread_id='t1', history=None, state='rfq', conv=CONV_A):
-    if history is None:
-        history = [{'type': 'rfq', 'messageId': _uuid(), 'timestamp': NOW}]
-    return {'conversationId': conv, 'threadId': thread_id, 'state': state, 'history': history}
-
-
-class TestResourceLimits:
-    @pytest.mark.parametrize("kwargs", [
-        {'max_threads': 0}, {'max_threads': -1}, {'max_threads': True}, {'max_threads': 1.0},
-        {'max_history_per_thread': 0}, {'max_history_per_thread': None},
-    ])
-    def test_invalid_limits_rejected(self, kwargs):
-        with pytest.raises(ValueError, match="positive integer"):
-            ThreadStateMachine(**kwargs)
-
-    def test_thread_limit_rejects_new_thread_and_keeps_terminal(self):
-        sm = ThreadStateMachine(max_threads=2)
-        sm.transition(CONV_A, 't1', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't1', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't1', 'reject', _uuid(), NOW)
-        sm.transition(CONV_A, 't2', 'rfq', _uuid(), NOW)
-
-        assert not sm.can_transition(CONV_A, 't3', 'rfq')
-        with pytest.raises(ValueError, match=r"Thread limit reached \(2\)"):
-            sm.transition(CONV_A, 't3', 'rfq', _uuid(), NOW)
-        # The terminal thread is never forgotten, so it cannot be reopened.
-        assert sm.is_terminal(CONV_A, 't1')
-        # Existing threads still progress at the limit.
-        assert sm.can_transition(CONV_A, 't2', 'offer')
-        sm.transition(CONV_A, 't2', 'offer', _uuid(), NOW)
-
-        assert sm.remove(CONV_A, 't1')
-        sm.transition(CONV_A, 't3', 'rfq', _uuid(), NOW)
-
-    def test_history_limit(self):
-        sm = ThreadStateMachine(max_history_per_thread=3)
-        sm.transition(CONV_A, 't1', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't1', 'offer', _uuid(), NOW)
-        sm.transition(CONV_A, 't1', 'offer', _uuid(), NOW)
-        assert not sm.can_transition(CONV_A, 't1', 'offer')
-        with pytest.raises(ValueError, match="Thread history exceeds maximum of 3 entries"):
-            sm.transition(CONV_A, 't1', 'offer', _uuid(), NOW)
-
-    def test_from_export_applies_limits(self):
-        with pytest.raises(ValueError, match="too many threads"):
-            ThreadStateMachine.from_export([_snap('t1'), _snap('t2')], max_threads=1)
-        three = [
-            {'type': 'rfq', 'messageId': _uuid(), 'timestamp': NOW},
-            {'type': 'offer', 'messageId': _uuid(), 'timestamp': NOW},
-            {'type': 'offer', 'messageId': _uuid(), 'timestamp': NOW},
-        ]
-        with pytest.raises(ValueError, match="history too large"):
-            ThreadStateMachine.from_export([_snap(history=three, state='offered')], max_history_per_thread=2)
-        restored = ThreadStateMachine.from_export([_snap('t1')], max_threads=1)
-        with pytest.raises(ValueError, match="Thread limit reached"):
-            restored.transition(CONV_A, 't2', 'rfq', _uuid(), NOW)
-
-    @pytest.mark.parametrize("snap, error", [
-        (_snap(history=[], state='idle'), "non-empty"),
-        (_snap(thread_id=''), "threadId must not be empty"),
-        (_snap(conv=''), "invalid conversationId"),
-        (_snap(conv='x' * 257), "invalid conversationId"),
-        (_snap(history=[{'type': 'rfq', 'messageId': 'm', 'timestamp': True}]), "timestamp"),
-        (_snap(history=[{'type': 'rfq', 'messageId': 'm', 'timestamp': -1}]), "timestamp"),
-        (_snap(history=[{'type': 'rfq', 'messageId': 'm', 'timestamp': 1.0}]), "timestamp"),
-        (_snap(state='offered'), "does not match"),
-    ])
-    def test_from_export_rejects_invalid_snapshot(self, snap, error):
-        with pytest.raises(ValueError, match=error):
-            ThreadStateMachine.from_export([snap])
-
-    def test_from_export_rejects_duplicate_thread(self):
-        with pytest.raises(ValueError, match="fromExport: duplicate thread"):
-            ThreadStateMachine.from_export([_snap('t1'), _snap('t1')])
-
-    def test_lengths_count_code_points(self):
-        # 256 astral-plane chars: 256 code points (512 UTF-16 units) is allowed.
-        validate_thread_id('\U0001F600' * 256)
-        ThreadStateMachine.from_export([_snap(conv='\U0001F600' * 256)])
-        with pytest.raises(ValueError, match="exceeds max length"):
-            validate_thread_id('\U0001F600' * 257)
+"""ThreadStateMachine: parties, roles, snapshots, limits."""
+
+import dataclasses
+
+from ace import ThreadEvent, ThreadHistoryEntry, ThreadSnapshot, ThreadStateMachine
+
+from .helpers import raises
+
+BUYER, SELLER, THIRD = ("ace:sha256:" + c * 64 for c in "abc")
+CONV = "c" * 64
+
+
+def ev(i, type_, frm, to, thread="t"):
+    return ThreadEvent(CONV, thread, type_, f"00000000-0000-4000-8000-{i:012d}", 1000 + i, frm, to)
+
+
+def deal(local=BUYER):
+    sm = ThreadStateMachine(local)
+    sm.apply(ev(1, "rfq", BUYER, SELLER), {"need": "x"})
+    sm.apply(ev(2, "offer", SELLER, BUYER), {})
+    return sm
+
+
+def test_constructor_validation():
+    with raises("invalid_argument"):
+        ThreadStateMachine("nope")
+    with raises("invalid_argument"):
+        ThreadStateMachine(BUYER, max_threads=0)
+    with raises("invalid_argument"):
+        ThreadStateMachine(BUYER, max_history_per_thread=True)  # type: ignore[arg-type]
+
+
+def test_non_economic_and_invalid_events():
+    sm = ThreadStateMachine(BUYER)
+    assert sm.apply(ev(1, "text", BUYER, SELLER), {}) == "idle"
+    sm.check(ev(1, "info", BUYER, BUYER), {})  # no-op, no party rules
+    with raises("invalid_envelope"):
+        sm.apply(ev(1, "rfq", BUYER, SELLER, thread=None), {})
+    with raises("invalid_envelope"):
+        sm.apply(ev(1, "bid", BUYER, SELLER), {})
+    with raises("invalid_argument"):
+        sm.apply("rfq", {})  # type: ignore[arg-type]
+
+
+def test_allowed_types_and_snapshot():
+    sm = deal()
+    assert sm.allowed_types(CONV, "t", BUYER) == ["accept", "reject"]
+    assert sm.allowed_types(CONV, "t", SELLER) == ["offer"]
+    assert sm.allowed_types(CONV, "t", THIRD) == []
+    assert sm.allowed_types(CONV, "new", THIRD) == ["rfq"]
+    snap = sm.get_snapshot(CONV, "t")
+    assert snap.local_ace_id == BUYER and snap.peer_ace_id == SELLER and snap.state == "offered"
+    assert snap.history[1] == ThreadHistoryEntry("offer", "00000000-0000-4000-8000-000000000002", 1002, SELLER)
+    assert sm.get_snapshot(CONV, "missing") is None
+    assert ThreadSnapshot.from_dict(snap.to_dict()) == snap
+    assert sm.remove(CONV, "t") and not sm.remove(CONV, "t")
+
+
+def test_check_does_not_mutate():
+    sm = deal()
+    before = sm.export_state()
+    sm.check(ev(3, "accept", BUYER, SELLER), {"offerId": "00000000-0000-4000-8000-000000000002"})
+    assert sm.export_state() == before
+
+
+def test_limits_reject_never_evict():
+    sm = ThreadStateMachine(BUYER, max_threads=1, max_history_per_thread=2)
+    sm.apply(ev(1, "rfq", BUYER, SELLER, "a"), {})
+    with raises("limit_exceeded"):
+        sm.apply(ev(2, "rfq", BUYER, SELLER, "b"), {})
+    sm.apply(ev(2, "offer", SELLER, BUYER, "a"), {})
+    with raises("limit_exceeded"):
+        sm.apply(ev(3, "offer", SELLER, BUYER, "a"), {})
+    assert sm.get_state(CONV, "a") == "offered"
+
+
+def test_from_state_round_trip_and_violations():
+    sm = deal(SELLER)
+    snaps = sm.export_state()
+    restored = ThreadStateMachine.from_state(snaps, SELLER)
+    assert restored.export_state() == snaps
+    with raises("invalid_argument"):
+        ThreadStateMachine.from_state(snaps, BUYER)
+    s = snaps[0]
+    bad_cases = [
+        dataclasses.replace(s, state="accepted"),
+        dataclasses.replace(s, peer_ace_id=SELLER),
+        dataclasses.replace(s, history=()),
+        dataclasses.replace(s, history=(s.history[1], s.history[0])),
+        dataclasses.replace(s, history=(s.history[0], dataclasses.replace(s.history[1], from_id=BUYER))),
+        dataclasses.replace(s, history=(s.history[0], dataclasses.replace(s.history[1], from_id=THIRD))),
+        dataclasses.replace(s, history=(s.history[0], dataclasses.replace(s.history[1], message_id="x"))),
+        dataclasses.replace(s, conversation_id="C" * 64),
+        dataclasses.replace(s, thread_id=""),
+    ]
+    for bad in bad_cases:
+        with raises("invalid_argument"):
+            ThreadStateMachine.from_state([bad], SELLER)
+    with raises("invalid_argument"):
+        ThreadStateMachine.from_state([s, s], SELLER)
+    with raises("invalid_argument"):
+        ThreadStateMachine.from_state(snaps, SELLER, max_history_per_thread=1)
+    with raises("invalid_argument"):
+        ThreadSnapshot.from_dict({"history": [{"timestamp": -1}]})

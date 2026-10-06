@@ -1,108 +1,118 @@
 """ACE Protocol SDK — Agent Commerce Engine."""
 
-from . import xwing
+from ._encoding import (
+    from_base64,
+    is_ace_id,
+    is_conversation_id,
+    is_message_id,
+    is_thread_id,
+    to_base64,
+)
+from .auth import RelayAuthRequest, create_auth_headers, parse_auth_headers, verify_auth_headers
 from .discovery import (
-    RegistrationKeys,
     VerifiedPeer,
     fetch_registration_file,
-    get_registration_encryption_public_key,
-    get_registration_signing_public_key,
-    validate_ace_id,
     validate_profile,
-    validate_registration_file,
-    verify_encryption_key_binding,
-    verify_registration_id,
+    verify_peer_record,
+    verify_registration_file,
 )
 from .encryption import (
-    MAX_PAYLOAD_SIZE,
     compute_conversation_id,
-    decode_kem_ciphertext,
-    decode_kem_public_key,
-    decrypt,
-    encrypt,
-    get_ace_kem_salt,
+    decrypt_with_seed,
+    generate_kem_seed,
+    kem_public_key_from_seed,
 )
+from .envelope import decode_envelope, envelope_fingerprint, verify_envelope_signature
+from .errors import ACEError, ACEErrorCategory, ACEErrorCode
 from .identity import SoftwareIdentity, compute_ace_id
-from .messages import (
-    create_message,
-    parse_message,
-    parse_message_from_peer,
-    parse_message_from_registration,
-    validate_body,
+from .limits import (
+    DEFAULT_REPLAY_CAPACITY,
+    KEM_CIPHERTEXT_SIZE,
+    KEM_PUBLIC_KEY_SIZE,
+    KEM_SEED_SIZE,
+    MAX_ENVELOPE_BYTES,
+    MAX_INBOX_PAGE,
+    MAX_JSON_DEPTH,
+    MAX_PAYLOAD_BYTES,
+    MAX_PLAINTEXT_BYTES,
+    MAX_REGISTRATION_FILE_BYTES,
+    MAX_THREAD_ID_LENGTH,
+    OFFLINE_WINDOW_SECONDS,
+    TIMESTAMP_WINDOW_SECONDS,
 )
-from .registration import build_registration_payload, create_registration_request
-from .security import ReplayDetector, check_timestamp_freshness, validate_message_id
-from .signing import (
-    build_sign_data,
-    decode_signature,
-    encode_payload,
-    encode_signature,
-    verify_signature,
-)
+from .messages import create_message, parse_message, validate_body
+from .registration import create_registration_request, verify_registration_request
+from .replay import ReplayDetector
 from .state_machine import (
-    InvalidTransitionError,
+    ThreadEvent,
+    ThreadHistoryEntry,
     ThreadSnapshot,
+    ThreadState,
     ThreadStateMachine,
-    validate_thread_id,
 )
 from .types import (
     ECONOMIC_TYPES,
     MESSAGE_TYPES,
-    SOCIAL_TYPES,
-    SYSTEM_TYPES,
+    AcceptBody,
     ACEIdentity,
     ACEMessage,
     AgentProfile,
     Capability,
     ChainInfo,
-    DiscoverAgent,
+    ConfirmBody,
+    DeliverBody,
     DiscoverQuery,
-    DiscoverResult,
     EncryptionEnvelope,
     HardwareBacking,
     IdentityTier,
+    InfoBody,
+    InvoiceBody,
+    JSONObject,
+    JSONValue,
     MessageType,
+    OfferBody,
     ParsedMessage,
+    PeerRecord,
     PricingInfo,
     ProfilePricing,
+    ReceiptBody,
     RegistrationFile,
+    RegistrationRequest,
+    RejectBody,
+    ReplayState,
+    RfqBody,
     SignatureEnvelope,
     SigningConfig,
     SigningScheme,
+    SoftwareIdentityExport,
+    TextBody,
     is_economic_type,
     is_message_type,
-    is_social_type,
-    is_system_type,
 )
 
 __all__ = [
-    "create_registration_request", "build_registration_payload",
-    # Types
-    "ACEIdentity", "SigningScheme", "IdentityTier", "HardwareBacking",
-    "RegistrationFile", "SigningConfig", "Capability", "PricingInfo", "ChainInfo",
-    "ACEMessage", "MessageType", "EncryptionEnvelope", "SignatureEnvelope", "ParsedMessage",
-    "ProfilePricing", "AgentProfile", "DiscoverQuery", "DiscoverAgent", "DiscoverResult",
-    "is_message_type", "is_economic_type", "is_system_type", "is_social_type",
-    "MESSAGE_TYPES", "ECONOMIC_TYPES", "SYSTEM_TYPES", "SOCIAL_TYPES",
-    # Identity
-    "SoftwareIdentity", "compute_ace_id",
-    # Encryption
-    "compute_conversation_id", "encrypt", "decrypt", "get_ace_kem_salt", "MAX_PAYLOAD_SIZE",
-    "decode_kem_public_key", "decode_kem_ciphertext", "xwing",
-    # Signing
-    "build_sign_data", "encode_payload",
-    "verify_signature", "encode_signature", "decode_signature",
-    # Messages
-    "create_message", "parse_message", "parse_message_from_registration",
-    "parse_message_from_peer", "validate_body",
-    # Discovery
-    "validate_registration_file", "RegistrationKeys", "validate_ace_id", "verify_registration_id",
-    "get_registration_signing_public_key", "get_registration_encryption_public_key",
-    "fetch_registration_file",
-    "validate_profile",
-    "verify_encryption_key_binding", "VerifiedPeer",
-    # Security
-    "check_timestamp_freshness", "validate_message_id", "ReplayDetector",
-    # State Machine
-    "ThreadStateMachine", "ThreadSnapshot", "InvalidTransitionError", "validate_thread_id",
+    # types
+    "ACEIdentity", "SigningScheme", "IdentityTier", "HardwareBacking", "RegistrationFile",
+    "SigningConfig", "Capability", "PricingInfo", "ChainInfo", "AgentProfile", "ProfilePricing",
+    "DiscoverQuery", "PeerRecord", "ACEMessage", "MessageType", "EncryptionEnvelope",
+    "SignatureEnvelope", "RfqBody", "OfferBody", "AcceptBody", "RejectBody", "InvoiceBody",
+    "ReceiptBody", "DeliverBody", "ConfirmBody", "InfoBody", "TextBody", "JSONValue", "JSONObject",
+    "ParsedMessage", "ThreadState", "ThreadSnapshot", "ThreadHistoryEntry", "ThreadEvent",
+    "ReplayState", "RegistrationRequest", "RelayAuthRequest", "ACEErrorCode", "ACEErrorCategory",
+    "SoftwareIdentityExport",
+    # values
+    "ACEError", "MESSAGE_TYPES", "ECONOMIC_TYPES", "is_message_type", "is_economic_type",
+    "MAX_PLAINTEXT_BYTES", "MAX_PAYLOAD_BYTES", "MAX_ENVELOPE_BYTES", "MAX_JSON_DEPTH",
+    "MAX_THREAD_ID_LENGTH", "TIMESTAMP_WINDOW_SECONDS", "OFFLINE_WINDOW_SECONDS",
+    "MAX_REGISTRATION_FILE_BYTES", "MAX_INBOX_PAGE", "KEM_SEED_SIZE", "KEM_PUBLIC_KEY_SIZE",
+    "KEM_CIPHERTEXT_SIZE", "DEFAULT_REPLAY_CAPACITY",
+    "SoftwareIdentity", "compute_ace_id", "to_base64", "from_base64", "compute_conversation_id",
+    "decrypt_with_seed", "kem_public_key_from_seed", "generate_kem_seed",
+    "decode_envelope", "verify_envelope_signature", "envelope_fingerprint",
+    "is_ace_id", "is_message_id", "is_thread_id", "is_conversation_id",
+    "create_message", "parse_message", "validate_body",
+    "VerifiedPeer", "verify_peer_record", "verify_registration_file", "fetch_registration_file",
+    "validate_profile", "create_registration_request", "verify_registration_request",
+    "create_auth_headers", "parse_auth_headers", "verify_auth_headers",
+    "ReplayDetector", "ThreadStateMachine",
 ]

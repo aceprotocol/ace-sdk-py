@@ -3,26 +3,40 @@ from ace import (
     SoftwareIdentity,
     ThreadStateMachine,
     create_message,
+    decode_envelope,
     parse_message,
+    verify_registration_file,
 )
 
 alice = SoftwareIdentity.generate("ed25519")
-bob = SoftwareIdentity.generate("ed25519")
-message = create_message(
-    sender=alice,
-    recipient_pub_key=bob.get_encryption_public_key(),
-    recipient_ace_id=bob.get_ace_id(),
-    type_="rfq",
-    body={"need": "Translate 500 words EN→FR", "maxPrice": "10", "currency": "USDC"},
-    thread_id="translation-1",
-    state_machine=ThreadStateMachine(),
+bob = SoftwareIdentity.generate("secp256k1")
+
+# Each side verifies the other's registration file (normally fetched with
+# fetch_registration_file or resolved from a relay with verify_peer_record).
+alice_peer = verify_registration_file(
+    alice.to_registration_file(name="Alice", endpoint="https://alice.example/ace")
+)
+bob_peer = verify_registration_file(
+    bob.to_registration_file(name="Bob", endpoint="https://bob.example/ace")
 )
 
-# The keys are trusted here because both identities were created locally.
-parsed = parse_message(
-    message, bob, alice.get_signing_public_key(),
-    sender_encryption_pub_key=alice.get_encryption_public_key(),
-    state_machine=ThreadStateMachine(),
-    replay_detector=ReplayDetector(),
+alice_threads = ThreadStateMachine(alice.get_ace_id())
+bob_threads = ThreadStateMachine(bob.get_ace_id())
+bob_replay = ReplayDetector()
+
+envelope = create_message(
+    alice,
+    bob_peer,
+    "rfq",
+    {"need": "Translate 500 words EN→FR", "maxPrice": "10", "currency": "USDC"},
+    alice_threads,
+    thread_id="translation-1",
 )
-print(parsed.body)
+
+# On the wire the envelope is JSON; the receiver decodes it strictly first.
+wire = envelope.to_dict()
+parsed = parse_message(
+    decode_envelope(wire), bob, alice_peer, threads=bob_threads, replay=bob_replay
+)
+print(parsed.type, parsed.body)
+print(bob_threads.allowed_types(parsed.conversation_id, "translation-1", bob.get_ace_id()))

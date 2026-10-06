@@ -1,498 +1,242 @@
-"""ACE Protocol message construction and schema validation."""
+"""Message construction and the receive pipeline (06-security)."""
 
 from __future__ import annotations
 
-import json
-import re
 import time
 import uuid
+from typing import Callable
 
-from ._utils import from_base64, to_base64
-from .discovery import VerifiedPeer, validate_registration_file
-from .encryption import MAX_PAYLOAD_SIZE, compute_conversation_id, decode_kem_ciphertext, encrypt
-from .identity import compute_ace_id
-from .security import ReplayDetector, check_timestamp_freshness, validate_message_id
-from .signing import (
-    build_sign_data,
+from ._encoding import (
+    check_json_value,
     decode_signature,
-    encode_payload,
+    dumps_body,
     encode_signature,
-    verify_signature,
+    is_thread_id,
+    loads_body,
+    to_base64,
+    wire_int,
 )
-from .state_machine import InvalidTransitionError, ThreadStateMachine, validate_thread_id
+from ._signing import verify_signature
+from .discovery import VerifiedPeer
+from .encryption import compute_conversation_id, encrypt
+from .envelope import decode_kem_ciphertext, decode_payload, message_sign_data, revalidate
+from .errors import ACEError
+from .limits import MAX_PLAINTEXT_BYTES, TIMESTAMP_WINDOW_SECONDS
+from .replay import ReplayDetector
+from .state_machine import ThreadEvent, ThreadStateMachine
 from .types import (
     ACEIdentity,
     ACEMessage,
     EncryptionEnvelope,
     MessageType,
     ParsedMessage,
-    RegistrationFile,
     SignatureEnvelope,
-    SigningScheme,
     is_economic_type,
     is_message_type,
 )
 
-_CONVERSATION_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
-MAX_JSON_DEPTH = 32
+# --- body schema ------------------------------------------------------------------
+
+_STR, _OPT_STR, _OPT_OBJ, _OBJ, _OPT_TTL = "str", "opt_str", "opt_obj", "obj", "opt_ttl"
+
+_SCHEMAS: dict[str, tuple[tuple[str, str], ...]] = {
+    "rfq": (("need", _STR), ("maxPrice", _OPT_STR), ("currency", _OPT_STR), ("ttl", _OPT_TTL)),
+    "offer": (("price", _STR), ("currency", _STR), ("terms", _OPT_STR), ("ttl", _OPT_TTL)),
+    "accept": (("offerId", _STR),),
+    "reject": (("reason", _OPT_STR),),
+    "invoice": (("offerId", _STR), ("amount", _STR), ("currency", _STR), ("settlementMethod", _STR),
+                ("settlementDetails", _OPT_OBJ)),
+    "receipt": (("referenceId", _STR), ("amount", _STR), ("currency", _STR), ("settlementMethod", _STR),
+                ("proof", _OBJ)),
+    "deliver": (("type", _STR), ("content", _OPT_STR), ("contentType", _OPT_STR), ("uri", _OPT_STR),
+                ("metadata", _OPT_OBJ)),
+    "confirm": (("deliverId", _STR), ("message", _OPT_STR)),
+    "info": (("message", _STR),),
+    "text": (("message", _STR),),
+}
 
 
-def _normalize_thread_id(thread_id: str | None) -> str:
-    return thread_id or ""
+def validate_body(type_: MessageType, body: dict) -> None:
+    """Validate a body against its type's schema; failures are ``invalid_body``.
 
-
-def _build_signed_message_payload(
-    type_: MessageType,
-    to_id: str,
-    conversation_id: str,
-    message_id: str,
-    thread_id: str | None,
-    kem_ciphertext: bytes,
-    payload: bytes,
-) -> bytes:
-    # kem_ciphertext is signed too: it is what the recipient decapsulates to derive
-    # the decryption key, so it is part of the sender's commitment. Omitting it
-    # would let a relay swap the KEM ciphertext (garbling the message) without
-    # breaking the signature.
-    return encode_payload(
-        type_, to_id, conversation_id, message_id, _normalize_thread_id(thread_id),
-        kem_ciphertext, payload,
-    )
-
-
-# === Schema Validation ===
-
-def _require_string(body: dict, field: str, type_name: str) -> str:
-    if field not in body or body[field] is None:
-        raise ValueError(f"{type_name} body requires '{field}' field")
-    value = body[field]
-    if not isinstance(value, str):
-        raise ValueError(f"{type_name}.{field} must be a string")
-    return value
-
-
-def _require_object(body: dict, field: str, type_name: str) -> None:
-    if field not in body or body[field] is None:
-        raise ValueError(f"{type_name} body requires '{field}' field")
-    _validate_object(body[field], field, type_name)
-
-
-def _validate_optional_string(body: dict, field: str, type_name: str) -> None:
-    value = body.get(field)
-    if value is None:
-        return
-    if not isinstance(value, str):
-        raise ValueError(f"{type_name}.{field} must be a string")
-
-
-def _validate_optional_object(body: dict, field: str, type_name: str) -> None:
-    value = body.get(field)
-    if value is None:
-        return
-    _validate_object(value, field, type_name)
-
-
-def _validate_optional_number(body: dict, field: str, type_name: str) -> None:
-    value = body.get(field)
-    if value is None:
-        return
-    if not _is_json_number(value):
-        raise ValueError(f"{type_name}.{field} must be a number")
-
-
-def _validate_object(value: object, field: str, type_name: str) -> None:
-    if not isinstance(value, dict):
-        raise ValueError(f"{type_name}.{field} must be an object")
-
-
-def _is_json_number(value: object) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-
-def _require_message_type(type_: object) -> None:
+    Optional fields set to null are absent; unknown fields are ignored.
+    """
     if not is_message_type(type_):
-        raise ValueError(f"Unknown message type: '{str(type_)[:32]}'")
+        raise ACEError("invalid_argument", "unknown message type")
+    if type(body) is not dict:
+        raise ACEError("invalid_body", "body must be a JSON object")
+    for name, kind in _SCHEMAS[type_]:
+        v = body.get(name)
+        if v is None:
+            if kind in (_STR, _OBJ):
+                raise ACEError("invalid_body", f"{type_}.{name} is required")
+            continue
+        ok = (
+            isinstance(v, str) if kind in (_STR, _OPT_STR)
+            else type(v) is dict if kind in (_OBJ, _OPT_OBJ)
+            else wire_int(v) is not None
+        )
+        if not ok:
+            raise ACEError("invalid_body", f"{type_}.{name} has the wrong type")
+    if type_ == "deliver":
+        kind = body["type"]
+        required = "content" if kind == "inline" else "uri" if kind == "reference" else None
+        if required is None:
+            raise ACEError("invalid_body", "deliver.type must be 'inline' or 'reference'")
+        if not isinstance(body.get(required), str):
+            raise ACEError("invalid_body", f"deliver ({kind}) requires {required}")
 
 
-def _reject_json_constant(name: str) -> None:
-    raise ValueError(f"Decrypted body contains non-standard JSON constant '{name}'")
-
-
-def _assert_max_depth(value: object, max_depth: int) -> None:
-    """Iterative depth check: the top-level value is depth 0."""
-    stack: list[tuple[object, int]] = [(value, 0)]
-    while stack:
-        val, depth = stack.pop()
-        if depth > max_depth:
-            raise ValueError(f"Decrypted body exceeds maximum nesting depth of {max_depth}")
-        children = val.values() if isinstance(val, dict) else val if isinstance(val, list) else ()
-        for child in children:
-            if isinstance(child, (dict, list)):
-                stack.append((child, depth + 1))
-
-
-def _decode_body(decrypted: bytes) -> dict:
-    try:
-        body = json.loads(decrypted.decode("utf-8"), parse_constant=_reject_json_constant)
-    except RecursionError:
-        # The stdlib parser is recursive; anything this deep is far past the limit.
-        raise ValueError(
-            f"Decrypted body exceeds maximum nesting depth of {MAX_JSON_DEPTH}"
-        ) from None
-    if not isinstance(body, dict):
-        raise ValueError("Decrypted body must be a JSON object")
-    _assert_max_depth(body, MAX_JSON_DEPTH)
+def decode_body(type_: MessageType, raw: bytes) -> dict:
+    """Internal: decrypted bytes -> validated body (``invalid_body``)."""
+    body = loads_body(raw)
+    validate_body(type_, body)
     return body
 
 
-def validate_body(type_: str, body: dict) -> None:
-    """Validate message body against schema for the given type."""
-    if type_ == "rfq":
-        _require_string(body, "need", "rfq")
-        _validate_optional_string(body, "maxPrice", "rfq")
-        _validate_optional_string(body, "currency", "rfq")
-        _validate_optional_number(body, "ttl", "rfq")
-    elif type_ == "offer":
-        _require_string(body, "price", "offer")
-        _require_string(body, "currency", "offer")
-        _validate_optional_string(body, "terms", "offer")
-        _validate_optional_number(body, "ttl", "offer")
-    elif type_ == "accept":
-        _require_string(body, "offerId", "accept")
-    elif type_ == "reject":
-        _validate_optional_string(body, "reason", "reject")
-    elif type_ == "invoice":
-        _require_string(body, "offerId", "invoice")
-        _require_string(body, "amount", "invoice")
-        _require_string(body, "currency", "invoice")
-        _require_string(body, "settlementMethod", "invoice")
-        _validate_optional_object(body, "settlementDetails", "invoice")
-    elif type_ == "receipt":
-        _require_string(body, "referenceId", "receipt")
-        _require_string(body, "amount", "receipt")
-        _require_string(body, "currency", "receipt")
-        _require_string(body, "settlementMethod", "receipt")
-        _require_object(body, "proof", "receipt")
-    elif type_ == "deliver":
-        deliver_type = _require_string(body, "type", "deliver")
-        _validate_optional_string(body, "content", "deliver")
-        _validate_optional_string(body, "contentType", "deliver")
-        _validate_optional_string(body, "uri", "deliver")
-        _validate_optional_object(body, "metadata", "deliver")
-        if deliver_type == "inline":
-            _require_string(body, "content", "deliver (inline)")
-        elif deliver_type == "reference":
-            _require_string(body, "uri", "deliver (reference)")
-        else:
-            raise ValueError(
-                f"deliver.type must be 'inline' or 'reference', got '{deliver_type[:50]}'"
-            )
-    elif type_ == "confirm":
-        _require_string(body, "deliverId", "confirm")
-        _validate_optional_string(body, "message", "confirm")
-    elif type_ == "info":
-        _require_string(body, "message", "info")
-    elif type_ == "text":
-        _require_string(body, "message", "text")
-    else:
-        _require_message_type(type_)
+# --- helpers ----------------------------------------------------------------------
+
+def _now(clock: Callable[[], int] | None) -> int:
+    return int(clock()) if clock is not None else int(time.time())
 
 
-def _thread_contains_message(
-    state_machine: ThreadStateMachine,
-    conversation_id: str,
-    thread_id: str,
-    message_type: MessageType,
-    message_id: str,
-) -> bool:
-    snapshot = state_machine.get_snapshot(conversation_id, thread_id)
-    return any(
-        entry["type"] == message_type and entry["messageId"] == message_id
-        for entry in snapshot.history
-    )
+def _event(env: ACEMessage) -> ThreadEvent:
+    return ThreadEvent(env.conversation_id, env.thread_id, env.type, env.message_id, env.timestamp,
+                       env.from_id, env.to_id)
 
 
-def _validate_thread_references(
-    type_: MessageType,
-    body: dict,
-    state_machine: ThreadStateMachine,
-    conversation_id: str,
-    thread_id: str,
-) -> None:
-    if not is_economic_type(type_) or not thread_id:
-        return
-
-    if type_ == "accept":
-        offer_id = _require_string(body, "offerId", "accept")
-        if not _thread_contains_message(state_machine, conversation_id, thread_id, "offer", offer_id):
-            raise ValueError("accept.offerId must reference an offer in the same thread")
-    elif type_ == "invoice":
-        offer_id = _require_string(body, "offerId", "invoice")
-        if not _thread_contains_message(state_machine, conversation_id, thread_id, "offer", offer_id):
-            raise ValueError("invoice.offerId must reference an offer in the same thread")
-    elif type_ == "receipt":
-        reference_id = _require_string(body, "referenceId", "receipt")
-        # Pre-paid path (accepted -> paid): the receipt references the accept.
-        prepaid = state_machine.get_state(conversation_id, thread_id) == "accepted"
-        ref_type: MessageType = "accept" if prepaid else "invoice"
-        if not _thread_contains_message(state_machine, conversation_id, thread_id, ref_type, reference_id):
-            raise ValueError(
-                "receipt.referenceId must reference the invoice (or, when pre-paid, the accept) "
-                "in the same thread"
-            )
-    elif type_ == "confirm":
-        deliver_id = _require_string(body, "deliverId", "confirm")
-        if not _thread_contains_message(state_machine, conversation_id, thread_id, "deliver", deliver_id):
-            raise ValueError("confirm.deliverId must reference a deliver message in the same thread")
-
-
-# === Message Construction ===
+# --- create -----------------------------------------------------------------------
 
 def create_message(
     sender: ACEIdentity,
-    recipient_pub_key: bytes,
-    recipient_ace_id: str,
+    recipient: VerifiedPeer,
     type_: MessageType,
     body: dict,
-    state_machine: ThreadStateMachine,
+    threads: ThreadStateMachine,
+    *,
     thread_id: str | None = None,
     timestamp: int | None = None,
 ) -> ACEMessage:
-    """Create a full ACE message envelope (encrypt + sign)."""
-    # 0. State machine enforcement
-    _require_message_type(type_)
-    if is_economic_type(type_) and not thread_id:
-        raise ValueError("Economic messages require a thread_id")
-    if thread_id is not None:
-        validate_thread_id(thread_id)
-
-    # 1. Validate body schema
-    validate_body(type_, body)
-
-    message_id = str(uuid.uuid4())
-    ts = timestamp if timestamp is not None else int(time.time())
+    """Encrypt, sign and record an outbound message (design §2.5 order)."""
+    if not isinstance(recipient, VerifiedPeer):
+        raise ACEError("invalid_argument", "recipient must be a VerifiedPeer")
+    if not isinstance(threads, ThreadStateMachine):
+        raise ACEError("invalid_argument", "threads must be a ThreadStateMachine")
+    # 1. type, threadId, local identity
+    if not is_message_type(type_):
+        raise ACEError("invalid_argument", "unknown message type")
+    if thread_id is not None and not is_thread_id(thread_id):
+        raise ACEError("invalid_argument", "thread_id must be 1..256 code points without control characters")
+    if thread_id is None and is_economic_type(type_):
+        raise ACEError("invalid_argument", "economic messages require thread_id")
     from_id = sender.get_ace_id()
-    to_id = recipient_ace_id
-    conversation_id = compute_conversation_id(
-        sender.get_encryption_public_key(),
-        recipient_pub_key,
+    if threads.local_ace_id != from_id:
+        raise ACEError("invalid_argument", "threads.local_ace_id must be the sender")
+    ts = _now(None) if timestamp is None else timestamp
+    if isinstance(ts, bool) or not isinstance(ts, int) or wire_int(ts) is None:
+        raise ACEError("invalid_argument", "timestamp must be an integer in [0, 2^53-1]")
+    # 2. JSON values, then schema
+    if type(body) is not dict:
+        raise ACEError("invalid_body", "body must be a JSON object")
+    check_json_value(body)
+    validate_body(type_, body)
+    # 3. conversation
+    conversation_id = compute_conversation_id(sender.get_encryption_public_key(), recipient.encryption_public_key)
+    message_id = str(uuid.uuid4())
+    event = ThreadEvent(conversation_id, thread_id, type_, message_id, ts, from_id, recipient.ace_id)
+    # 4. state machine pre-check
+    threads.check(event, body)
+    # 5. serialize
+    plaintext = dumps_body(body)
+    if len(plaintext) > MAX_PLAINTEXT_BYTES:
+        raise ACEError("limit_exceeded", f"body exceeds {MAX_PLAINTEXT_BYTES} bytes")
+    # 6. encrypt
+    kem_ciphertext, payload = encrypt(plaintext, recipient.encryption_public_key, conversation_id)
+    scheme = sender.get_signing_scheme()
+    env = ACEMessage(
+        ace="1.0", message_id=message_id, from_id=from_id, to_id=recipient.ace_id,
+        conversation_id=conversation_id, type=type_, timestamp=ts,
+        encryption=EncryptionEnvelope(to_base64(kem_ciphertext), to_base64(payload)),
+        signature=SignatureEnvelope(scheme, ""), thread_id=thread_id,
     )
-    thread_key = _normalize_thread_id(thread_id)
-    # Pre-check: fail fast before expensive crypto operations
-    if not state_machine.can_transition(conversation_id, thread_key, type_):
-        current = state_machine.get_state(conversation_id, thread_key)
-        raise InvalidTransitionError(thread_key, current, type_)
-    _validate_thread_references(type_, body, state_machine, conversation_id, thread_key)
-
-    # 2. Encrypt body
-    body_json = json.dumps(body, separators=(",", ":")).encode("utf-8")
-    kem_ciphertext, payload = encrypt(body_json, recipient_pub_key, conversation_id)
-
-    # 3. Build sign data and sign
-    message_payload = _build_signed_message_payload(
-        type_, to_id, conversation_id, message_id, thread_id, kem_ciphertext, payload
-    )
-    sign_data = build_sign_data("message", from_id, ts, message_payload)
-    signature, scheme = sender.sign(sign_data)
-
-    # 4. Commit state transition (only after all crypto succeeded)
-    state_machine.transition(conversation_id, thread_key, type_, message_id, ts)
-
-    return ACEMessage(
-        ace="1.0",
-        message_id=message_id,
-        from_id=from_id,
-        to_id=to_id,
-        conversation_id=conversation_id,
-        type=type_,
-        timestamp=ts,
-        encryption=EncryptionEnvelope(
-            kem_ciphertext=to_base64(kem_ciphertext),
-            payload=to_base64(payload),
-        ),
-        signature=SignatureEnvelope(
-            scheme=scheme,
-            value=encode_signature(signature, scheme),
-        ),
-        thread_id=thread_id,
-    )
+    # 7. sign
+    env.signature.value = encode_signature(sender.sign(message_sign_data(env)), scheme)
+    # 8. commit
+    threads.apply(event, body)
+    return env
 
 
-# === Message Parsing (Verify + Decrypt) ===
+# --- parse ------------------------------------------------------------------------
 
 def parse_message(
-    msg: ACEMessage,
-    receiver: ACEIdentity,
-    sender_signing_pub_key: bytes,
-    state_machine: ThreadStateMachine,
-    replay_detector: ReplayDetector,
-    sender_encryption_pub_key: bytes | None = None,
-    oldest_timestamp: int | None = None,
-    expected_scheme: SigningScheme | None = None,
-) -> ParsedMessage:
-    """Verify signature, decrypt, and validate a received message.
-
-    Args:
-        expected_scheme: Optional sender signing scheme; the envelope
-            ``signature.scheme`` must match it.
-        oldest_timestamp: Offline acceptance floor; use it for every message, live
-            ones included, until the backlog is done.
-        sender_encryption_pub_key: Optional sender X-Wing public key. When
-            provided, `conversation_id` is recomputed from the sender and
-            recipient encryption keys and must match the envelope value.
-    """
-    # 1. Envelope validation (pipeline step 1)
-    if msg.ace != "1.0":
-        raise ValueError(f"Unsupported ACE version: '{msg.ace}'")
-    if msg.to_id != receiver.get_ace_id():
-        raise ValueError("Message not addressed to this recipient")
-    if not msg.message_id or not msg.from_id or not msg.conversation_id or not msg.type:
-        raise ValueError("Missing required envelope fields")
-    _require_message_type(msg.type)
-    if not isinstance(msg.conversation_id, str) or not _CONVERSATION_ID_PATTERN.fullmatch(msg.conversation_id):
-        raise ValueError("Invalid conversationId: expected 64 lowercase hex characters")
-    validate_message_id(msg.message_id)
-
-    # Validate encryption and signature sub-envelopes
-    if not msg.encryption or not msg.encryption.payload or not msg.encryption.kem_ciphertext:
-        raise ValueError("Missing required encryption fields")
-    if not msg.signature or not msg.signature.scheme or not msg.signature.value:
-        raise ValueError("Missing required signature fields")
-    if expected_scheme is not None and msg.signature.scheme != expected_scheme:
-        raise ValueError(
-            f"Signature scheme mismatch: expected '{expected_scheme}', "
-            f"got '{str(msg.signature.scheme)[:32]}'"
-        )
-
-    expected_from_id = compute_ace_id(sender_signing_pub_key)
-    if msg.from_id != expected_from_id:
-        raise ValueError("msg.from_id does not match sender signing public key")
-    if sender_encryption_pub_key is not None:
-        expected_conversation_id = compute_conversation_id(
-            sender_encryption_pub_key,
-            receiver.get_encryption_public_key(),
-        )
-        if msg.conversation_id != expected_conversation_id:
-            raise ValueError(
-                "msg.conversation_id does not match sender/recipient encryption keys"
-            )
-    if is_economic_type(msg.type) and not msg.thread_id:
-        raise ValueError("Economic messages require a thread_id")
-    if msg.thread_id is not None:
-        validate_thread_id(msg.thread_id)
-
-    # 2–3. Timestamp freshness, replay horizon and seen check — before expensive crypto ops
-    check_timestamp_freshness(msg.timestamp, oldest_timestamp)
-    replay_error = ValueError(
-        f"Replay detected: message {msg.message_id} already processed or below replay horizon"
-    )
-    if not replay_detector.accepts(msg.message_id, msg.from_id, msg.timestamp):
-        raise replay_error
-
-    # 4. Verify signature BEFORE decryption (pipeline step 4).
-    payload_bytes = from_base64(msg.encryption.payload, max_len=MAX_PAYLOAD_SIZE, what="Payload")
-    # Length-checked before any signature or KEM work: a relay cannot make us
-    # decapsulate a malformed ciphertext.
-    kem_ciphertext = decode_kem_ciphertext(msg.encryption.kem_ciphertext)
-    message_payload = _build_signed_message_payload(
-        msg.type,
-        msg.to_id,
-        msg.conversation_id,
-        msg.message_id,
-        msg.thread_id,
-        kem_ciphertext,
-        payload_bytes,
-    )
-    sign_data = build_sign_data("message", msg.from_id, msg.timestamp, message_payload)
-    sig_bytes = decode_signature(msg.signature.value, msg.signature.scheme)
-    try:
-        valid = verify_signature(
-            sign_data, sig_bytes, msg.signature.scheme, sender_signing_pub_key,
-        )
-    except Exception:
-        valid = False
-    if not valid:
-        raise ValueError("Signature verification failed")
-    # Commit now: an authentic message is one-shot, even if a later step fails.
-    if not replay_detector.commit(msg.message_id, msg.from_id, msg.timestamp, oldest_timestamp):
-        raise replay_error
-
-    # 5. Decrypt body (pipeline step 5) — kem_ciphertext is signature-verified
-    # above, so decapsulation uses the authenticated ciphertext.
-    decrypted = receiver.decrypt_payload(kem_ciphertext, payload_bytes, msg.conversation_id)
-    body = _decode_body(decrypted)
-
-    # 6. Validate body schema (pipeline step 6)
-    validate_body(msg.type, body)
-    thread_key = _normalize_thread_id(msg.thread_id)
-    _validate_thread_references(msg.type, body, state_machine, msg.conversation_id, thread_key)
-
-    # 7. State machine validation (pipeline step 7)
-    state_machine.transition(
-        msg.conversation_id, thread_key, msg.type, msg.message_id, msg.timestamp,
-    )
-
-    return ParsedMessage(
-        message_id=msg.message_id,
-        from_id=msg.from_id,
-        to_id=msg.to_id,
-        conversation_id=msg.conversation_id,
-        type=msg.type,
-        timestamp=msg.timestamp,
-        body=body,
-        thread_id=msg.thread_id,
-    )
-
-
-def parse_message_from_registration(
-    msg: ACEMessage,
-    receiver: ACEIdentity,
-    sender_registration: RegistrationFile,
-    state_machine: ThreadStateMachine,
-    replay_detector: ReplayDetector,
-    oldest_timestamp: int | None = None,
-) -> ParsedMessage:
-    """Strict parse path that derives sender keys from a validated registration file."""
-    # validate_registration_file already checks the secp256k1 address against the
-    # signing key, so the only remaining verify_registration_id check is the id.
-    keys = validate_registration_file(sender_registration)
-    if compute_ace_id(keys.signing_public_key) != sender_registration.id:
-        raise ValueError("Sender registration file failed cryptographic verification")
-
-    return parse_message(
-        msg,
-        receiver,
-        keys.signing_public_key,
-        state_machine=state_machine,
-        replay_detector=replay_detector,
-        sender_encryption_pub_key=keys.encryption_public_key,
-        oldest_timestamp=oldest_timestamp,
-        expected_scheme=sender_registration.signing.scheme,
-    )
-
-
-def parse_message_from_peer(
-    msg: ACEMessage,
+    env: ACEMessage,
     receiver: ACEIdentity,
     sender: VerifiedPeer,
-    state_machine: ThreadStateMachine,
-    replay_detector: ReplayDetector,
-    oldest_timestamp: int | None = None,
+    *,
+    threads: ThreadStateMachine,
+    replay: ReplayDetector,
+    floor: int | None = None,
+    clock: Callable[[], int] | None = None,
 ) -> ParsedMessage:
-    """Safe path for messages whose sender keys came from a relay.
+    """Verify, decrypt and validate an inbound message. The first failure wins:
 
-    ``sender`` must be a :class:`VerifiedPeer` — obtainable only after the sender's
-    encryption-key binding was verified — so the recipient never encrypts against
-    or trusts a relay-substituted encryption key.  ``conversation_id`` is recomputed
-    from the verified encryption keys and must match the envelope.
+    decode -> wrong_recipient -> from (invalid_envelope) -> scheme_mismatch ->
+    conversationId (invalid_envelope) -> floor/timestamp (stale_timestamp) -> replay ->
+    invalid_signature -> replay commit -> decrypt -> invalid_body -> state machine.
     """
-    return parse_message(
-        msg,
-        receiver,
-        sender.signing_public_key,
-        state_machine=state_machine,
-        replay_detector=replay_detector,
-        sender_encryption_pub_key=sender.encryption_public_key,
-        oldest_timestamp=oldest_timestamp,
-        expected_scheme=sender.scheme,
+    if not isinstance(sender, VerifiedPeer):
+        raise ACEError("invalid_argument", "sender must be a VerifiedPeer")
+    if not isinstance(threads, ThreadStateMachine) or not isinstance(replay, ReplayDetector):
+        raise ACEError("invalid_argument", "threads and replay are required")
+    receiver_id = receiver.get_ace_id()
+    if threads.local_ace_id != receiver_id:
+        raise ACEError("invalid_argument", "threads.local_ace_id must be the receiver")
+    # 1
+    env = revalidate(env)
+    # 2-5
+    if env.to_id != receiver_id:
+        raise ACEError("wrong_recipient", "message is not addressed to this identity")
+    if env.from_id != sender.ace_id:
+        raise ACEError("invalid_envelope", "from does not match the sender")
+    if env.signature.scheme != sender.scheme:
+        raise ACEError("scheme_mismatch", "signature scheme differs from the sender's scheme")
+    if env.conversation_id != compute_conversation_id(sender.encryption_public_key, receiver.get_encryption_public_key()):
+        raise ACEError("invalid_envelope", "conversationId does not match the verified keys")
+    # 6
+    now = _now(clock)
+    if floor is None:
+        floor = max(0, now - TIMESTAMP_WINDOW_SECONDS)
+    elif isinstance(floor, bool) or not isinstance(floor, int) or not 0 <= floor <= now:
+        raise ACEError("invalid_argument", "floor must be an integer in [0, now]")
+    if not floor <= env.timestamp <= now + TIMESTAMP_WINDOW_SECONDS:
+        raise ACEError("stale_timestamp", "timestamp is outside the acceptance window")
+    # 7
+    if not replay.accepts(env.message_id, env.from_id, env.timestamp):
+        raise ACEError("replay", "message already seen or below the replay horizon")
+    # 8
+    sig = decode_signature(env.signature.value, env.signature.scheme, "invalid_envelope")
+    if not verify_signature(message_sign_data(env), sig, sender.scheme, sender.signing_public_key):
+        raise ACEError("invalid_signature", "message signature does not verify")
+    # 9
+    if not replay.commit(env.message_id, env.from_id, env.timestamp, floor):
+        raise ACEError("replay", "message already seen or below the replay horizon")
+    # 10
+    try:
+        plaintext = receiver.decrypt(
+            decode_kem_ciphertext(env.encryption.kem_ciphertext), decode_payload(env.encryption.payload),
+            env.conversation_id,
+        )
+    except ACEError:
+        raise
+    except Exception as exc:
+        raise ACEError("identity_unavailable", f"identity decrypt failed: {type(exc).__name__}") from exc
+    # 11-12
+    body = decode_body(env.type, plaintext)
+    # 13
+    if is_economic_type(env.type):
+        threads.apply(_event(env), body)
+    return ParsedMessage(
+        message_id=env.message_id, from_id=env.from_id, to_id=env.to_id,
+        conversation_id=env.conversation_id, type=env.type, thread_id=env.thread_id,
+        timestamp=env.timestamp, body=body,
     )

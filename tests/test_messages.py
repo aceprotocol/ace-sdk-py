@@ -1,521 +1,234 @@
-import re
-import time
+"""create_message / parse_message: flows and the exact check order."""
+
+from __future__ import annotations
+
+import dataclasses
+import os
 
 import pytest
 
-from ace import ReplayDetector, SoftwareIdentity, ThreadStateMachine
-from ace._utils import to_base64
-from ace.encryption import encrypt
-from ace.messages import (
+from ace import (
+    ACEError,
+    ReplayDetector,
+    SoftwareIdentity,
+    ThreadStateMachine,
     create_message,
+    decode_envelope,
     parse_message,
-    parse_message_from_registration,
     validate_body,
+    verify_envelope_signature,
 )
-from ace.signing import build_sign_data, encode_payload, encode_signature
-from ace.types import ACEMessage, EncryptionEnvelope, SignatureEnvelope
-
-
-class TestValidateBody:
-    def test_rfq(self):
-        validate_body("rfq", {"need": "GPU rental"})
-        with pytest.raises(ValueError, match="need"):
-            validate_body("rfq", {})
-
-    def test_offer(self):
-        validate_body("offer", {"price": "10", "currency": "USD"})
-        with pytest.raises(ValueError, match="currency"):
-            validate_body("offer", {"price": "10"})
-
-    def test_accept(self):
-        validate_body("accept", {"offerId": "abc"})
-        with pytest.raises(ValueError, match="offerId"):
-            validate_body("accept", {})
-
-    def test_invoice(self):
-        validate_body("invoice", {
-            "offerId": "abc", "amount": "10", "currency": "USD",
-            "settlementMethod": "crypto/instant",
-        })
-        with pytest.raises(ValueError, match="offerId"):
-            validate_body("invoice", {"amount": "10"})
-
-    def test_deliver_inline(self):
-        validate_body("deliver", {"type": "inline", "content": "data"})
-        with pytest.raises(ValueError, match="content"):
-            validate_body("deliver", {"type": "inline"})
-
-    def test_deliver_reference(self):
-        validate_body("deliver", {"type": "reference", "uri": "https://example.com"})
-        with pytest.raises(ValueError, match="uri"):
-            validate_body("deliver", {"type": "reference"})
-
-    def test_confirm(self):
-        validate_body("confirm", {"deliverId": "abc"})
-        with pytest.raises(ValueError, match="deliverId"):
-            validate_body("confirm", {})
-
-    def test_text(self):
-        validate_body("text", {"message": "hello"})
-        with pytest.raises(ValueError, match="message"):
-            validate_body("text", {})
-
-    def test_info(self):
-        validate_body("info", {"message": "ok"})
-
-    def test_rejects_wrong_required_field_types(self):
-        with pytest.raises(ValueError, match="amount must be a string"):
-            validate_body("invoice", {
-                "offerId": "550e8400-e29b-41d4-a716-446655440000",
-                "amount": ["3.50"],
-                "currency": "USD",
-                "settlementMethod": "crypto/instant",
-            })
-
-    def test_rejects_wrong_optional_field_types(self):
-        with pytest.raises(ValueError, match="ttl must be a number"):
-            validate_body("offer", {
-                "price": "3.50",
-                "currency": "USD",
-                "ttl": True,
-            })
-
-    def test_rejects_wrong_system_message_type(self):
-        with pytest.raises(ValueError, match="message must be a string"):
-            validate_body("text", {
-                "message": {"hello": "world"},
-            })
-
-
-class TestCreateMessage:
-    def test_creates_envelope(self):
-        sender = SoftwareIdentity.generate("ed25519")
-        receiver = SoftwareIdentity.generate("ed25519")
-
-        msg = create_message(
-            sender=sender,
-            recipient_pub_key=receiver.get_encryption_public_key(),
-            recipient_ace_id=receiver.get_ace_id(),
-            type_="rfq",
-            body={"need": "GPU rental", "maxPrice": "50", "currency": "USD"},
-            state_machine=ThreadStateMachine(),
-            thread_id="test-001",
-        )
-        assert msg.ace == "1.0"
-        assert msg.type == "rfq"
-        assert msg.from_id == sender.get_ace_id()
-        assert msg.to_id == receiver.get_ace_id()
-        assert re.match(
-            r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
-            msg.message_id,
-        )
-
-    def test_thread_id(self):
-        sender = SoftwareIdentity.generate("ed25519")
-        receiver = SoftwareIdentity.generate("ed25519")
-
-        msg = create_message(
-            sender=sender,
-            recipient_pub_key=receiver.get_encryption_public_key(),
-            recipient_ace_id=receiver.get_ace_id(),
-            type_="rfq",
-            body={"need": "test"},
-            state_machine=ThreadStateMachine(),
-            thread_id="deal-001",
-        )
-        assert msg.thread_id == "deal-001"
-
-
-class TestParseMessage:
-    def test_roundtrip(self):
-        sender = SoftwareIdentity.generate("ed25519")
-        receiver = SoftwareIdentity.generate("ed25519")
-        sm = ThreadStateMachine()
-
-        msg = create_message(
-            sender=sender,
-            recipient_pub_key=receiver.get_encryption_public_key(),
-            recipient_ace_id=receiver.get_ace_id(),
-            type_="text",
-            body={"message": "Hello from ACE!"},
-            state_machine=sm,
-        )
-
-        parsed = parse_message(
-            msg, receiver,
-            sender.get_signing_public_key(),
-            state_machine=sm, replay_detector=ReplayDetector(),
-        )
-        assert parsed.type == "text"
-        assert parsed.body == {"message": "Hello from ACE!"}
-        assert parsed.from_id == sender.get_ace_id()
-
-    def test_rejects_mismatched_sender_identity(self):
-        sender = SoftwareIdentity.generate("ed25519")
-        receiver = SoftwareIdentity.generate("ed25519")
-        other = SoftwareIdentity.generate("ed25519")
-        sm = ThreadStateMachine()
-
-        msg = create_message(
-            sender=sender,
-            recipient_pub_key=receiver.get_encryption_public_key(),
-            recipient_ace_id=receiver.get_ace_id(),
-            type_="text",
-            body={"message": "test"},
-            state_machine=sm,
-        )
-
-        with pytest.raises(ValueError, match="does not match"):
-            parse_message(msg, receiver, other.get_signing_public_key(), state_machine=sm, replay_detector=ReplayDetector())
-
-    def test_rejects_non_uuid_message_id(self):
-        sender = SoftwareIdentity.generate("ed25519")
-        receiver = SoftwareIdentity.generate("ed25519")
-        sm = ThreadStateMachine()
-
-        msg = create_message(
-            sender=sender,
-            recipient_pub_key=receiver.get_encryption_public_key(),
-            recipient_ace_id=receiver.get_ace_id(),
-            type_="text",
-            body={"message": "test"},
-            state_machine=sm,
-        )
-        msg.message_id = "../evil"
-
-        with pytest.raises(ValueError, match="UUID v4"):
-            parse_message(msg, receiver, sender.get_signing_public_key(), state_machine=sm, replay_detector=ReplayDetector())
-
-    def test_rejects_conversation_id_not_bound_to_encryption_keys(self):
-        sender = SoftwareIdentity.generate("ed25519")
-        receiver = SoftwareIdentity.generate("ed25519")
-        bogus_conversation_id = "b" * 64
-        body_bytes = b'{"message":"bound check"}'
-        kem_ciphertext, payload = encrypt(
-            body_bytes,
-            receiver.get_encryption_public_key(),
-            bogus_conversation_id,
-        )
-        message_id = "550e8400-e29b-41d4-a716-446655440000"
-        timestamp = int(time.time())
-        message_payload = encode_payload(
-            "text", receiver.get_ace_id(), bogus_conversation_id, message_id, "", kem_ciphertext, payload
-        )
-        sign_data = build_sign_data("message", sender.get_ace_id(), timestamp, message_payload)
-        signature, scheme = sender.sign(sign_data)
-        msg = ACEMessage(
-            ace="1.0",
-            message_id=message_id,
-            from_id=sender.get_ace_id(),
-            to_id=receiver.get_ace_id(),
-            conversation_id=bogus_conversation_id,
-            type="text",
-            timestamp=timestamp,
-            encryption=EncryptionEnvelope(
-                kem_ciphertext=to_base64(kem_ciphertext),
-                payload=to_base64(payload),
-            ),
-            signature=SignatureEnvelope(
-                scheme=scheme,
-                value=encode_signature(signature, scheme),
-            ),
-        )
-
-        with pytest.raises(ValueError, match="conversation_id does not match"):
-            parse_message(
-                msg,
-                receiver,
-                sender.get_signing_public_key(),
-                state_machine=ThreadStateMachine(),
-                sender_encryption_pub_key=sender.get_encryption_public_key(), replay_detector=ReplayDetector(),
-            )
-
-    def test_parses_strictly_from_sender_registration(self):
-        sender = SoftwareIdentity.generate("secp256k1")
-        receiver = SoftwareIdentity.generate("ed25519")
-        reg = sender.to_registration_file(name="Seller", endpoint="https://seller.example.com/ace")
-        sm = ThreadStateMachine()
-
-        msg = create_message(
-            sender=sender,
-            recipient_pub_key=receiver.get_encryption_public_key(),
-            recipient_ace_id=receiver.get_ace_id(),
-            type_="text",
-            body={"message": "strict registration path"},
-            state_machine=sm,
-        )
-
-        parsed = parse_message_from_registration(msg, receiver, reg, state_machine=sm, replay_detector=ReplayDetector())
-        assert parsed.body == {"message": "strict registration path"}
-
-    def test_rejects_invalid_base64_payload(self):
-        sender = SoftwareIdentity.generate("ed25519")
-        receiver = SoftwareIdentity.generate("ed25519")
-        sm = ThreadStateMachine()
-
-        msg = create_message(
-            sender=sender,
-            recipient_pub_key=receiver.get_encryption_public_key(),
-            recipient_ace_id=receiver.get_ace_id(),
-            type_="text",
-            body={"message": "test"},
-            state_machine=sm,
-        )
-        msg.encryption.payload = "!!!not-base64!!!"
-
-        with pytest.raises(ValueError, match="Base64"):
-            parse_message(msg, receiver, sender.get_signing_public_key(), state_machine=sm, replay_detector=ReplayDetector())
-
-    def test_rejects_oversized_payload_before_base64_decode(self):
-        sender = SoftwareIdentity.generate("ed25519")
-        receiver = SoftwareIdentity.generate("ed25519")
-        oversized_payload = "A" * (((10 * 1024 * 1024 + 1 + 2) // 3) * 4)
-
-        msg = ACEMessage(
-            ace="1.0",
-            message_id="550e8400-e29b-41d4-a716-446655440000",
-            from_id=sender.get_ace_id(),
-            to_id=receiver.get_ace_id(),
-            conversation_id="a" * 64,
-            type="text",
-            timestamp=int(time.time()),
-            encryption=EncryptionEnvelope(
-                kem_ciphertext=to_base64(b"\xaa" * 1120),
-                payload=oversized_payload,
-            ),
-            signature=SignatureEnvelope(
-                scheme="ed25519",
-                value="AQ==",
-            ),
-        )
-
-        with pytest.raises(ValueError, match="Payload too large"):
-            parse_message(msg, receiver, sender.get_signing_public_key(), state_machine=ThreadStateMachine(), replay_detector=ReplayDetector())
-
-    def test_rejects_tampered_thread_id(self):
-        sender = SoftwareIdentity.generate("ed25519")
-        receiver = SoftwareIdentity.generate("ed25519")
-
-        msg = create_message(
-            sender=sender,
-            recipient_pub_key=receiver.get_encryption_public_key(),
-            recipient_ace_id=receiver.get_ace_id(),
-            type_="rfq",
-            body={"need": "gpu rental"},
-            state_machine=ThreadStateMachine(),
-            thread_id="deal-a",
-        )
-        msg.thread_id = "deal-b"
-
-        with pytest.raises(ValueError, match="Signature verification failed"):
-            parse_message(msg, receiver, sender.get_signing_public_key(), state_machine=ThreadStateMachine(), replay_detector=ReplayDetector())
-
-    def test_rejects_cross_thread_reference_on_create(self):
-        sender = SoftwareIdentity.generate("ed25519")
-        receiver = SoftwareIdentity.generate("ed25519")
-        sm = ThreadStateMachine()
-
-        create_message(
-            sender=sender,
-            recipient_pub_key=receiver.get_encryption_public_key(),
-            recipient_ace_id=receiver.get_ace_id(),
-            type_="rfq",
-            body={"need": "gpu rental"},
-            state_machine=sm,
-            thread_id="deal-a",
-        )
-        offer_a = create_message(
-            sender=receiver,
-            recipient_pub_key=sender.get_encryption_public_key(),
-            recipient_ace_id=sender.get_ace_id(),
-            type_="offer",
-            body={"price": "10", "currency": "USD"},
-            state_machine=sm,
-            thread_id="deal-a",
-        )
-        create_message(
-            sender=sender,
-            recipient_pub_key=receiver.get_encryption_public_key(),
-            recipient_ace_id=receiver.get_ace_id(),
-            type_="accept",
-            body={"offerId": offer_a.message_id},
-            state_machine=sm,
-            thread_id="deal-a",
-        )
-        create_message(
-            sender=sender,
-            recipient_pub_key=receiver.get_encryption_public_key(),
-            recipient_ace_id=receiver.get_ace_id(),
-            type_="rfq",
-            body={"need": "design review"},
-            state_machine=sm,
-            thread_id="deal-b",
-        )
-        offer_b = create_message(
-            sender=receiver,
-            recipient_pub_key=sender.get_encryption_public_key(),
-            recipient_ace_id=sender.get_ace_id(),
-            type_="offer",
-            body={"price": "20", "currency": "USD"},
-            state_machine=sm,
-            thread_id="deal-b",
-        )
-        create_message(
-            sender=sender,
-            recipient_pub_key=receiver.get_encryption_public_key(),
-            recipient_ace_id=receiver.get_ace_id(),
-            type_="accept",
-            body={"offerId": offer_b.message_id},
-            state_machine=sm,
-            thread_id="deal-b",
-        )
-
-        with pytest.raises(ValueError, match="same thread"):
-            create_message(
-                sender=receiver,
-                recipient_pub_key=sender.get_encryption_public_key(),
-                recipient_ace_id=sender.get_ace_id(),
-                type_="invoice",
-                body={
-                    "offerId": offer_a.message_id,
-                    "amount": "20",
-                    "currency": "USD",
-                    "settlementMethod": "crypto/instant",
-                },
-                state_machine=sm,
-                thread_id="deal-b",
-            )
-
-
-# === Cross-SDK unification regressions ===
-
-def _signed_message(sender, receiver, plaintext: bytes, type_="text", scheme_override=None):
-    """Hand-build a correctly signed envelope around an arbitrary plaintext body."""
-    from ace.encryption import compute_conversation_id
-
-    conversation_id = compute_conversation_id(
-        sender.get_encryption_public_key(), receiver.get_encryption_public_key(),
-    )
-    kem_ciphertext, payload = encrypt(plaintext, receiver.get_encryption_public_key(), conversation_id)
-    message_id = "550e8400-e29b-41d4-a716-446655440000"
-    timestamp = int(time.time())
-    message_payload = encode_payload(
-        type_, receiver.get_ace_id(), conversation_id, message_id, "", kem_ciphertext, payload,
-    )
-    signature, scheme = sender.sign(build_sign_data("message", sender.get_ace_id(), timestamp, message_payload))
-    return ACEMessage(
-        ace="1.0",
-        message_id=message_id,
-        from_id=sender.get_ace_id(),
-        to_id=receiver.get_ace_id(),
-        conversation_id=conversation_id,
-        type=type_,
-        timestamp=timestamp,
-        encryption=EncryptionEnvelope(kem_ciphertext=to_base64(kem_ciphertext), payload=to_base64(payload)),
-        signature=SignatureEnvelope(scheme=scheme_override or scheme, value=encode_signature(signature, scheme)),
-    )
-
-
-def _parse(msg, sender, receiver):
-    return parse_message(
-        msg, receiver, sender.get_signing_public_key(),
-        state_machine=ThreadStateMachine(), replay_detector=ReplayDetector(),
-    )
-
-
-class TestUnification:
-    def setup_method(self):
-        self.sender = SoftwareIdentity.generate("ed25519")
-        self.receiver = SoftwareIdentity.generate("ed25519")
-
-    def _send(self, sm, type_, body, thread_id="deal", reverse=False):
-        a, b = (self.receiver, self.sender) if reverse else (self.sender, self.receiver)
-        return create_message(
-            sender=a, recipient_pub_key=b.get_encryption_public_key(), recipient_ace_id=b.get_ace_id(),
-            type_=type_, body=body, state_machine=sm, thread_id=thread_id,
-        )
-
-    # D1
-    def test_prepaid_receipt_references_accept(self):
-        sm = ThreadStateMachine()
-        self._send(sm, "rfq", {"need": "gpu"})
-        offer = self._send(sm, "offer", {"price": "1", "currency": "USD"}, reverse=True)
-        accept = self._send(sm, "accept", {"offerId": offer.message_id})
-        receipt = {"amount": "1", "currency": "USD", "settlementMethod": "x", "proof": {}}
-        with pytest.raises(ValueError, match=r"receipt.referenceId must reference the invoice \(or, when pre-paid"):
-            self._send(sm, "receipt", {**receipt, "referenceId": offer.message_id})
-        paid = self._send(sm, "receipt", {**receipt, "referenceId": accept.message_id})
-        assert sm.get_state(paid.conversation_id, "deal") == "paid"
-
-    # D2
-    def test_unknown_type_rejected(self):
-        with pytest.raises(ValueError, match="Unknown message type: 'bogus'"):
-            validate_body("bogus", {})
-        with pytest.raises(ValueError, match="Unknown message type: '" + "x" * 32 + "'"):
-            create_message(
-                sender=self.sender, recipient_pub_key=b"", recipient_ace_id=self.receiver.get_ace_id(),
-                type_="x" * 40, body={}, state_machine=ThreadStateMachine(),
-            )
-        msg = _signed_message(self.sender, self.receiver, b'{"message":"hi"}')
-        msg.type = "bogus"
-        with pytest.raises(ValueError, match="Unknown message type"):
-            _parse(msg, self.sender, self.receiver)
-
-    def test_message_types_exported(self):
-        import ace
-
-        assert ace.MESSAGE_TYPES == {
-            "rfq", "offer", "accept", "reject", "invoice", "receipt", "deliver", "confirm", "info", "text",
-        }
-        assert ace.is_message_type("text") and not ace.is_message_type("bogus")
-
-    # D5
-    @pytest.mark.parametrize("plaintext, error", [
-        (b'["message"]', "must be a JSON object"),
-        (b'"hi"', "must be a JSON object"),
-        (b'{"message":"hi","ttl":NaN}', "non-standard JSON"),
-        (b'{"message":"hi","x":-Infinity}', "non-standard JSON"),
-        (b'{"message":"hi","x":' + b'[' * 33 + b']' * 33 + b'}', "maximum nesting depth of 32"),
-        (b'{"message":"hi","x":' + b'[' * 100_000 + b']' * 100_000 + b'}', "maximum nesting depth of 32"),
-    ])
-    def test_decrypted_body_rejections(self, plaintext, error):
-        msg = _signed_message(self.sender, self.receiver, plaintext)
-        with pytest.raises(ValueError, match=error):
-            _parse(msg, self.sender, self.receiver)
-
-    def test_decrypted_body_at_max_depth_accepted(self):
-        plaintext = b'{"message":"hi","x":' + b'[' * 32 + b']' * 32 + b'}'
-        assert _parse(_signed_message(self.sender, self.receiver, plaintext), self.sender, self.receiver)
-
-    def test_null_optional_field_is_absent(self):
-        validate_body("rfq", {"need": "gpu", "ttl": None, "maxPrice": None})
-
-    # D6
-    def test_message_id_trailing_newline_rejected(self):
-        from ace import validate_message_id
-
-        validate_message_id("550E8400-E29B-41D4-A716-446655440000")
-        with pytest.raises(ValueError, match="UUID v4"):
-            validate_message_id("550e8400-e29b-41d4-a716-446655440000\n")
-
-    # D7
-    @pytest.mark.parametrize("conversation_id", ["A" * 64, "a" * 63, "a" * 64 + "\n"])
-    def test_conversation_id_must_be_64_lowercase_hex(self, conversation_id):
-        msg = _signed_message(self.sender, self.receiver, b'{"message":"hi"}')
-        msg.conversation_id = conversation_id
-        with pytest.raises(ValueError, match="Invalid conversationId: expected 64 lowercase hex characters"):
-            _parse(msg, self.sender, self.receiver)
-
-    # D11
-    def test_expected_scheme_mismatch(self):
-        msg = _signed_message(self.sender, self.receiver, b'{"message":"hi"}', scheme_override="secp256k1")
-        with pytest.raises(ValueError, match="Signature scheme mismatch: expected 'ed25519', got 'secp256k1'"):
-            parse_message(
-                msg, self.receiver, self.sender.get_signing_public_key(),
-                state_machine=ThreadStateMachine(), replay_detector=ReplayDetector(), expected_scheme="ed25519",
-            )
-        reg = self.sender.to_registration_file(name="S", endpoint="https://s.example.com")
-        with pytest.raises(ValueError, match="Signature scheme mismatch"):
-            parse_message_from_registration(
-                msg, self.receiver, reg, state_machine=ThreadStateMachine(), replay_detector=ReplayDetector(),
-            )
+from ace._encoding import encode_signature, to_base64
+from ace.encryption import encrypt
+from ace.envelope import message_sign_data
+
+from .helpers import peer_of, raises
+
+NOW = 1_800_000_000
+
+
+@pytest.fixture()
+def world():
+    alice, bob, carol = (SoftwareIdentity.generate(s) for s in ("ed25519", "secp256k1", "ed25519"))
+    return {
+        "alice": alice, "bob": bob, "carol": carol,
+        "pa": peer_of(alice), "pb": peer_of(bob), "pc": peer_of(carol),
+        "ta": ThreadStateMachine(alice.get_ace_id()), "tb": ThreadStateMachine(bob.get_ace_id()),
+    }
+
+
+def parse(w, env, *, receiver="bob", sender="pa", replay=None, **kw):
+    threads = kw.pop("threads", w["tb"] if receiver == "bob" else w["ta"])
+    return parse_message(env, w[receiver], w[sender], threads=threads,
+                         replay=replay or ReplayDetector(horizon=NOW - 1000), clock=lambda: NOW, **kw)
+
+
+def text(w, body=None, **kw):
+    return create_message(w["alice"], w["pb"], "text", body or {"message": "hi"}, w["ta"], timestamp=NOW, **kw)
+
+
+def resign(w, env, *, plaintext: bytes | None = None, signer="alice"):
+    """Re-encrypt (optional) and re-sign an envelope as ``signer``."""
+    env = dataclasses.replace(env, encryption=dataclasses.replace(env.encryption), signature=dataclasses.replace(env.signature))
+    if plaintext is not None:
+        kem, payload = encrypt(plaintext, w["bob"].get_encryption_public_key(), env.conversation_id)
+        env.encryption.kem_ciphertext, env.encryption.payload = to_base64(kem), to_base64(payload)
+    env.signature.value = encode_signature(w[signer].sign(message_sign_data(env)), env.signature.scheme)
+    return env
+
+
+def test_full_economic_flow(world):
+    w = world
+    a, b, pa, pb, ta, tb = w["alice"], w["bob"], w["pa"], w["pb"], w["ta"], w["tb"]
+    ra, rb = ReplayDetector(horizon=NOW - 1000), ReplayDetector(horizon=NOW - 1000)
+
+    def send(src, dst_peer, src_threads, recv, src_peer, recv_threads, recv_replay, type_, body, i):
+        env = create_message(src, dst_peer, type_, body, src_threads, thread_id="deal", timestamp=NOW + i)
+        p = parse_message(decode_envelope(env.to_dict()), recv, src_peer, threads=recv_threads,
+                          replay=recv_replay, clock=lambda: NOW + i)
+        assert p.thread_id == "deal" and p.body == body
+        assert src_threads.get_state(env.conversation_id, "deal") == recv_threads.get_state(env.conversation_id, "deal")
+        return env
+
+    rfq = send(a, pb, ta, b, pa, tb, rb, "rfq", {"need": "translate", "ttl": 60}, 1)
+    offer = send(b, pa, tb, a, pb, ta, ra, "offer", {"price": "5", "currency": "USDC"}, 2)
+    accept = send(a, pb, ta, b, pa, tb, rb, "accept", {"offerId": offer.message_id}, 3)
+    invoice = send(b, pa, tb, a, pb, ta, ra, "invoice", {"offerId": offer.message_id, "amount": "5", "currency": "USDC",
+                                                          "settlementMethod": "x"}, 4)
+    send(a, pb, ta, b, pa, tb, rb, "receipt", {"referenceId": invoice.message_id, "amount": "5", "currency": "USDC",
+                                               "settlementMethod": "x", "proof": {"tx": "0x1"}}, 5)
+    deliver = send(b, pa, tb, a, pb, ta, ra, "deliver", {"type": "inline", "content": "bonjour"}, 6)
+    send(a, pb, ta, b, pa, tb, rb, "confirm", {"deliverId": deliver.message_id}, 7)
+    assert ta.get_state(rfq.conversation_id, "deal") == "confirmed" and ta.is_terminal(rfq.conversation_id, "deal")
+    snap = tb.get_snapshot(rfq.conversation_id, "deal")
+    assert snap.peer_ace_id == a.get_ace_id() and snap.history[0].from_id == a.get_ace_id()
+    assert accept.message_id == snap.history[2].message_id
+
+
+def test_create_errors(world):
+    w = world
+    with raises("invalid_argument"):
+        create_message(w["alice"], w["pb"], "rfq", {"need": "x"}, w["ta"])
+    with raises("invalid_argument"):
+        create_message(w["alice"], w["pb"], "bid", {}, w["ta"])  # type: ignore[arg-type]
+    with raises("invalid_argument"):
+        create_message(w["alice"], w["pb"], "text", {"message": "x"}, w["ta"], thread_id="")
+    with raises("invalid_argument"):
+        create_message(w["alice"], w["pb"], "text", {"message": "x"}, w["tb"])
+    with raises("invalid_argument"):
+        create_message(w["alice"], {"aceId": "x"}, "text", {"message": "x"}, w["ta"])  # type: ignore[arg-type]
+    with raises("invalid_body"):
+        text(w, {"message": 1})
+    with raises("invalid_body"):
+        text(w, {"message": "x", "n": float("nan")})
+    with raises("invalid_body"):
+        text(w, {"message": "x", "t": (1, 2)})
+    with raises("limit_exceeded"):
+        text(w, {"message": "x" * 65500})
+    create_message(w["alice"], w["pb"], "rfq", {"need": "x"}, w["ta"], thread_id="t")
+    with raises("wrong_role"):
+        create_message(w["alice"], w["pb"], "offer", {"price": "1", "currency": "USDC"}, w["ta"], thread_id="t")
+    conv = next(iter(w["ta"].export_state())).conversation_id
+    assert w["ta"].get_state(conv, "t") == "rfq"
+
+
+def test_check_order(world):
+    w = world
+    env = text(w)
+    assert parse(w, env).body == {"message": "hi"}
+    # 2. wrong recipient (before everything else after decoding)
+    to_carol = create_message(w["alice"], w["pc"], "text", {"message": "x"}, w["ta"], timestamp=NOW)
+    with raises("wrong_recipient"):
+        parse(w, to_carol, sender="pc")
+    # 3. from must be the sender
+    with raises("invalid_envelope"):
+        parse(w, text(w), sender="pc")
+    # 4. scheme mismatch
+    forged = dataclasses.replace(text(w), signature=dataclasses.replace(env.signature, scheme="secp256k1",
+                                                                         value="0x" + "11" * 65))
+    with raises("scheme_mismatch"):
+        parse(w, forged)
+    # 5. conversationId recomputed from verified keys
+    with raises("invalid_envelope"):
+        parse(w, resign(w, dataclasses.replace(text(w), conversation_id="ab" * 32)))
+    # 6. timestamps and floor
+    with raises("stale_timestamp"):
+        parse(w, create_message(w["alice"], w["pb"], "text", {"message": "x"}, w["ta"], timestamp=NOW - 301))
+    with raises("stale_timestamp"):
+        parse(w, create_message(w["alice"], w["pb"], "text", {"message": "x"}, w["ta"], timestamp=NOW + 301))
+    old = create_message(w["alice"], w["pb"], "text", {"message": "x"}, w["ta"], timestamp=NOW - 3600)
+    assert parse(w, old, floor=NOW - 7200, replay=ReplayDetector(horizon=NOW - 7201)).body == {"message": "x"}
+    with raises("invalid_argument"):
+        parse(w, text(w), floor=NOW + 1)
+    # 7/9. replay
+    replay = ReplayDetector(horizon=NOW - 1000)
+    once = text(w)
+    parse(w, once, replay=replay)
+    with raises("replay"):
+        parse(w, once, replay=replay)
+    # 8. bad signature commits nothing
+    good = text(w)
+    tampered = dataclasses.replace(good, encryption=dataclasses.replace(
+        good.encryption, payload=to_base64(os.urandom(64))))
+    replay = ReplayDetector(horizon=NOW - 1000)
+    with raises("invalid_signature"):
+        parse(w, tampered, replay=replay)
+    assert parse(w, good, replay=replay).body == {"message": "hi"}
+
+
+def test_post_commit_failures_are_one_shot(world):
+    w = world
+    replay = ReplayDetector(horizon=NOW - 1000)
+    garbage = resign(w, dataclasses.replace(text(w), encryption=dataclasses.replace(
+        text(w).encryption, payload=to_base64(os.urandom(64)))))
+    with raises("decryption_failed"):
+        parse(w, garbage, replay=replay)
+    with raises("replay"):
+        parse(w, garbage, replay=replay)
+    bad_body = resign(w, text(w), plaintext=b'{"message":1}')
+    with raises("invalid_body"):
+        parse(w, bad_body, replay=replay)
+    not_json = resign(w, text(w), plaintext=b"\xff")
+    with raises("invalid_body"):
+        parse(w, not_json, replay=replay)
+
+
+def test_identity_errors_are_local(world):
+    w = world
+
+    class Flaky:
+        def __init__(self, inner, exc):
+            self.inner, self.exc = inner, exc
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def decrypt(self, *a):
+            raise self.exc
+
+    w["flaky"] = Flaky(w["bob"], OSError("keychain locked"))
+    with raises("identity_unavailable") as info:
+        parse(w, text(w), receiver="flaky", threads=w["tb"])
+    assert info.value.is_transient
+    w["flaky"] = Flaky(w["bob"], ACEError("decryption_failed"))
+    with raises("decryption_failed"):
+        parse(w, text(w), receiver="flaky", threads=w["tb"])
+
+
+def test_parse_argument_checks(world):
+    w = world
+    with raises("invalid_argument"):
+        parse(w, text(w), threads=w["ta"])
+    with raises("invalid_argument"):
+        parse(w, text(w).to_dict())
+    with raises("invalid_argument"):
+        parse_message(text(w), w["bob"], {"aceId": "x"}, threads=w["tb"], replay=ReplayDetector())  # type: ignore[arg-type]
+
+
+def test_economic_parse_applies_state_rules(world):
+    w = world
+    rfq = create_message(w["alice"], w["pb"], "rfq", {"need": "x"}, w["ta"], thread_id="t", timestamp=NOW)
+    parse(w, rfq)
+    # alice (the buyer) cannot offer; craft a correctly signed offer from alice anyway
+    forged = resign(w, dataclasses.replace(rfq, type="offer", message_id="00000000-0000-4000-8000-000000000009"),
+                    plaintext=b'{"price":"1","currency":"USDC"}')
+    with raises("wrong_role"):
+        parse(w, forged)
+
+
+def test_verify_envelope_signature(world):
+    w = world
+    env = text(w)
+    verify_envelope_signature(env, scheme="ed25519", signing_public_key=w["alice"].get_signing_public_key())
+    with raises("scheme_mismatch"):
+        verify_envelope_signature(env, scheme="secp256k1", signing_public_key=w["bob"].get_signing_public_key())
+    with raises("invalid_signature"):
+        verify_envelope_signature(env, scheme="ed25519", signing_public_key=w["carol"].get_signing_public_key())
+
+
+def test_validate_body_public():
+    validate_body("text", {"message": "x", "extra": 1})
+    with raises("invalid_body"):
+        validate_body("text", [])  # type: ignore[arg-type]
+    with raises("invalid_argument"):
+        validate_body("nope", {})  # type: ignore[arg-type]
