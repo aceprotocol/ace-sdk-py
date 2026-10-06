@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import time
 from typing import Callable, NamedTuple
 
 from ._encoding import (
+    check_wire_int,
     decode_b64,
     decode_signature,
     encode_signature,
     is_ace_id,
     to_base64,
+    unix_now,
     wire_int,
 )
 from ._signing import build_sign_data, encode_payload, verify_signature
@@ -104,9 +105,8 @@ def create_registration_request(
     identity: ACEIdentity, profile: AgentProfile | dict | None | object = _KEEP, timestamp: int | None = None,
 ) -> RegistrationRequest:
     """Build a ``POST /v1/register`` body. Omitted profile keeps it; ``None`` removes it."""
-    ts = int(time.time()) if timestamp is None else timestamp
-    if isinstance(ts, bool) or not isinstance(ts, int) or wire_int(ts) is None:
-        raise ACEError("invalid_argument", "timestamp must be an integer in [0, 2^53-1]")
+    ts = unix_now(None) if timestamp is None else timestamp
+    check_wire_int(ts, "timestamp")
     enc = identity.get_encryption_public_key()
     if not isinstance(enc, (bytes, bytearray)) or len(enc) != KEM_PUBLIC_KEY_SIZE:
         raise ACEError("invalid_key", "identity encryption public key must be 1216 bytes")
@@ -164,7 +164,7 @@ def verify_registration_request(
 
     spk_bytes = decode_b64(spk, bad, "signingPublicKey", max_bytes=64)
     decode_b64(epk, bad, "encryptionPublicKey", max_bytes=KEM_PUBLIC_KEY_SIZE + 3)
-    now = int(clock()) if clock is not None else int(time.time())
+    now = unix_now(clock)
     if abs(now - ts) > window_seconds:
         raise ACEError("stale_timestamp", "registration timestamp is outside the freshness window")
     if compute_ace_id(spk_bytes) != ace_id:

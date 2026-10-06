@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import time
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
-from ._encoding import is_ace_id, to_base64, wire_int
+from ._encoding import is_ace_id, to_base64, unix_now, wire_int
 from .discovery import (
     AdoptOutcome,
     VerifiedPeer,
@@ -120,7 +119,7 @@ class PeerStore:
         self._clock = clock
 
     def _now(self) -> int:
-        return int(self._clock()) if self._clock is not None else int(time.time())
+        return unix_now(self._clock)
 
     @staticmethod
     def _check_id(ace_id: object) -> str:

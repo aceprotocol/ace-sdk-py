@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
-import time
 import uuid
 from typing import Callable
 
 from ._encoding import (
     check_json_value,
+    check_wire_int,
     decode_signature,
     dumps_body,
     encode_signature,
     is_thread_id,
     loads_body,
     to_base64,
+    unix_now,
     wire_int,
 )
 from ._signing import verify_signature
@@ -96,10 +97,6 @@ def decode_body(type_: MessageType, raw: bytes) -> dict:
 
 # --- helpers ----------------------------------------------------------------------
 
-def _now(clock: Callable[[], int] | None) -> int:
-    return int(clock()) if clock is not None else int(time.time())
-
-
 def _event(env: ACEMessage) -> ThreadEvent:
     return ThreadEvent(env.conversation_id, env.thread_id, env.type, env.message_id, env.timestamp,
                        env.from_id, env.to_id)
@@ -132,9 +129,8 @@ def create_message(
     from_id = sender.get_ace_id()
     if threads.local_ace_id != from_id:
         raise ACEError("invalid_argument", "threads.local_ace_id must be the sender")
-    ts = _now(None) if timestamp is None else timestamp
-    if isinstance(ts, bool) or not isinstance(ts, int) or wire_int(ts) is None:
-        raise ACEError("invalid_argument", "timestamp must be an integer in [0, 2^53-1]")
+    ts = unix_now(None) if timestamp is None else timestamp
+    check_wire_int(ts, "timestamp")
     # 2. JSON values, then schema
     if type(body) is not dict:
         raise ACEError("invalid_body", "body must be a JSON object")
@@ -203,7 +199,7 @@ def parse_message(
     if env.conversation_id != compute_conversation_id(sender.encryption_public_key, receiver.get_encryption_public_key()):
         raise ACEError("invalid_envelope", "conversationId does not match the verified keys")
     # 6
-    now = _now(clock)
+    now = unix_now(clock)
     if floor is None:
         floor = max(0, now - TIMESTAMP_WINDOW_SECONDS)
     elif isinstance(floor, bool) or not isinstance(floor, int) or not 0 <= floor <= now:

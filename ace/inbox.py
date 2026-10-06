@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import threading
-import time
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Callable, Generator, Iterator, Literal
 
-from ._encoding import is_ace_id, is_conversation_id, is_message_id, is_thread_id, wire_int
+from ._encoding import is_ace_id, is_conversation_id, is_message_id, is_thread_id, unix_now, wire_int
 from .encryption import compute_conversation_id
 from .envelope import decode_envelope, envelope_fingerprint
 from .errors import ACEError
@@ -24,7 +23,7 @@ from .relay import STREAM_ID_RE, RelayClient, compare_stream_ids, normalize_rela
 from .replay import ReplayDetector
 from .state_machine import ThreadSnapshot, ThreadStateMachine
 from .store import ACEStore, dump_record, load_record
-from .threads import ThreadRecord, ThreadStore, sha256_hex, snapshot_from_dict
+from .threads import PendingSend, ThreadRecord, ThreadStore, sha256_hex, snapshot_from_dict
 from .types import ACEIdentity, ACEMessage, ParsedMessage, is_economic_type, is_message_type
 
 QUARANTINE_CAP = 1000
@@ -170,11 +169,11 @@ def _history_dicts(snap: ThreadSnapshot | None) -> list[dict]:
     return [] if snap is None else [h.to_dict() for h in snap.history]
 
 
-def _clear_proven_pending(rec: ThreadRecord | None, new_snap: ThreadSnapshot) -> Any:
+def _clear_proven_pending(rec: ThreadRecord | None, new_snap: ThreadSnapshot) -> PendingSend | None:
     """The stored pending send, or None when ``new_snap`` proves its delivery (it is
     followed by an entry from the peer)."""
     if rec is None or rec.pending is None:
-        return None if rec is None else rec.pending
+        return None
     mid = rec.pending.message.message_id
     ids = [h.message_id for h in new_snap.history]
     if mid in ids and any(h.from_id != new_snap.local_ace_id for h in new_snap.history[ids.index(mid) + 1:]):
@@ -238,7 +237,7 @@ class Inbox:
         if not callable(on_message):
             raise ACEError("invalid_argument", "on_message must be callable")
         if type(offline_window_seconds) is not int or offline_window_seconds < TIMESTAMP_WINDOW_SECONDS:
-            raise ACEError("invalid_argument", "offline_window_seconds must be an integer >= 300")
+            raise ACEError("invalid_argument", f"offline_window_seconds must be an integer >= {TIMESTAMP_WINDOW_SECONDS}")
         if type(capacity) is not int or capacity < 1:
             raise ACEError("invalid_argument", "capacity must be an integer >= 1")
         self = object.__new__(cls)
@@ -271,14 +270,14 @@ class Inbox:
         return self
 
     def _now(self) -> int:
-        return int(self._clock()) if self._clock is not None else int(time.time())
+        return unix_now(self._clock)
 
     def _floor(self) -> int:
         return max(0, self._now() - self._offline)
 
     def _load_replay(self) -> ReplayDetector:
-        raw = self._store.read("replay.json")
-        if raw is None:
+        state = load_record(self._store, "replay.json")
+        if state is None:
             # Outbox-only threads (no inbound entry) may legitimately predate the first open.
             if self._store.list("deliveries/") or any(
                 h.from_id != self._local for rec in self._threads.records() for h in rec.snapshot.history
@@ -290,9 +289,8 @@ class Inbox:
             self._write_replay(replay)
             return replay
         try:
-            state = json.loads(bytes(raw).decode("utf-8"))
             return ReplayDetector.from_state(state, capacity=self._capacity, clock=self._clock)
-        except (UnicodeDecodeError, ValueError, RecursionError, ACEError) as exc:
+        except ACEError as exc:
             raise ACEError("storage_failed", f"replay.json is invalid: {exc}") from None
 
     def _write_replay(self, replay: ReplayDetector) -> None:
@@ -309,10 +307,6 @@ class Inbox:
             raise ACEError("storage_failed", "cursors.json is invalid")
         return dict(cursors)
 
-    def _covered(self, from_id: str, ts: int) -> bool:
-        r = self._replay
-        return ts <= max(r.horizon, r._sh.get(from_id, r.horizon))
-
     def _recover(self) -> None:
         """Repair threads and replay from every delivery record first (ordered by
         (timestamp, key)), then hand over the pending ones in the same order."""
@@ -320,7 +314,7 @@ class Inbox:
         changed = False
         with self._threads.locked():
             for rec in records:
-                if rec.status == "acked" and self._covered(rec.message.from_id, rec.message.timestamp):
+                if rec.status == "acked" and self._replay.covers(rec.message.from_id, rec.message.timestamp):
                     continue  # fully committed long ago; its thread may have been pruned
                 repair_thread(self._threads, rec)
         for rec in records:
@@ -339,7 +333,7 @@ class Inbox:
                     raise ACEError("handler_failed", f"on_message failed during recovery: {exc}") from exc
                 rec.status = "acked"
                 self._store.write(rec.key, dump_record(rec.to_dict()))
-            if self._covered(m.from_id, m.timestamp):
+            if self._replay.covers(m.from_id, m.timestamp):
                 self._store.delete(rec.key)
 
     # --- public ---
@@ -394,9 +388,7 @@ class Inbox:
         self._store.write("cursors.json", dump_record({"cursors": cursors, "version": 1}))
         self._cursors = cursors  # type: ignore[assignment]
 
-    def _quarantine(self, err: ACEError, env: ACEMessage | None, source: ReceiveSource) -> ReceiveOutcome:
-        if env is None:
-            return ReceiveOutcome("quarantined", error=err)
+    def _quarantine(self, err: ACEError, env: ACEMessage, source: ReceiveSource) -> ReceiveOutcome:
         fp = envelope_fingerprint(env)
         if source.kind == "relay":
             self._write_quarantine(err, env, fp)
@@ -442,7 +434,7 @@ class Inbox:
             return ReceiveOutcome("retryable", error=ACEError("handler_failed", f"on_message failed: {exc}"),
                                   from_id=m.from_id, message_id=m.message_id)
         try:
-            if self._covered(m.from_id, m.timestamp):
+            if self._replay.covers(m.from_id, m.timestamp):
                 self._store.delete(rec.key)
             else:
                 rec.status = "acked"
@@ -461,9 +453,8 @@ class Inbox:
             return ReceiveOutcome("quarantined", error=exc)
         # 2. direct freshness
         if source.kind == "direct" and abs(now - env.timestamp) > TIMESTAMP_WINDOW_SECONDS:
-            return ReceiveOutcome(
-                "quarantined", error=ACEError("stale_timestamp", "direct delivery outside the timestamp window"),
-                fingerprint=envelope_fingerprint(env), from_id=env.from_id, message_id=env.message_id,
+            return self._quarantine(
+                ACEError("stale_timestamp", "direct delivery outside the timestamp window"), env, source,
             )
         # 3. peer
         try:
@@ -474,8 +465,10 @@ class Inbox:
         except ACEError as exc:
             if exc.is_transient:
                 return ReceiveOutcome("retryable", error=exc, from_id=env.from_id, message_id=env.message_id)
-            err = exc
-            return self._safe(lambda: self._quarantine(err, env, source))
+            try:
+                return self._quarantine(exc, env, source)
+            except ACEError as store_exc:
+                return ReceiveOutcome("retryable", error=store_exc)
         # 4. stored delivery
         key = delivery_key(env.from_id, env.message_id)
         try:
@@ -489,23 +482,15 @@ class Inbox:
             return ReceiveOutcome("duplicate", from_id=env.from_id, message_id=env.message_id)
         # 5-7
         economic = is_economic_type(env.type)
-        try:
-            lock = self._threads.locked() if economic else None
-            if lock is not None:
-                lock.__enter__()
-        except ACEError as exc:
-            return ReceiveOutcome("retryable", error=exc, from_id=env.from_id, message_id=env.message_id)
-        try:
+        with ExitStack() as held:
+            if economic:
+                try:
+                    held.enter_context(self._threads.locked())
+                except ACEError as exc:
+                    return ReceiveOutcome("retryable", error=exc, from_id=env.from_id, message_id=env.message_id)
             result = self._parse_and_commit(env, peer, key, source, now, economic)
-        except BaseException:
-            if lock is not None:
-                lock.__exit__(None, None, None)
-            raise
-        if lock is not None:
-            if self._failed:
-                self._held_threads = lock  # keep other writers out until close()/open() repairs
-            else:
-                lock.__exit__(None, None, None)
+            if self._failed and economic:
+                self._held_threads = held.pop_all()  # keep other writers out until close()/open() repairs
         if isinstance(result, ReceiveOutcome):
             return result
         outcome = self._hand_over(result)  # 7.4-7.5, without the threads lock
@@ -518,12 +503,6 @@ class Inbox:
                 except ACEError:
                     pass
         return outcome
-
-    def _safe(self, fn: Callable[[], ReceiveOutcome]) -> ReceiveOutcome:
-        try:
-            return fn()
-        except ACEError as exc:
-            return ReceiveOutcome("retryable", error=exc)
 
     def _parse_and_commit(
         self, env: ACEMessage, peer: Any, key: str, source: ReceiveSource, now: int, economic: bool,
@@ -549,7 +528,7 @@ class Inbox:
         except ACEError as exc:
             if exc.code == "replay":
                 return ReceiveOutcome("duplicate", **ids)
-            if exc.category != "permanent":
+            if exc.is_transient:
                 return ReceiveOutcome("retryable", error=exc, **ids)
             try:
                 outcome = self._quarantine(exc, env, source)
@@ -585,7 +564,7 @@ class Inbox:
                 if d is None:
                     continue
                 rec = _delivery_from_dict(d, key, self._local)
-                if rec.status == "acked" and self._covered(rec.message.from_id, rec.message.timestamp):
+                if rec.status == "acked" and self._replay.covers(rec.message.from_id, rec.message.timestamp):
                     self._store.delete(key)
                     removed += 1
             return removed

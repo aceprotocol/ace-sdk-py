@@ -38,10 +38,12 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 )
 
 from .errors import ACEError
+from .limits import (
+    KEM_CIPHERTEXT_SIZE as CIPHERTEXT_SIZE,
+    KEM_PUBLIC_KEY_SIZE as PUBLIC_KEY_SIZE,
+    KEM_SEED_SIZE as SEED_SIZE,
+)
 
-SEED_SIZE = 32
-PUBLIC_KEY_SIZE = 1216
-CIPHERTEXT_SIZE = 1120
 SHARED_SECRET_SIZE = 32
 
 # XWingLabel = ASCII "\.//^\" (6 bytes), hex 5c2e2f2f5e5c.

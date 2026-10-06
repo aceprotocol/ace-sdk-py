@@ -156,10 +156,8 @@ def _pid_alive(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    except PermissionError:
-        return True
     except OSError:
-        return True
+        pass  # EPERM: alive, owned by another user
     return True
 
 
@@ -276,8 +274,6 @@ class FileStore:
             return self._read_file(path)
         except FileNotFoundError:
             return None
-        except ACEError:
-            raise
         except OSError as exc:
             raise _io_error(f"read {key}", exc) from None
 
@@ -300,8 +296,6 @@ class FileStore:
             os.rename(tmp, path)
             tmp = None
             self._fsync_dir(directory)
-        except ACEError:
-            raise
         except OSError as exc:
             raise _io_error(f"write {key}", exc) from None
         finally:
@@ -323,8 +317,6 @@ class FileStore:
             self._fsync_dir(os.path.dirname(path))
         except FileNotFoundError:
             return
-        except ACEError:
-            raise
         except OSError as exc:
             raise _io_error(f"delete {key}", exc) from None
 

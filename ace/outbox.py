@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import dataclasses
-import time
 import uuid
 from typing import Callable
 
-from ._encoding import CONTROL_CHAR_RE, encode_signature
+from ._encoding import encode_signature, is_thread_id, unix_now
 from .discovery import VerifiedPeer
 from .encryption import compute_conversation_id
 from .envelope import message_sign_data
@@ -24,7 +23,7 @@ def _outbox_key(request_id: str) -> str:
 
 
 def _check_request_id(request_id: object) -> str:
-    if not isinstance(request_id, str) or not 1 <= len(request_id) <= 256 or CONTROL_CHAR_RE.search(request_id):
+    if not is_thread_id(request_id):  # same 1-256 / no-control-character rule
         raise ACEError("invalid_argument", "request_id must be 1-256 characters without control characters")
     return request_id
 
@@ -65,7 +64,7 @@ class Outbox:
         return self
 
     def _now(self) -> int:
-        return int(self._clock()) if self._clock is not None else int(time.time())
+        return unix_now(self._clock)
 
     # --- lookup ---
 

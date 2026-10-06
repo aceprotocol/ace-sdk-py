@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import time
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
-from ._encoding import is_ace_id, wire_int
+from ._encoding import is_ace_id, unix_now, wire_int
 from .envelope import decode_envelope
 from .errors import ACEError
 from .limits import MAX_OPEN_THREADS_PER_PEER
@@ -28,10 +27,6 @@ _PRUNE_INTERVAL_SECONDS = 3600
 def sha256_hex(*parts: str) -> str:
     """Lowercase hex SHA-256 over the UTF-8 parts joined by one zero byte."""
     return hashlib.sha256(b"\x00".join(p.encode("utf-8") for p in parts)).hexdigest()
-
-
-def _now(clock: Callable[[], int] | None) -> int:
-    return int(clock()) if clock is not None else int(time.time())
 
 
 @dataclass(frozen=True)
@@ -180,9 +175,10 @@ class ThreadStore:
 
     def load(self, conversation_id: str, thread_id: str) -> ThreadRecord | None:
         key = thread_key(conversation_id, thread_id)
-        if self._store.read(key) is None:
+        d = load_record(self._store, key)
+        if d is None:
             return None
-        rec = self._load_key(key)
+        rec = self._record_from_dict(key, d)
         if (rec.snapshot.conversation_id, rec.snapshot.thread_id) != (conversation_id, thread_id):
             raise ACEError("storage_failed", f"{key} belongs to another thread")
         return rec
@@ -191,6 +187,9 @@ class ThreadStore:
         d = load_record(self._store, key)
         if d is None:
             raise ACEError("storage_failed", f"{key} vanished")
+        return self._record_from_dict(key, d)
+
+    def _record_from_dict(self, key: str, d: dict) -> ThreadRecord:
         snap = snapshot_from_dict(d, self.local_ace_id)
         if key != thread_key(snap.conversation_id, snap.thread_id):
             raise ACEError("storage_failed", f"{key} does not match its thread")
@@ -277,7 +276,7 @@ class ThreadStore:
         self._write_index(peer_ace_id, [*cur, entry] if is_open else [e for e in cur if e != entry])
 
     def _maybe_prune(self) -> None:
-        now = _now(self._clock)
+        now = unix_now(self._clock)
         if self._last_prune is not None and now - self._last_prune < _PRUNE_INTERVAL_SECONDS:
             return
         self._last_prune = now

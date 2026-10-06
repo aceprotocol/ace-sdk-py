@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import re
-import time
 from dataclasses import dataclass
 from typing import Callable, Literal, Mapping, NamedTuple, Sequence
 
 from ._encoding import (
     MAX_SAFE_INTEGER,
+    check_wire_int,
     decimal,
     decode_signature,
     encode_signature,
     is_ace_id,
+    unix_now,
     wire_int,
 )
 from ._signing import build_sign_data, encode_payload, verify_signature
@@ -106,8 +107,7 @@ def create_auth_headers(identity: ACEIdentity, req: RelayAuthRequest, timestamp:
     """``X-ACE-Id`` / ``X-ACE-Timestamp`` / ``X-ACE-Signature`` for one relay call."""
     if not isinstance(req, RelayAuthRequest):
         raise _bad("expected a RelayAuthRequest")
-    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or wire_int(timestamp) is None:
-        raise _bad("timestamp must be an integer in [0, 2^53-1]")
+    check_wire_int(timestamp, "timestamp")
     ace_id = identity.get_ace_id()
     sig = identity.sign(_sign_data(req, ace_id, timestamp))
     return {
@@ -166,7 +166,7 @@ def verify_auth_headers(
         raise _bad("window_seconds must be a non-negative integer")
     if auth.ace_id != ace_id:
         raise _bad("X-ACE-Id does not match the signer")
-    now = int(clock()) if clock is not None else int(time.time())
+    now = unix_now(clock)
     if abs(now - auth.timestamp) > window_seconds:
         raise ACEError("stale_timestamp", "X-ACE-Timestamp is outside the freshness window")
     sig = decode_signature(auth.signature, scheme, "invalid_signature")

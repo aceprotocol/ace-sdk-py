@@ -12,7 +12,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, NamedTuple
 
-from ._encoding import wire_int
+from ._encoding import unix_now, wire_int
 from .auth import RelayAuthRequest, create_auth_headers
 from .discovery import VerifiedPeer, verify_peer_record
 from .errors import ACEError
@@ -178,7 +178,7 @@ class RelayClient:
     # --- plumbing ---
 
     def _now(self) -> int:
-        return int(self._clock()) if self._clock is not None else int(time.time())
+        return unix_now(self._clock)
 
     def _next_ts(self) -> int:
         with self._ts_lock:

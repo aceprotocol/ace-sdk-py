@@ -13,9 +13,6 @@ from .types import ECONOMIC_TYPES, is_economic_type, is_message_type
 ThreadState = Literal[
     "idle", "rfq", "offered", "accepted", "rejected", "invoiced", "paid", "delivered", "confirmed",
 ]
-THREAD_STATES: tuple[str, ...] = (
-    "idle", "rfq", "offered", "accepted", "rejected", "invoiced", "paid", "delivered", "confirmed",
-)
 
 # (from_state, type) -> (to_state, required sender role)
 TRANSITIONS: dict[tuple[str, str], tuple[str, str]] = {

@@ -7,7 +7,8 @@ import binascii
 import json
 import math
 import re
-from typing import Any
+import time
+from typing import Any, Callable
 
 from Crypto.Hash import keccak as _keccak
 
@@ -78,6 +79,18 @@ def wire_int(value: object) -> int | None:
         if math.isfinite(value) and value.is_integer() and 0 <= value <= MAX_SAFE_INTEGER:
             return int(value)
     return None
+
+
+def check_wire_int(value: object, what: str) -> int:
+    """An ``int`` (not bool, not float) in [0, 2^53-1], or ``invalid_argument``."""
+    if isinstance(value, bool) or not isinstance(value, int) or wire_int(value) is None:
+        raise ACEError("invalid_argument", f"{what} must be an integer in [0, 2^53-1]")
+    return value
+
+
+def unix_now(clock: Callable[[], int] | None) -> int:
+    """Unix seconds from ``clock`` (injected for tests) or the system clock."""
+    return int(clock()) if clock is not None else int(time.time())
 
 
 def decimal(n: int) -> str:

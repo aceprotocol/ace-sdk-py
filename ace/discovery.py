@@ -9,7 +9,6 @@ import re
 import socket
 import ssl
 import threading
-import time
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
@@ -17,10 +16,12 @@ import base58
 
 from ._encoding import (
     CONTROL_CHAR_RE,
+    check_wire_int,
     decode_b64,
     decode_signature,
     is_ace_id,
     is_https_url,
+    unix_now,
     wire_int,
 )
 from ._signing import build_sign_data, encode_payload, is_valid_signing_public_key, verify_signature
@@ -190,8 +191,8 @@ def verify_registration_file(
     The peer's ``registered_at`` is ``pinned_at`` or now (a file has no signed timestamp).
     """
     code: ACEErrorCode = "invalid_registration"
-    if pinned_at is not None and (isinstance(pinned_at, bool) or not isinstance(pinned_at, int) or wire_int(pinned_at) is None):
-        raise ACEError("invalid_argument", "pinned_at must be an integer in [0, 2^53-1]")
+    if pinned_at is not None:
+        check_wire_int(pinned_at, "pinned_at")
     if isinstance(reg, dict):
         reg = RegistrationFile.from_dict(reg)
     if not isinstance(reg, RegistrationFile):
@@ -227,7 +228,7 @@ def verify_registration_file(
     if compute_ace_id(signing_key) != reg.id:
         raise ACEError(code, "id does not match the signing key")
     enc_key = decode_encryption_key(s.encryption_public_key, code)
-    now = int(clock()) if clock is not None else int(time.time())
+    now = unix_now(clock)
     return _make_peer(
         ace_id=reg.id, scheme=s.scheme, signing_public_key=bytes(signing_key), encryption_public_key=enc_key,
         registered_at=now if pinned_at is None else pinned_at, registration_signature=None,

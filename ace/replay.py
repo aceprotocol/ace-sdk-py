@@ -5,23 +5,12 @@ from __future__ import annotations
 import copy
 import heapq
 import threading
-import time
 from typing import Callable
 
-from ._encoding import is_message_id, wire_int
+from ._encoding import check_wire_int, is_message_id, unix_now, wire_int
 from .errors import ACEError
 from .limits import DEFAULT_REPLAY_CAPACITY, TIMESTAMP_WINDOW_SECONDS
 from .types import ReplayState
-
-
-def _now(clock: Callable[[], int] | None) -> int:
-    return int(clock()) if clock is not None else int(time.time())
-
-
-def _ts_arg(value: object, what: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or wire_int(value) is None:
-        raise ACEError("invalid_argument", f"{what} must be an integer in [0, 2^53-1]")
-    return value
 
 
 class ReplayDetector:
@@ -53,7 +42,7 @@ class ReplayDetector:
         self._quota = max(1, capacity // 16)
         self._clock = clock
         self._horizon = (
-            max(0, _now(clock) - TIMESTAMP_WINDOW_SECONDS) if horizon is None else _ts_arg(horizon, "horizon")
+            max(0, unix_now(clock) - TIMESTAMP_WINDOW_SECONDS) if horizon is None else check_wire_int(horizon, "horizon")
         )
         self._sh: dict[str, int] = {}
         self._sh_heap: list[tuple[int, str]] = []          # lazy (h, sender)
@@ -78,10 +67,15 @@ class ReplayDetector:
         with self._lock:
             return self._accepts(message_id, sender, timestamp)
 
+    def covers(self, sender: str, timestamp: int) -> bool:
+        """True if a horizon (``H`` or ``SH[sender]``) covers ``timestamp``."""
+        with self._lock:
+            return self._covers(sender, timestamp)
+
     def commit(self, message_id: str, sender: str, timestamp: int, floor: int | None = None) -> bool:
         """Record a verified message. False if it is a duplicate or covered by a horizon."""
         self._check_args(message_id, sender, timestamp)
-        floor = max(0, _now(self._clock) - TIMESTAMP_WINDOW_SECONDS) if floor is None else _ts_arg(floor, "floor")
+        floor = max(0, unix_now(self._clock) - TIMESTAMP_WINDOW_SECONDS) if floor is None else check_wire_int(floor, "floor")
         with self._lock:
             if not self._accepts(message_id, sender, timestamp):
                 return False
@@ -168,10 +162,13 @@ class ReplayDetector:
     def _check_args(message_id: object, sender: object, timestamp: object) -> None:
         if not isinstance(message_id, str) or not isinstance(sender, str) or not sender:
             raise ACEError("invalid_argument", "message_id and sender must be non-empty strings")
-        _ts_arg(timestamp, "timestamp")
+        check_wire_int(timestamp, "timestamp")
+
+    def _covers(self, s: str, ts: int) -> bool:
+        return ts <= self._horizon or ts <= self._sh.get(s, self._horizon)
 
     def _accepts(self, mid: str, s: str, ts: int) -> bool:
-        return ts > self._horizon and ts > self._sh.get(s, self._horizon) and (s, mid) not in self._live
+        return not self._covers(s, ts) and (s, mid) not in self._live
 
     def _insert(self, ts: int, s: str, mid: str) -> None:
         self._live[(s, mid)] = ts
