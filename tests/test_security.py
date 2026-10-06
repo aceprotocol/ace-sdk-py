@@ -164,3 +164,23 @@ def test_replay_from_export_rejects_malformed_state(state, error):
 def test_replay_rejects_non_positive_capacity():
     with pytest.raises(ValueError, match="capacity"):
         ReplayDetector(0)
+
+
+def test_replay_same_id_is_isolated_by_sender(clock):
+    d = ReplayDetector()
+    assert d.commit(_id(1), MALLORY, T)
+    assert d.commit(_id(1), ALICE, T)
+    restored = ReplayDetector.from_export(d.export())
+    assert not restored.commit(_id(1), MALLORY, T)
+    assert not restored.commit(_id(1), ALICE, T)
+
+
+def test_replay_same_second_eviction_survives_restart(clock):
+    d = ReplayDetector(2)
+    for n in range(1, 4):
+        assert d.commit(_id(n), ALICE, T)
+    restored = ReplayDetector.from_export(d.export(), 2)
+    for n in range(1, 4):
+        assert not restored.accepts(_id(n), ALICE, T)
+    assert restored.commit(_id(1), MALLORY, T)
+    assert ReplayDetector.from_export(restored.export(), 2).export() == restored.export()

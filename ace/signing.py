@@ -55,7 +55,7 @@ def build_sign_data(
     Format: SHA-256("ace.v1" || len(action) || action || len(ace_id) || ace_id
                     || timestamp[8 BE] || len(payload) || payload)
     """
-    if not isinstance(timestamp, int) or timestamp < 0 or timestamp > _MAX_TIMESTAMP:
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0 or timestamp > _MAX_TIMESTAMP:
         raise ValueError(f"Timestamp must be an integer in range [0, {_MAX_TIMESTAMP}], got {timestamp!r}")
     chunks: list[bytes] = [_DOMAIN_PREFIX]
     chunks.append(_length_prefix(action.encode("utf-8")))

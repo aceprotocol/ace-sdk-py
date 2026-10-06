@@ -273,6 +273,7 @@ class VerifiedPeer:
     scheme: SigningScheme
     signing_public_key: bytes
     encryption_public_key: bytes
+    registered_at: int
 
     @classmethod
     def from_relay_response(cls, data: dict[str, Any]) -> "VerifiedPeer":
@@ -315,6 +316,7 @@ class VerifiedPeer:
             scheme=scheme,  # type: ignore[arg-type]
             signing_public_key=keys.signing_public_key,
             encryption_public_key=keys.encryption_public_key,
+            registered_at=registered_at,
         )
 
 

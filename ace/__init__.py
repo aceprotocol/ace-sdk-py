@@ -30,6 +30,7 @@ from .messages import (
     parse_message_from_registration,
     validate_body,
 )
+from .registration import build_registration_payload, create_registration_request
 from .security import ReplayDetector, check_timestamp_freshness, validate_message_id
 from .signing import (
     build_sign_data,
@@ -75,6 +76,7 @@ from .types import (
 )
 
 __all__ = [
+    "create_registration_request", "build_registration_payload",
     # Types
     "ACEIdentity", "SigningScheme", "IdentityTier", "HardwareBacking",
     "RegistrationFile", "SigningConfig", "Capability", "PricingInfo", "ChainInfo",

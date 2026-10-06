@@ -59,7 +59,7 @@ class ReplayDetector:
         if not _is_timestamp(capacity) or capacity < 1:
             raise ValueError("ReplayDetector capacity must be a positive integer")
         self._capacity = capacity
-        self._ids: set[str] = set()
+        self._ids: set[tuple[str, str]] = set()
         self._heap: list[tuple[int, str, str]] = []  # min-heap of (timestamp, message_id, sender)
         self._horizon = int(time.time()) - MAX_DRIFT_SECONDS
         self._sender_horizons: dict[str, int] = {}
@@ -86,13 +86,18 @@ class ReplayDetector:
         with self._lock:
             if not self._accepts(message_id, sender, timestamp):
                 return False
-            self._ids.add(message_id)
+            self._ids.add((sender, message_id))
             heapq.heappush(self._heap, (timestamp, message_id, sender))
             self._evict(floor)
             return True
 
     def export(self) -> dict:
         with self._lock:
+            # Remove entries now covered by a horizon before serialization.
+            self._heap = [(ts, mid, sender) for ts, mid, sender in self._heap
+                          if ts > self._horizon and ts > self._sender_horizons.get(sender, self._horizon)]
+            heapq.heapify(self._heap)
+            self._ids = {(sender, mid) for _, mid, sender in self._heap}
             return {
                 "horizon": self._horizon,
                 "senderHorizons": dict(self._sender_horizons),
@@ -123,7 +128,7 @@ class ReplayDetector:
                 or not detector._accepts(mid, sender, ts)
             ):
                 raise ValueError("from_export: invalid entry")
-            detector._ids.add(mid)
+            detector._ids.add((sender, mid))
             detector._heap.append((ts, mid, sender))
         heapq.heapify(detector._heap)
         detector._evict(0)
@@ -133,19 +138,19 @@ class ReplayDetector:
         return (
             timestamp > self._horizon
             and timestamp > self._sender_horizons.get(sender, self._horizon)
-            and message_id not in self._ids
+            and (sender, message_id) not in self._ids
         )
 
     def _evict(self, floor: int) -> None:
         """Remove smallest-timestamp entries: below ``floor`` they raise the
         horizon, over capacity they raise only their sender's horizon."""
         while self._heap and self._heap[0][0] < floor:
-            ts, mid, _ = heapq.heappop(self._heap)
-            self._ids.discard(mid)
+            ts, mid, sender = heapq.heappop(self._heap)
+            self._ids.discard((sender, mid))
             self._horizon = max(self._horizon, ts)
         while len(self._heap) > self._capacity:
             ts, mid, sender = heapq.heappop(self._heap)
-            self._ids.discard(mid)
+            self._ids.discard((sender, mid))
             self._sender_horizons[sender] = max(self._sender_horizons.get(sender, ts), ts)
         self._compact_sender_horizons()
 
