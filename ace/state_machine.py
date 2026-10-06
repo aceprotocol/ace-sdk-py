@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import threading
-from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -43,10 +42,15 @@ TERMINAL_STATES: frozenset[str] = frozenset({'rejected', 'confirmed'})
 # === Validation ===
 
 MAX_THREAD_ID_LENGTH = 256
+MAX_CONVERSATION_ID_LENGTH = 256
+DEFAULT_MAX_THREADS = 100_000
+DEFAULT_MAX_HISTORY_PER_THREAD = 1_000
 
 
 def validate_thread_id(thread_id: str) -> None:
-    """Validate thread_id format."""
+    """Validate thread_id format (lengths count Unicode code points)."""
+    if not isinstance(thread_id, str):
+        raise ValueError('threadId must be a string')
     if len(thread_id) == 0:
         raise ValueError('threadId must not be empty')
     if len(thread_id) > MAX_THREAD_ID_LENGTH:
@@ -88,36 +92,51 @@ class ThreadSnapshot:
     history: list[dict[str, Any]]
 
 
-class ThreadStateMachine:
-    """Tracks economic message flow per (conversationId, threadId) pair."""
+def _is_positive_int(value: object) -> bool:
+    return type(value) is int and value > 0
 
-    def __init__(self, capacity: int | None = None) -> None:
-        if capacity is not None and capacity < 1:
-            raise ValueError(f"capacity must be >= 1, got {capacity}")
-        self._capacity = capacity
+
+def _is_timestamp(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+class ThreadStateMachine:
+    """Tracks economic message flow per (conversationId, threadId) pair.
+
+    Resource limits reject new work rather than evict: forgetting a thread
+    would let a finished (terminal) deal be reopened. Use ``remove()`` to
+    drop a thread explicitly.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_threads: int = DEFAULT_MAX_THREADS,
+        max_history_per_thread: int = DEFAULT_MAX_HISTORY_PER_THREAD,
+    ) -> None:
+        if not _is_positive_int(max_threads):
+            raise ValueError(f"max_threads must be a positive integer, got {max_threads!r}")
+        if not _is_positive_int(max_history_per_thread):
+            raise ValueError(
+                f"max_history_per_thread must be a positive integer, got {max_history_per_thread!r}"
+            )
+        self._max_threads = max_threads
+        self._max_history_per_thread = max_history_per_thread
         self._lock = threading.Lock()
-        self._threads: OrderedDict[str, _ThreadEntry] = OrderedDict()
+        self._threads: dict[str, _ThreadEntry] = {}
 
     def _composite_key(self, conversation_id: str, thread_id: str) -> str:
         """Length-prefixed composite key prevents collision."""
         return f"{len(conversation_id)}:{conversation_id}:{thread_id}"
 
-    def _evict_if_over_capacity(self) -> None:
-        """Evict oldest terminal threads when over capacity. Caller must hold lock."""
-        if self._capacity is None or len(self._threads) <= self._capacity:
-            return
-        # First pass: evict oldest terminal threads
-        to_remove = []
-        for key, entry in self._threads.items():
-            if entry.state in TERMINAL_STATES:
-                to_remove.append(key)
-                if len(self._threads) - len(to_remove) <= self._capacity:
-                    break
-        for key in to_remove:
-            del self._threads[key]
-        # If still over capacity, evict oldest regardless of state
-        while len(self._threads) > self._capacity:
-            self._threads.popitem(last=False)
+    def _limit_error(self, thread: _ThreadEntry | None) -> str | None:
+        """Resource-limit error for adding one entry, or None. Caller must hold lock."""
+        if thread is None:
+            if len(self._threads) >= self._max_threads:
+                return f"Thread limit reached ({self._max_threads})"
+        elif len(thread.history) >= self._max_history_per_thread:
+            return f"Thread history exceeds maximum of {self._max_history_per_thread} entries"
+        return None
 
     def transition(
         self,
@@ -134,7 +153,7 @@ class ThreadStateMachine:
 
         Raises:
             InvalidTransitionError: if the transition is not allowed
-            ValueError: if threadId is invalid
+            ValueError: if threadId is invalid or a resource limit is reached
         """
         if not is_economic_type(message_type):
             with self._lock:
@@ -155,6 +174,10 @@ class ThreadStateMachine:
             if next_state is None:
                 raise InvalidTransitionError(thread_id, current_state, message_type)
 
+            limit_error = self._limit_error(thread)
+            if limit_error is not None:
+                raise ValueError(limit_error)
+
             history_entry = {'type': message_type, 'messageId': message_id, 'timestamp': timestamp}
 
             if thread is None:
@@ -164,7 +187,6 @@ class ThreadStateMachine:
                     state=next_state,
                     history=[history_entry],
                 )
-                self._evict_if_over_capacity()
             else:
                 thread.state = next_state
                 thread.history.append(history_entry)
@@ -182,12 +204,12 @@ class ThreadStateMachine:
             return False
 
         with self._lock:
-            current_state = self._get_state_unlocked(conversation_id, thread_id)
-
-        if current_state in TERMINAL_STATES:
-            return False
-
-        return (current_state, message_type) in TRANSITIONS
+            thread = self._threads.get(self._composite_key(conversation_id, thread_id))
+            current_state = thread.state if thread else 'idle'
+            if current_state in TERMINAL_STATES or (current_state, message_type) not in TRANSITIONS:
+                return False
+            # Must agree with transition(): a limit that would reject also fails here.
+            return self._limit_error(thread) is None
 
     def _get_state_unlocked(self, conversation_id: str, thread_id: str) -> str:
         """Get current state (caller must hold self._lock)."""
@@ -250,56 +272,48 @@ class ThreadStateMachine:
                 })
             return snapshots
 
-    # Derived from TRANSITIONS + TERMINAL_STATES — no manual sync needed
-    _VALID_STATES: frozenset[str] = frozenset(
-        {'idle'} | TERMINAL_STATES | {v for v in TRANSITIONS.values()}
-    )
-
-    _MAX_IMPORT_HISTORY = 1000
-    _MAX_IMPORT_THREADS = 100_000
-
     @staticmethod
-    def from_export(snapshots: list[dict[str, Any]], capacity: int | None = None) -> 'ThreadStateMachine':
+    def from_export(
+        snapshots: list[dict[str, Any]],
+        *,
+        max_threads: int = DEFAULT_MAX_THREADS,
+        max_history_per_thread: int = DEFAULT_MAX_HISTORY_PER_THREAD,
+    ) -> 'ThreadStateMachine':
         """Restore a state machine from exported snapshots.
 
         Validates that each snapshot's history represents a legal walk through
         the transition table from 'idle'. Rejects snapshots with invalid
         transition sequences to prevent state injection.
         """
-        if len(snapshots) > ThreadStateMachine._MAX_IMPORT_THREADS:
-            raise ValueError(
-                f"fromExport: too many threads ({len(snapshots)}), "
-                f"max is {ThreadStateMachine._MAX_IMPORT_THREADS}"
-            )
-        sm = ThreadStateMachine(capacity=capacity)
+        sm = ThreadStateMachine(max_threads=max_threads, max_history_per_thread=max_history_per_thread)
+        if len(snapshots) > max_threads:
+            raise ValueError(f"fromExport: too many threads ({len(snapshots)}), max is {max_threads}")
         for snap in snapshots:
             conv_id = snap['conversationId']
             thread_id = snap['threadId']
 
             # Validate threadId format (same rules as live messages)
             validate_thread_id(thread_id)
-            if not conv_id or len(conv_id) > 256:
+            if not isinstance(conv_id, str) or not conv_id or len(conv_id) > MAX_CONVERSATION_ID_LENGTH:
                 raise ValueError("fromExport: invalid conversationId")
 
-            # Validate state is a known value
-            if snap['state'] not in ThreadStateMachine._VALID_STATES:
-                raise ValueError(f"fromExport: invalid state '{str(snap['state'])[:32]}'")
-
             history = snap['history']
-            if not isinstance(history, list):
-                raise ValueError("fromExport: history must be a list")
-            if len(history) > ThreadStateMachine._MAX_IMPORT_HISTORY:
+            if not isinstance(history, list) or not history:
+                raise ValueError("fromExport: history must be a non-empty list")
+            if len(history) > max_history_per_thread:
                 raise ValueError(f"fromExport: history too large ({len(history)})")
 
             # Replay the history to verify it represents a valid transition sequence
             replay_state: str = 'idle'
             for entry in history:
+                if not isinstance(entry, dict):
+                    raise ValueError("fromExport: invalid history entry")
                 msg_type = entry.get('type')
                 if not isinstance(msg_type, str) or not is_economic_type(msg_type):
                     raise ValueError(f"fromExport: unknown message type '{str(msg_type)[:32]}' in thread history")
                 if not isinstance(entry.get('messageId'), str):
                     raise ValueError("fromExport: invalid history entry")
-                if not isinstance(entry.get('timestamp'), int):
+                if not _is_timestamp(entry.get('timestamp')):
                     raise ValueError("fromExport: invalid history entry timestamp")
 
                 next_state = TRANSITIONS.get((replay_state, msg_type))
@@ -312,15 +326,17 @@ class ThreadStateMachine:
             # Final replayed state must match the declared state
             if replay_state != snap['state']:
                 raise ValueError(
-                    f"fromExport: declared state '{snap['state']}' does not match "
+                    f"fromExport: declared state '{str(snap['state'])[:32]}' does not match "
                     f"history replay '{replay_state}'"
                 )
 
             key = sm._composite_key(conv_id, thread_id)
+            if key in sm._threads:
+                raise ValueError("fromExport: duplicate thread")
             sm._threads[key] = _ThreadEntry(
                 conversation_id=conv_id,
                 thread_id=thread_id,
-                state=snap['state'],
+                state=replay_state,
                 history=list(history),
             )
         return sm

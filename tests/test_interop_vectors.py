@@ -172,7 +172,7 @@ def test_encrypted_message_decrypts_for_bob(monkeypatch):
         _b64(alice["signingPublicKey"]),
         ThreadStateMachine(),
         # The fixed vector timestamp is far below a new store's horizon.
-        ReplayDetector.from_export({"horizon": 0, "entries": []}),
+        ReplayDetector.from_export({"horizon": 0, "senderHorizons": {}, "entries": []}),
         sender_encryption_pub_key=_b64(alice["encryptionPublicKey"]),
     )
     assert parsed.body == em["expectedBody"]

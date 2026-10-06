@@ -104,22 +104,9 @@ class SoftwareIdentity:
             signature = self._ed_private_key.sign(data)
             return signature, "ed25519"
         else:
-            # coincurve: sign_recoverable returns 65 bytes (r[32] + s[32] + v[1])
-            sig = self._secp_private_key.sign_recoverable(data, hasher=None)
-            # coincurve format: r(32) + s(32) + recovery_id(1)
-            r = int.from_bytes(sig[:32], "big")
-            s = int.from_bytes(sig[32:64], "big")
-            v = sig[64]
-
-            # Low-S normalization per spec
-            order = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-            if s > order // 2:
-                s = order - s
-                v ^= 1  # flip recovery id
-
-            r_bytes = r.to_bytes(32, "big")
-            s_bytes = s.to_bytes(32, "big")
-            return r_bytes + s_bytes + bytes([v]), "secp256k1"
+            # coincurve returns r[32] || s[32] || v[1], the ACE wire order.
+            # libsecp256k1 always emits low-S, as ACE verifiers require.
+            return self._secp_private_key.sign_recoverable(data, hasher=None), "secp256k1"
 
     def get_address(self) -> str:
         return self._address

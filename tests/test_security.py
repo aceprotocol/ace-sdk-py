@@ -80,7 +80,7 @@ def test_replay_keeps_entry_until_below_floor_then_raises_horizon(clock):
 
 def test_replay_fixed_earlier_floor_keeps_entries_until_capacity(clock):
     # A store that has been running since before the receiver went offline.
-    d = ReplayDetector.from_export({"horizon": T - 7200, "entries": []}, capacity=2)
+    d = ReplayDetector.from_export({"horizon": T - 7200, "senderHorizons": {}, "entries": []}, capacity=2)
     d.commit(_id(1), ALICE, T - 3000, T - 7200)
     d.commit(_id(2), ALICE, T - 1000, T - 7200)
     assert d.horizon == T - 7200  # nothing removed
@@ -136,23 +136,25 @@ def test_replay_export_import_round_trip(clock):
 
 def test_replay_from_export_over_capacity_raises_sender_horizon(clock):
     entries = [[_id(1), ALICE, T - 30], [_id(2), ALICE, T - 10], [_id(3), ALICE, T - 20]]
-    restored = ReplayDetector.from_export({"horizon": T - 300, "entries": entries}, capacity=2)
+    restored = ReplayDetector.from_export({"horizon": T - 300, "senderHorizons": {}, "entries": entries}, capacity=2)
     assert restored.horizon == T - 300
     assert restored.export()["senderHorizons"] == {ALICE: T - 30}
     assert len(restored.export()["entries"]) == 2
 
 
 @pytest.mark.parametrize("state, error", [
-    ({"horizon": -1, "entries": []}, "invalid replay state"),
+    ({"horizon": -1, "senderHorizons": {}, "entries": []}, "invalid replay state"),
+    ({"horizon": T, "entries": []}, "invalid replay state"),  # senderHorizons is required
+    ({"horizon": T, "senderHorizons": {}, "entries": [[_id(1) + "\n", ALICE, T + 1]]}, "invalid message_id"),
     ({"horizon": T, "senderHorizons": {"": T}, "entries": []}, "invalid replay state"),
     ({"horizon": T, "senderHorizons": {ALICE: -1}, "entries": []}, "invalid replay state"),
     ({"horizon": T, "senderHorizons": [], "entries": []}, "invalid replay state"),
-    ({"horizon": T, "entries": [["msg-1", ALICE, T + 1]]}, "invalid message_id"),
-    ({"horizon": T, "entries": [[_id(1), T + 1]]}, "invalid message_id"),
-    ({"horizon": T, "entries": [[_id(1), "", T + 1]]}, "invalid entry"),
-    ({"horizon": T, "entries": [[_id(1), ALICE, T]]}, "invalid entry"),
+    ({"horizon": T, "senderHorizons": {}, "entries": [["msg-1", ALICE, T + 1]]}, "invalid message_id"),
+    ({"horizon": T, "senderHorizons": {}, "entries": [[_id(1), T + 1]]}, "invalid message_id"),
+    ({"horizon": T, "senderHorizons": {}, "entries": [[_id(1), "", T + 1]]}, "invalid entry"),
+    ({"horizon": T, "senderHorizons": {}, "entries": [[_id(1), ALICE, T]]}, "invalid entry"),
     ({"horizon": T, "senderHorizons": {ALICE: T + 5}, "entries": [[_id(1), ALICE, T + 5]]}, "invalid entry"),
-    ({"horizon": T, "entries": [[_id(1), ALICE, T + 1], [_id(1), ALICE, T + 2]]}, "invalid entry"),
+    ({"horizon": T, "senderHorizons": {}, "entries": [[_id(1), ALICE, T + 1], [_id(1), ALICE, T + 2]]}, "invalid entry"),
 ])
 def test_replay_from_export_rejects_malformed_state(state, error):
     with pytest.raises(ValueError, match=error):

@@ -24,6 +24,11 @@ ECONOMIC_TYPES: frozenset[str] = frozenset({
 
 SYSTEM_TYPES: frozenset[str] = frozenset({"info"})
 SOCIAL_TYPES: frozenset[str] = frozenset({"text"})
+MESSAGE_TYPES: frozenset[str] = ECONOMIC_TYPES | SYSTEM_TYPES | SOCIAL_TYPES
+
+
+def is_message_type(t: object) -> bool:
+    return isinstance(t, str) and t in MESSAGE_TYPES
 
 
 def is_economic_type(t: str) -> bool:

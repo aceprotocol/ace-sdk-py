@@ -32,12 +32,14 @@ from .types import (
 
 _VALID_SCHEMES: frozenset[str] = frozenset({"ed25519", "secp256k1"})
 
-_ACE_ID_PATTERN = re.compile(r"^ace:sha256:[a-f0-9]{64}$")
+# All validation patterns are applied with fullmatch: `$` would accept a trailing "\n".
+_ACE_ID_PATTERN = re.compile(r"ace:sha256:[a-f0-9]{64}")
 _VALID_DOMAIN_PATTERN = re.compile(
-    r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?"
+    r"[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?"
     r"(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*"
-    r"\.[a-zA-Z]{2,}$"
+    r"\.[a-zA-Z]{2,}"
 )
+_CAIP2_PATTERN = re.compile(r"[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}")
 
 _DEFAULT_MAX_REGISTRATION_BYTES = 1_048_576
 
@@ -84,7 +86,18 @@ def _decode_ed25519_address(address: str) -> bytes:
 
 def validate_ace_id(ace_id: str) -> bool:
     """Validate ACE ID format: ace:sha256:<64 hex chars>."""
-    return bool(_ACE_ID_PATTERN.match(ace_id))
+    return isinstance(ace_id, str) and bool(_ACE_ID_PATTERN.fullmatch(ace_id))
+
+
+def _is_https_url(value: object) -> bool:
+    """Absolute URL with scheme ``https`` (case-insensitive) and a non-empty host."""
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    return parsed.scheme.lower() == "https" and bool(parsed.hostname)
 
 
 class RegistrationKeys(NamedTuple):
@@ -107,14 +120,15 @@ def validate_registration_file(reg: RegistrationFile) -> RegistrationKeys:
         raise ValueError(f"Invalid ace version: expected '1.0', got '{reg.ace}'")
     if not reg.id or not validate_ace_id(reg.id):
         raise ValueError(f"Invalid or missing ACE id: '{reg.id}'")
-    if not reg.name:
+    if not isinstance(reg.name, str) or not reg.name:
         raise ValueError("Missing required field: name")
     if not reg.endpoint:
         raise ValueError("Missing required field: endpoint")
-    if not reg.endpoint.startswith("https://"):
-        raise ValueError("endpoint must be an HTTPS URL")
-    if reg.tier not in (0, 1):
-        raise ValueError(f"Invalid tier: {reg.tier}")
+    if not _is_https_url(reg.endpoint):
+        raise ValueError("endpoint must be an HTTPS URL with host")
+    # JSON does not distinguish 1 from 1.0 (TS/Swift cannot either); only bool is excluded.
+    if isinstance(reg.tier, bool) or reg.tier not in (0, 1):
+        raise ValueError(f"Invalid tier: {str(reg.tier)[:32]}")
     if not reg.signing:
         raise ValueError("Missing required field: signing")
     if not reg.signing.scheme:
@@ -405,7 +419,7 @@ def fetch_registration_file(
     registration file structure, and verifies the ACE ID matches the
     signing key.
     """
-    if not _VALID_DOMAIN_PATTERN.match(domain):
+    if not _VALID_DOMAIN_PATTERN.fullmatch(domain):
         raise ValueError(f"Invalid domain: '{domain[:100]}'")
     if timeout <= 0:
         raise ValueError(f"Invalid timeout: expected positive seconds, got {timeout!r}")
@@ -450,14 +464,14 @@ def fetch_registration_file(
         conn.close()
 
     reg = _parse_registration_json(raw)
-    validate_registration_file(reg)
-    if not verify_registration_id(reg):
+    keys = validate_registration_file(reg)
+    if compute_ace_id(keys.signing_public_key) != reg.id:
         raise ValueError("Registration ACE ID does not match signing key")
 
     return reg
 
 
-_TAG_PATTERN = re.compile(r'^[a-z0-9][a-z0-9-]*$')
+_TAG_PATTERN = re.compile(r'[a-z0-9][a-z0-9-]*')
 
 
 def _validate_tag_like_list(items: list, field_name: str, max_count: int) -> None:
@@ -465,7 +479,7 @@ def _validate_tag_like_list(items: list, field_name: str, max_count: int) -> Non
     if not isinstance(items, list) or len(items) > max_count:
         raise ValueError(f"Invalid profile: {field_name} must be a list of at most {max_count} items")
     for item in items:
-        if not isinstance(item, str) or len(item) > 32 or not _TAG_PATTERN.match(item):
+        if not isinstance(item, str) or len(item) > 32 or not _TAG_PATTERN.fullmatch(item):
             raise ValueError(
                 f"Invalid profile: each {field_name[:-1]} must be 1-32 lowercase alphanumeric chars or hyphens ({field_name})"
             )
@@ -488,8 +502,7 @@ def validate_profile(profile: "AgentProfile") -> None:
     if profile.image is not None:
         if not isinstance(profile.image, str) or len(profile.image) > 512:
             raise ValueError("Invalid profile: image must be at most 512 characters")
-        parsed_image = urlparse(profile.image)
-        if parsed_image.scheme != "https" or not parsed_image.netloc:
+        if not _is_https_url(profile.image):
             raise ValueError("Invalid profile: image must be a valid HTTPS URL (image)")
 
     if profile.tags is not None:
@@ -502,17 +515,13 @@ def validate_profile(profile: "AgentProfile") -> None:
         if not isinstance(profile.chains, list) or len(profile.chains) > 10:
             raise ValueError("Invalid profile: chains must be a list of at most 10 items")
         for chain in profile.chains:
-            if not isinstance(chain, str) or ":" not in chain:
+            if not isinstance(chain, str) or not _CAIP2_PATTERN.fullmatch(chain):
                 raise ValueError("Invalid profile: each chain must be a CAIP-2 identifier (chains)")
-            parts = chain.split(":", 1)
-            if not parts[0] or not parts[1]:
-                raise ValueError("Invalid profile: each chain must be a CAIP-2 identifier with non-empty namespace and reference (chains)")
 
     if profile.endpoint is not None:
         if not isinstance(profile.endpoint, str):
             raise ValueError("Invalid profile: endpoint must be a string")
-        parsed = urlparse(profile.endpoint)
-        if parsed.scheme != "https" or not parsed.netloc:
+        if not _is_https_url(profile.endpoint):
             raise ValueError("Invalid profile: endpoint must be a valid HTTPS URL with host (endpoint)")
 
     if profile.pricing is not None:

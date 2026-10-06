@@ -708,62 +708,87 @@ def test_exhaustive_transition(state: str, msg_type: str):
 
 
 # ============================================================
-# Capacity Eviction
+# Resource Limits (reject, never evict)
 # ============================================================
 
-class TestCapacityEviction:
-    def test_invalid_capacity_rejected(self):
-        with pytest.raises(ValueError, match="capacity"):
-            ThreadStateMachine(capacity=0)
-        with pytest.raises(ValueError, match="capacity"):
-            ThreadStateMachine(capacity=-1)
+def _snap(thread_id='t1', history=None, state='rfq', conv=CONV_A):
+    if history is None:
+        history = [{'type': 'rfq', 'messageId': _uuid(), 'timestamp': NOW}]
+    return {'conversationId': conv, 'threadId': thread_id, 'state': state, 'history': history}
 
-    def test_none_capacity_means_unlimited(self):
-        sm = ThreadStateMachine(capacity=None)
-        for i in range(100):
-            sm.transition(CONV_A, f"t-{i}", 'rfq', _uuid(), NOW)
-        # All 100 threads should exist
-        assert len(sm.export_state()) == 100
 
-    def test_evicts_terminal_threads_first(self):
-        sm = ThreadStateMachine(capacity=2)
-        # Thread t1: drive to terminal (rejected)
+class TestResourceLimits:
+    @pytest.mark.parametrize("kwargs", [
+        {'max_threads': 0}, {'max_threads': -1}, {'max_threads': True}, {'max_threads': 1.0},
+        {'max_history_per_thread': 0}, {'max_history_per_thread': None},
+    ])
+    def test_invalid_limits_rejected(self, kwargs):
+        with pytest.raises(ValueError, match="positive integer"):
+            ThreadStateMachine(**kwargs)
+
+    def test_thread_limit_rejects_new_thread_and_keeps_terminal(self):
+        sm = ThreadStateMachine(max_threads=2)
         sm.transition(CONV_A, 't1', 'rfq', _uuid(), NOW)
         sm.transition(CONV_A, 't1', 'offer', _uuid(), NOW)
         sm.transition(CONV_A, 't1', 'reject', _uuid(), NOW)
+        sm.transition(CONV_A, 't2', 'rfq', _uuid(), NOW)
+
+        assert not sm.can_transition(CONV_A, 't3', 'rfq')
+        with pytest.raises(ValueError, match=r"Thread limit reached \(2\)"):
+            sm.transition(CONV_A, 't3', 'rfq', _uuid(), NOW)
+        # The terminal thread is never forgotten, so it cannot be reopened.
         assert sm.is_terminal(CONV_A, 't1')
+        # Existing threads still progress at the limit.
+        assert sm.can_transition(CONV_A, 't2', 'offer')
+        sm.transition(CONV_A, 't2', 'offer', _uuid(), NOW)
 
-        # Thread t2: active
-        sm.transition(CONV_A, 't2', 'rfq', _uuid(), NOW)
-
-        # Thread t3: adding this exceeds capacity=2, should evict terminal t1
+        assert sm.remove(CONV_A, 't1')
         sm.transition(CONV_A, 't3', 'rfq', _uuid(), NOW)
 
-        states = sm.export_state()
-        thread_ids = {s['threadId'] for s in states}
-        assert 't1' not in thread_ids  # terminal thread evicted
-        assert 't2' in thread_ids
-        assert 't3' in thread_ids
-
-    def test_evicts_oldest_when_no_terminal(self):
-        sm = ThreadStateMachine(capacity=2)
+    def test_history_limit(self):
+        sm = ThreadStateMachine(max_history_per_thread=3)
         sm.transition(CONV_A, 't1', 'rfq', _uuid(), NOW)
-        sm.transition(CONV_A, 't2', 'rfq', _uuid(), NOW)
-        # t3 forces eviction; no terminal threads, so oldest (t1) is evicted
-        sm.transition(CONV_A, 't3', 'rfq', _uuid(), NOW)
+        sm.transition(CONV_A, 't1', 'offer', _uuid(), NOW)
+        sm.transition(CONV_A, 't1', 'offer', _uuid(), NOW)
+        assert not sm.can_transition(CONV_A, 't1', 'offer')
+        with pytest.raises(ValueError, match="Thread history exceeds maximum of 3 entries"):
+            sm.transition(CONV_A, 't1', 'offer', _uuid(), NOW)
 
-        states = sm.export_state()
-        thread_ids = {s['threadId'] for s in states}
-        assert 't1' not in thread_ids
-        assert 't2' in thread_ids
-        assert 't3' in thread_ids
+    def test_from_export_applies_limits(self):
+        with pytest.raises(ValueError, match="too many threads"):
+            ThreadStateMachine.from_export([_snap('t1'), _snap('t2')], max_threads=1)
+        three = [
+            {'type': 'rfq', 'messageId': _uuid(), 'timestamp': NOW},
+            {'type': 'offer', 'messageId': _uuid(), 'timestamp': NOW},
+            {'type': 'offer', 'messageId': _uuid(), 'timestamp': NOW},
+        ]
+        with pytest.raises(ValueError, match="history too large"):
+            ThreadStateMachine.from_export([_snap(history=three, state='offered')], max_history_per_thread=2)
+        restored = ThreadStateMachine.from_export([_snap('t1')], max_threads=1)
+        with pytest.raises(ValueError, match="Thread limit reached"):
+            restored.transition(CONV_A, 't2', 'rfq', _uuid(), NOW)
 
-    def test_from_export_preserves_capacity(self):
-        sm = ThreadStateMachine(capacity=2)
-        sm.transition(CONV_A, 't1', 'rfq', _uuid(), NOW)
-        exported = sm.export_state()
-        restored = ThreadStateMachine.from_export(exported, capacity=2)
-        restored.transition(CONV_A, 't2', 'rfq', _uuid(), NOW)
-        restored.transition(CONV_A, 't3', 'rfq', _uuid(), NOW)
-        states = restored.export_state()
-        assert len(states) == 2
+    @pytest.mark.parametrize("snap, error", [
+        (_snap(history=[], state='idle'), "non-empty"),
+        (_snap(thread_id=''), "threadId must not be empty"),
+        (_snap(conv=''), "invalid conversationId"),
+        (_snap(conv='x' * 257), "invalid conversationId"),
+        (_snap(history=[{'type': 'rfq', 'messageId': 'm', 'timestamp': True}]), "timestamp"),
+        (_snap(history=[{'type': 'rfq', 'messageId': 'm', 'timestamp': -1}]), "timestamp"),
+        (_snap(history=[{'type': 'rfq', 'messageId': 'm', 'timestamp': 1.0}]), "timestamp"),
+        (_snap(state='offered'), "does not match"),
+    ])
+    def test_from_export_rejects_invalid_snapshot(self, snap, error):
+        with pytest.raises(ValueError, match=error):
+            ThreadStateMachine.from_export([snap])
+
+    def test_from_export_rejects_duplicate_thread(self):
+        with pytest.raises(ValueError, match="fromExport: duplicate thread"):
+            ThreadStateMachine.from_export([_snap('t1'), _snap('t1')])
+
+    def test_lengths_count_code_points(self):
+        # 256 astral-plane chars: 256 code points (512 UTF-16 units) is allowed.
+        validate_thread_id('\U0001F600' * 256)
+        ThreadStateMachine.from_export([_snap(conv='\U0001F600' * 256)])
+        with pytest.raises(ValueError, match="exceeds max length"):
+            validate_thread_id('\U0001F600' * 257)

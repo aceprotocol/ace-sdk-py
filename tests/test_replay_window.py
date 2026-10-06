@@ -42,7 +42,7 @@ def _parse(agents, msg, store, oldest_timestamp=None):
 
 def _running_store(capacity=100_000):
     # A store that has been running since before the receiver went offline.
-    return ReplayDetector.from_export({"horizon": T - 7200, "entries": []}, capacity)
+    return ReplayDetector.from_export({"horizon": T - 7200, "senderHorizons": {}, "entries": []}, capacity)
 
 
 def test_online_max_future_drift_message_cannot_be_replayed_after_5_minutes(clock, agents):

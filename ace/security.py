@@ -9,15 +9,15 @@ import time
 
 MAX_DRIFT_SECONDS = 300  # 5 minutes
 _MESSAGE_ID_V4_PATTERN = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
     re.IGNORECASE,
 )
 
 
 def validate_message_id(message_id: str) -> None:
     """Validate that a message ID is a valid UUID v4."""
-    if not _MESSAGE_ID_V4_PATTERN.match(message_id):
-        raise ValueError(f"Invalid message_id: expected UUID v4, got '{message_id[:50]}'")
+    if not isinstance(message_id, str) or not _MESSAGE_ID_V4_PATTERN.fullmatch(message_id):
+        raise ValueError(f"Invalid message_id: expected UUID v4, got '{str(message_id)[:50]}'")
 
 
 def check_timestamp_freshness(timestamp: int, oldest_timestamp: int | None = None) -> None:
@@ -103,7 +103,7 @@ class ReplayDetector:
     def from_export(cls, data: dict, capacity: int = 100_000) -> "ReplayDetector":
         detector = cls(capacity)
         horizon = data.get("horizon") if isinstance(data, dict) else None
-        sender_horizons = data.get("senderHorizons", {}) if isinstance(data, dict) else None
+        sender_horizons = data.get("senderHorizons") if isinstance(data, dict) else None
         entries = data.get("entries") if isinstance(data, dict) else None
         if (
             not _is_timestamp(horizon)
@@ -116,7 +116,7 @@ class ReplayDetector:
         detector._sender_horizons = dict(sender_horizons)
         for entry in entries:
             mid, sender, ts = entry if isinstance(entry, (list, tuple)) and len(entry) == 3 else (None, None, None)
-            if not isinstance(mid, str) or not _MESSAGE_ID_V4_PATTERN.match(mid):
+            if not isinstance(mid, str) or not _MESSAGE_ID_V4_PATTERN.fullmatch(mid):
                 raise ValueError(f"from_export: invalid message_id '{str(mid)[:50]}'")
             if (
                 not isinstance(sender, str) or not sender or not _is_timestamp(ts)

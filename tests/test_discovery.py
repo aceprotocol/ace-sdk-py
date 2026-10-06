@@ -48,6 +48,56 @@ def test_validate_reg_valid():
     validate_registration_file(_make_valid_reg())
 
 
+def test_validate_ace_id_rejects_trailing_newline():
+    assert validate_ace_id("ace:sha256:" + "a" * 64 + "\n") is False
+
+
+def test_validate_reg_name_has_no_length_rule():
+    reg = _make_valid_reg()
+    reg.name = "n" * 200
+    validate_registration_file(reg)
+    reg.name = ""
+    with pytest.raises(ValueError, match="name"):
+        validate_registration_file(reg)
+
+
+@pytest.mark.parametrize("endpoint, ok", [
+    ("HTTPS://test.example.com/ace", True),
+    ("https://", False),
+    ("https:///path", False),
+    ("http://test.example.com", False),
+    ("https//test.example.com", False),
+])
+def test_validate_reg_endpoint_url(endpoint, ok):
+    reg = _make_valid_reg()
+    reg.endpoint = endpoint
+    if ok:
+        validate_registration_file(reg)
+    else:
+        with pytest.raises(ValueError, match="endpoint"):
+            validate_registration_file(reg)
+
+
+def test_validate_reg_tier_accepts_integral_float():
+    # JSON has one number type: 1.0 is tier 1, as in the TS and Swift SDKs.
+    reg = _make_valid_reg()
+    reg.tier = 1.0
+    validate_registration_file(reg)
+
+
+@pytest.mark.parametrize("tier", [True, False, 0.5, 2, "0"])
+def test_validate_reg_tier_must_be_0_or_1(tier):
+    reg = _make_valid_reg()
+    reg.tier = tier
+    with pytest.raises(ValueError, match="Invalid tier"):
+        validate_registration_file(reg)
+
+
+def test_fetch_rejects_domain_with_trailing_newline():
+    with pytest.raises(ValueError, match="Invalid domain"):
+        fetch_registration_file("example.com\n")
+
+
 def test_validate_reg_rejects_32_byte_encryption_key():
     """A registration whose encryption key is a 32-byte key must fail with a length error."""
     reg = _make_valid_reg()

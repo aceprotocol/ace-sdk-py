@@ -242,3 +242,26 @@ class TestValidateProfilePricing:
         validate_profile(profile)
         assert isinstance(profile.pricing, ProfilePricing)
         assert profile.pricing.max_amount == "100"
+
+
+class TestValidateProfileUnification:
+    @pytest.mark.parametrize("chain", ["eip155:1\n", "EIP155:1", "ab:1", "eip155:" + "x" * 33, "eip155:a.b"])
+    def test_chain_must_fully_match_caip2(self, chain):
+        with pytest.raises(ValueError, match=r"each chain must be a CAIP-2 identifier \(chains\)"):
+            validate_profile(AgentProfile(chains=[chain]))
+
+    def test_tag_trailing_newline_rejected(self):
+        with pytest.raises(ValueError, match="tags"):
+            validate_profile(AgentProfile(tags=["ai\n"]))
+
+    def test_lengths_count_code_points(self):
+        emoji = "\U0001F600"
+        validate_profile(AgentProfile(name=emoji * 64, description=emoji * 256))
+        with pytest.raises(ValueError, match="name must be 1-64"):
+            validate_profile(AgentProfile(name=emoji * 65))
+
+    @pytest.mark.parametrize("field", ["endpoint", "image"])
+    def test_url_scheme_case_insensitive_and_host_required(self, field):
+        validate_profile(AgentProfile(**{field: "HTTPS://example.com/x"}))
+        with pytest.raises(ValueError, match=field):
+            validate_profile(AgentProfile(**{field: "https://:443/x"}))

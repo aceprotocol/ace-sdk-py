@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 
@@ -27,8 +28,13 @@ from .types import (
     ParsedMessage,
     RegistrationFile,
     SignatureEnvelope,
+    SigningScheme,
     is_economic_type,
+    is_message_type,
 )
+
+_CONVERSATION_ID_PATTERN = re.compile(r"[0-9a-f]{64}")
+MAX_JSON_DEPTH = 32
 
 
 def _normalize_thread_id(thread_id: str | None) -> str:
@@ -55,12 +61,6 @@ def _build_signed_message_payload(
 
 
 # === Schema Validation ===
-
-def _require_fields(body: dict, fields: list[str], type_name: str) -> None:
-    for field in fields:
-        if field not in body or body[field] is None:
-            raise ValueError(f"{type_name} body requires '{field}' field")
-
 
 def _require_string(body: dict, field: str, type_name: str) -> str:
     if field not in body or body[field] is None:
@@ -109,6 +109,42 @@ def _is_json_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _require_message_type(type_: object) -> None:
+    if not is_message_type(type_):
+        raise ValueError(f"Unknown message type: '{str(type_)[:32]}'")
+
+
+def _reject_json_constant(name: str) -> None:
+    raise ValueError(f"Decrypted body contains non-standard JSON constant '{name}'")
+
+
+def _assert_max_depth(value: object, max_depth: int) -> None:
+    """Iterative depth check: the top-level value is depth 0."""
+    stack: list[tuple[object, int]] = [(value, 0)]
+    while stack:
+        val, depth = stack.pop()
+        if depth > max_depth:
+            raise ValueError(f"Decrypted body exceeds maximum nesting depth of {max_depth}")
+        children = val.values() if isinstance(val, dict) else val if isinstance(val, list) else ()
+        for child in children:
+            if isinstance(child, (dict, list)):
+                stack.append((child, depth + 1))
+
+
+def _decode_body(decrypted: bytes) -> dict:
+    try:
+        body = json.loads(decrypted.decode("utf-8"), parse_constant=_reject_json_constant)
+    except RecursionError:
+        # The stdlib parser is recursive; anything this deep is far past the limit.
+        raise ValueError(
+            f"Decrypted body exceeds maximum nesting depth of {MAX_JSON_DEPTH}"
+        ) from None
+    if not isinstance(body, dict):
+        raise ValueError("Decrypted body must be a JSON object")
+    _assert_max_depth(body, MAX_JSON_DEPTH)
+    return body
+
+
 def validate_body(type_: str, body: dict) -> None:
     """Validate message body against schema for the given type."""
     if type_ == "rfq":
@@ -132,7 +168,7 @@ def validate_body(type_: str, body: dict) -> None:
         _require_string(body, "settlementMethod", "invoice")
         _validate_optional_object(body, "settlementDetails", "invoice")
     elif type_ == "receipt":
-        _require_string(body, "invoiceId", "receipt")
+        _require_string(body, "referenceId", "receipt")
         _require_string(body, "amount", "receipt")
         _require_string(body, "currency", "receipt")
         _require_string(body, "settlementMethod", "receipt")
@@ -158,7 +194,8 @@ def validate_body(type_: str, body: dict) -> None:
         _require_string(body, "message", "info")
     elif type_ == "text":
         _require_string(body, "message", "text")
-    # Unknown types: no validation (forward compatibility)
+    else:
+        _require_message_type(type_)
 
 
 def _thread_contains_message(
@@ -194,9 +231,15 @@ def _validate_thread_references(
         if not _thread_contains_message(state_machine, conversation_id, thread_id, "offer", offer_id):
             raise ValueError("invoice.offerId must reference an offer in the same thread")
     elif type_ == "receipt":
-        invoice_id = _require_string(body, "invoiceId", "receipt")
-        if not _thread_contains_message(state_machine, conversation_id, thread_id, "invoice", invoice_id):
-            raise ValueError("receipt.invoiceId must reference an invoice in the same thread")
+        reference_id = _require_string(body, "referenceId", "receipt")
+        # Pre-paid path (accepted -> paid): the receipt references the accept.
+        prepaid = state_machine.get_state(conversation_id, thread_id) == "accepted"
+        ref_type: MessageType = "accept" if prepaid else "invoice"
+        if not _thread_contains_message(state_machine, conversation_id, thread_id, ref_type, reference_id):
+            raise ValueError(
+                "receipt.referenceId must reference the invoice (or, when pre-paid, the accept) "
+                "in the same thread"
+            )
     elif type_ == "confirm":
         deliver_id = _require_string(body, "deliverId", "confirm")
         if not _thread_contains_message(state_machine, conversation_id, thread_id, "deliver", deliver_id):
@@ -217,6 +260,7 @@ def create_message(
 ) -> ACEMessage:
     """Create a full ACE message envelope (encrypt + sign)."""
     # 0. State machine enforcement
+    _require_message_type(type_)
     if is_economic_type(type_) and not thread_id:
         raise ValueError("Economic messages require a thread_id")
     if thread_id is not None:
@@ -284,10 +328,13 @@ def parse_message(
     replay_detector: ReplayDetector,
     sender_encryption_pub_key: bytes | None = None,
     oldest_timestamp: int | None = None,
+    expected_scheme: SigningScheme | None = None,
 ) -> ParsedMessage:
     """Verify signature, decrypt, and validate a received message.
 
     Args:
+        expected_scheme: Optional sender signing scheme; the envelope
+            ``signature.scheme`` must match it.
         oldest_timestamp: Offline acceptance floor; use it for every message, live
             ones included, until the backlog is done.
         sender_encryption_pub_key: Optional sender X-Wing public key. When
@@ -301,8 +348,9 @@ def parse_message(
         raise ValueError("Message not addressed to this recipient")
     if not msg.message_id or not msg.from_id or not msg.conversation_id or not msg.type:
         raise ValueError("Missing required envelope fields")
-    if len(msg.conversation_id) > 256:
-        raise ValueError("conversationId exceeds max length of 256 characters")
+    _require_message_type(msg.type)
+    if not isinstance(msg.conversation_id, str) or not _CONVERSATION_ID_PATTERN.fullmatch(msg.conversation_id):
+        raise ValueError("Invalid conversationId: expected 64 lowercase hex characters")
     validate_message_id(msg.message_id)
 
     # Validate encryption and signature sub-envelopes
@@ -310,6 +358,11 @@ def parse_message(
         raise ValueError("Missing required encryption fields")
     if not msg.signature or not msg.signature.scheme or not msg.signature.value:
         raise ValueError("Missing required signature fields")
+    if expected_scheme is not None and msg.signature.scheme != expected_scheme:
+        raise ValueError(
+            f"Signature scheme mismatch: expected '{expected_scheme}', "
+            f"got '{str(msg.signature.scheme)[:32]}'"
+        )
 
     expected_from_id = compute_ace_id(sender_signing_pub_key)
     if msg.from_id != expected_from_id:
@@ -367,7 +420,7 @@ def parse_message(
     # 5. Decrypt body (pipeline step 5) — kem_ciphertext is signature-verified
     # above, so decapsulation uses the authenticated ciphertext.
     decrypted = receiver.decrypt_payload(kem_ciphertext, payload_bytes, msg.conversation_id)
-    body = json.loads(decrypted.decode("utf-8"))
+    body = _decode_body(decrypted)
 
     # 6. Validate body schema (pipeline step 6)
     validate_body(msg.type, body)
@@ -414,6 +467,7 @@ def parse_message_from_registration(
         replay_detector=replay_detector,
         sender_encryption_pub_key=keys.encryption_public_key,
         oldest_timestamp=oldest_timestamp,
+        expected_scheme=sender_registration.signing.scheme,
     )
 
 
@@ -440,4 +494,5 @@ def parse_message_from_peer(
         replay_detector=replay_detector,
         sender_encryption_pub_key=sender.encryption_public_key,
         oldest_timestamp=oldest_timestamp,
+        expected_scheme=sender.scheme,
     )

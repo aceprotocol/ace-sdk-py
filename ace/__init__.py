@@ -46,6 +46,7 @@ from .state_machine import (
 )
 from .types import (
     ECONOMIC_TYPES,
+    MESSAGE_TYPES,
     SOCIAL_TYPES,
     SYSTEM_TYPES,
     ACEIdentity,
@@ -68,6 +69,7 @@ from .types import (
     SigningConfig,
     SigningScheme,
     is_economic_type,
+    is_message_type,
     is_social_type,
     is_system_type,
 )
@@ -78,8 +80,8 @@ __all__ = [
     "RegistrationFile", "SigningConfig", "Capability", "PricingInfo", "ChainInfo",
     "ACEMessage", "MessageType", "EncryptionEnvelope", "SignatureEnvelope", "ParsedMessage",
     "ProfilePricing", "AgentProfile", "DiscoverQuery", "DiscoverAgent", "DiscoverResult",
-    "is_economic_type", "is_system_type", "is_social_type",
-    "ECONOMIC_TYPES", "SYSTEM_TYPES", "SOCIAL_TYPES",
+    "is_message_type", "is_economic_type", "is_system_type", "is_social_type",
+    "MESSAGE_TYPES", "ECONOMIC_TYPES", "SYSTEM_TYPES", "SOCIAL_TYPES",
     # Identity
     "SoftwareIdentity", "compute_ace_id",
     # Encryption
