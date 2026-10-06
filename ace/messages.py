@@ -37,16 +37,6 @@ from .types import (
 )
 
 
-def _estimate_base64_decoded_length(encoded: str) -> int:
-    full_blocks = len(encoded) // 4
-    decoded_length = full_blocks * 3
-    if encoded.endswith("=="):
-        decoded_length -= 2
-    elif encoded.endswith("="):
-        decoded_length -= 1
-    return decoded_length
-
-
 def _normalize_thread_id(thread_id: str | None) -> str:
     return thread_id or ""
 
@@ -353,13 +343,7 @@ def parse_message(
         raise replay_error
 
     # 4. Verify signature BEFORE decryption (pipeline step 4).
-    estimated_payload_bytes = _estimate_base64_decoded_length(msg.encryption.payload)
-    if estimated_payload_bytes > MAX_PAYLOAD_SIZE:
-        raise ValueError(
-            f"Payload too large: estimated decoded size {estimated_payload_bytes} "
-            f"bytes exceeds max {MAX_PAYLOAD_SIZE}"
-        )
-    payload_bytes = from_base64(msg.encryption.payload)
+    payload_bytes = from_base64(msg.encryption.payload, max_len=MAX_PAYLOAD_SIZE, what="Payload")
     # Length-checked before any signature or KEM work: a relay cannot make us
     # decapsulate a malformed ciphertext.
     kem_ciphertext = decode_kem_ciphertext(msg.encryption.kem_ciphertext)
@@ -374,13 +358,12 @@ def parse_message(
     )
     sign_data = build_sign_data("message", msg.from_id, msg.timestamp, message_payload)
     sig_bytes = decode_signature(msg.signature.value, msg.signature.scheme)
-    valid = False
     try:
         valid = verify_signature(
             sign_data, sig_bytes, msg.signature.scheme, sender_signing_pub_key,
         )
     except Exception:
-        pass
+        valid = False
     if not valid:
         raise ValueError("Signature verification failed")
     # Commit now: an authentic message is one-shot, even if a later step fails.

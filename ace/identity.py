@@ -54,7 +54,8 @@ class SoftwareIdentity:
         """
         if scheme not in _VALID_SCHEMES:
             raise ValueError(f"Unsupported signing scheme: '{scheme}' (expected one of {sorted(_VALID_SCHEMES)})")
-        xwing.check_seed(encryption_seed)
+        # Validates the seed length and expands the key once for every later decrypt.
+        self._decapsulation_key = xwing.DecapsulationKey(encryption_seed)
 
         self._scheme = scheme
         self._signing_private_key = signing_private_key
@@ -73,15 +74,12 @@ class SoftwareIdentity:
             uncompressed = sk.public_key.format(compressed=False)
             self._address = secp_pubkey_to_address(uncompressed)
 
-        self._encryption_public_key = xwing.public_key_from_seed(self._encryption_seed)
+        self._encryption_public_key = self._decapsulation_key.public_key
         self._ace_id = compute_ace_id(self._signing_public_key)
 
     @classmethod
     def generate(cls, scheme: SigningScheme) -> "SoftwareIdentity":
         """Generate a new random identity."""
-        if scheme not in _VALID_SCHEMES:
-            raise ValueError(f"Unsupported signing scheme: '{scheme}' (expected one of {sorted(_VALID_SCHEMES)})")
-
         encryption_seed = os.urandom(xwing.SEED_SIZE)
         if scheme == "ed25519":
             signing_private_key = Ed25519PrivateKey.generate().private_bytes_raw()
@@ -138,7 +136,7 @@ class SoftwareIdentity:
     def decrypt_payload(self, kem_ciphertext: bytes, payload: bytes, conversation_id: str) -> bytes:
         """Decrypt an encrypted payload using this identity's X-Wing private seed."""
         from .encryption import decrypt
-        return decrypt(kem_ciphertext, payload, self._encryption_seed, conversation_id)
+        return decrypt(kem_ciphertext, payload, self._decapsulation_key, conversation_id)
 
     def to_dict(self, *, include_private_keys: bool = False) -> dict[str, Any]:
         """Export identity for persistence.

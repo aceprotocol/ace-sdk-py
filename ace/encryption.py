@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-from typing import Callable
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -47,41 +46,18 @@ MAX_PAYLOAD_SIZE = 10 * 1024 * 1024
 _MAX_PLAINTEXT_SIZE = MAX_PAYLOAD_SIZE - _MIN_PAYLOAD_LEN
 
 
-def _padded_base64_length(n_bytes: int) -> int:
-    """Length of the padded Base64 encoding of ``n_bytes`` bytes."""
-    return 4 * ((n_bytes + 2) // 3)
-
-
-_MAX_PUBLIC_KEY_B64_LEN = _padded_base64_length(xwing.PUBLIC_KEY_SIZE)  # 1624
-_MAX_CIPHERTEXT_B64_LEN = _padded_base64_length(xwing.CIPHERTEXT_SIZE)  # 1496
-
-
-def _decode_fixed_size(
-    b64: str, max_b64_len: int, check: Callable[[bytes], None], what: str
-) -> bytes:
-    if not isinstance(b64, str):
-        raise ValueError(f"{what} must be a Base64 string")
-    # Cheap pre-check: refuse to decode anything longer than the encoding of a
-    # correctly sized value.
-    if len(b64) > max_b64_len:
-        raise ValueError(f"{what} Base64 is too long ({len(b64)} chars, max {max_b64_len})")
-    raw = from_base64(b64)
-    check(raw)
-    return raw
-
-
 def decode_kem_public_key(b64: str) -> bytes:
     """Decode a Base64 X-Wing public key and enforce its length (1216 bytes)."""
-    return _decode_fixed_size(
-        b64, _MAX_PUBLIC_KEY_B64_LEN, xwing.check_public_key, "X-Wing public key"
-    )
+    raw = from_base64(b64, max_len=xwing.PUBLIC_KEY_SIZE, what="X-Wing public key")
+    xwing.check_public_key(raw)
+    return raw
 
 
 def decode_kem_ciphertext(b64: str) -> bytes:
     """Decode a Base64 X-Wing KEM ciphertext and enforce its length (1120 bytes)."""
-    return _decode_fixed_size(
-        b64, _MAX_CIPHERTEXT_B64_LEN, xwing.check_ciphertext, "X-Wing ciphertext"
-    )
+    raw = from_base64(b64, max_len=xwing.CIPHERTEXT_SIZE, what="X-Wing ciphertext")
+    xwing.check_ciphertext(raw)
+    return raw
 
 
 def _derive_aes_key(shared_secret: bytes, conv_id_bytes: bytes) -> bytes:
@@ -156,11 +132,13 @@ def encrypt(
 def decrypt(
     kem_ciphertext: bytes,
     payload: bytes,
-    private_seed: bytes,
+    private_key: bytes | xwing.DecapsulationKey,
     conversation_id: str,
 ) -> bytes:
-    """Decrypt a message using own X-Wing private seed (32 bytes).
+    """Decrypt a message using own X-Wing private key.
 
+    ``private_key`` is the 32-byte seed or an already-expanded
+    :class:`xwing.DecapsulationKey` (cheaper when decrypting repeatedly).
     All length checks run before any decapsulation.
     """
     # 0. Validate payload size (kem_ciphertext / seed lengths are checked by
@@ -177,7 +155,10 @@ def decrypt(
 
     # 1. KEM decapsulation (implicit rejection: a bad ciphertext yields an
     #    unrelated secret, caught by the GCM tag below)
-    shared_secret = xwing.decapsulate(kem_ciphertext, private_seed)
+    if isinstance(private_key, xwing.DecapsulationKey):
+        shared_secret = private_key.decapsulate(kem_ciphertext)
+    else:
+        shared_secret = xwing.decapsulate(kem_ciphertext, private_key)
 
     # 2. HKDF key derivation
     conv_id_bytes = conversation_id.encode("utf-8")

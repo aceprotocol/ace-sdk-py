@@ -46,6 +46,7 @@ __all__ = [
     "check_public_key",
     "check_ciphertext",
     "check_seed",
+    "DecapsulationKey",
     "public_key_from_seed",
     "encapsulate",
     "decapsulate",
@@ -88,25 +89,46 @@ def check_seed(seed: bytes) -> None:
     _check_length(seed, SEED_SIZE, "seed")
 
 
-def _expand_decapsulation_key(seed: bytes) -> tuple[MLKEM768PrivateKey, X25519PrivateKey, bytes]:
-    """expandDecapsulationKey(sk) -> (sk_M, sk_X, pk_X)."""
-    expanded = hashlib.shake_256(bytes(seed)).digest(_EXPANDED_SIZE)
-    sk_m = MLKEM768PrivateKey.from_seed_bytes(expanded[:_MLKEM_SEED_SIZE])
-    sk_x = X25519PrivateKey.from_private_bytes(expanded[_MLKEM_SEED_SIZE:_EXPANDED_SIZE])
-    pk_x = sk_x.public_key().public_bytes_raw()
-    return sk_m, sk_x, pk_x
-
-
 def _combiner(ss_m: bytes, ss_x: bytes, ct_x: bytes, pk_x: bytes) -> bytes:
     return hashlib.sha3_256(ss_m + ss_x + ct_x + pk_x + XWING_LABEL).digest()
 
 
+class DecapsulationKey:
+    """An X-Wing private key expanded once from its 32-byte seed.
+
+    expandDecapsulationKey (SHAKE256 + ML-KEM-768 keygen + X25519 base-point
+    multiplication) runs in the constructor, so holders that decapsulate
+    repeatedly pay for it once.
+    """
+
+    __slots__ = ("_sk_m", "_sk_x", "_pk_x", "public_key")
+
+    def __init__(self, seed: bytes) -> None:
+        check_seed(seed)
+        expanded = hashlib.shake_256(bytes(seed)).digest(_EXPANDED_SIZE)
+        self._sk_m = MLKEM768PrivateKey.from_seed_bytes(expanded[:_MLKEM_SEED_SIZE])
+        self._sk_x = X25519PrivateKey.from_private_bytes(expanded[_MLKEM_SEED_SIZE:_EXPANDED_SIZE])
+        self._pk_x = self._sk_x.public_key().public_bytes_raw()
+        self.public_key: bytes = self._sk_m.public_key().public_bytes_raw() + self._pk_x
+
+    def decapsulate(self, ciphertext: bytes) -> bytes:
+        """Decapsulate an X-Wing ciphertext; returns 32 bytes.
+
+        ML-KEM-768 uses implicit rejection: a malformed or foreign ``ct_M`` yields a
+        pseudorandom secret instead of an error, so callers must rely on the AEAD tag
+        to detect a bad ciphertext.
+        """
+        check_ciphertext(ciphertext)
+        ct_m = bytes(ciphertext[:_MLKEM_CT_SIZE])
+        ct_x = bytes(ciphertext[_MLKEM_CT_SIZE:])
+        ss_m = self._sk_m.decapsulate(ct_m)
+        ss_x = self._sk_x.exchange(X25519PublicKey.from_public_bytes(ct_x))
+        return _combiner(ss_m, ss_x, ct_x, self._pk_x)
+
+
 def public_key_from_seed(seed: bytes) -> bytes:
     """Derive the 1216-byte X-Wing public key from a 32-byte seed."""
-    check_seed(seed)
-    sk_m, _sk_x, pk_x = _expand_decapsulation_key(seed)
-    pk_m = sk_m.public_key().public_bytes_raw()
-    return pk_m + pk_x
+    return DecapsulationKey(seed).public_key
 
 
 def encapsulate(public_key: bytes) -> tuple[bytes, bytes]:
@@ -132,16 +154,9 @@ def encapsulate(public_key: bytes) -> tuple[bytes, bytes]:
 def decapsulate(ciphertext: bytes, seed: bytes) -> bytes:
     """Decapsulate an X-Wing ciphertext with the 32-byte seed; returns 32 bytes.
 
-    ML-KEM-768 uses implicit rejection: a malformed or foreign ``ct_M`` yields a
-    pseudorandom secret instead of an error, so callers must rely on the AEAD tag
-    to detect a bad ciphertext.
+    See :meth:`DecapsulationKey.decapsulate`; prefer holding a
+    :class:`DecapsulationKey` when decapsulating repeatedly.
     """
+    # Ciphertext length is checked before the (more expensive) key expansion.
     check_ciphertext(ciphertext)
-    check_seed(seed)
-    ct_m = bytes(ciphertext[:_MLKEM_CT_SIZE])
-    ct_x = bytes(ciphertext[_MLKEM_CT_SIZE:])
-
-    sk_m, sk_x, pk_x = _expand_decapsulation_key(seed)
-    ss_m = sk_m.decapsulate(ct_m)
-    ss_x = sk_x.exchange(X25519PublicKey.from_public_bytes(ct_x))
-    return _combiner(ss_m, ss_x, ct_x, pk_x)
+    return DecapsulationKey(seed).decapsulate(ciphertext)

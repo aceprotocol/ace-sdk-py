@@ -280,7 +280,7 @@ class VerifiedPeer:
                 "not signed by this identity's signing key (possible key substitution / relay MITM)."
             )
         # The binding check above already validated both Base64 strings and the
-        # X-Wing length; decode once here for the verified instance.
+        # X-Wing length; re-decoding here is cheap and keeps that check self-contained.
         return cls(
             ace_id=ace_id,
             scheme=scheme,  # type: ignore[arg-type]

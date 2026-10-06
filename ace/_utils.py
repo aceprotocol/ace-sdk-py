@@ -23,11 +23,25 @@ def to_base64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
-def from_base64(s: str) -> bytes:
+def from_base64(s: str, *, max_len: int | None = None, what: str = "Base64 value") -> bytes:
+    """Strictly decode Base64.
+
+    With ``max_len``, ``s`` must be a ``str`` and anything longer than the padded
+    encoding of ``max_len`` bytes is refused before decoding (DoS guard).
+    """
+    if max_len is not None:
+        if not isinstance(s, str):
+            raise ValueError(f"{what} must be a Base64 string")
+        max_encoded = 4 * ((max_len + 2) // 3)
+        if len(s) > max_encoded:
+            raise ValueError(f"{what} too large: {len(s)} Base64 chars exceeds max {max_encoded}")
     try:
-        return base64.b64decode(s, validate=True)
+        raw = base64.b64decode(s, validate=True)
     except binascii.Error as exc:
         raise ValueError("Invalid Base64 input") from exc
+    if max_len is not None and len(raw) > max_len:
+        raise ValueError(f"{what} too large: {len(raw)} bytes exceeds max {max_len}")
+    return raw
 
 
 def eip55_checksum(address: str) -> str:
