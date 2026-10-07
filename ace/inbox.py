@@ -7,7 +7,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Callable, Generator, Iterator, Literal, NamedTuple
 
-from ._encoding import is_ace_id, is_conversation_id, is_message_id, is_thread_id, unix_now, wire_int
+from ._encoding import is_ace_id, is_stream_id, is_conversation_id, is_message_id, is_thread_id, unix_now, wire_int
 from .encryption import compute_conversation_id
 from .envelope import decode_envelope, envelope_fingerprint
 from .errors import ACEError
@@ -19,7 +19,7 @@ from .limits import (
 )
 from .messages import parse_message
 from .peers import PeerStore
-from .relay import STREAM_ID_RE, RelayClient, compare_stream_ids, normalize_relay_url
+from .relay import RelayClient, compare_stream_ids, normalize_relay_url
 from .replay import ReplayDetector
 from .state_machine import ThreadSnapshot, ThreadStateMachine
 from .store import ACEStore, load_record, write_record
@@ -44,9 +44,7 @@ class ReceiveSource:
     def __post_init__(self) -> None:
         if self.kind == "relay":
             object.__setattr__(self, "relay_url", normalize_relay_url(self.relay_url))
-            if self.stream_id is not None and (
-                not isinstance(self.stream_id, str) or STREAM_ID_RE.fullmatch(self.stream_id) is None
-            ):
+            if self.stream_id is not None and not is_stream_id(self.stream_id):
                 raise ACEError("invalid_argument", "stream_id must be '<ms>-<seq>'")
         elif self.kind == "direct":
             if self.relay_url is not None or self.stream_id is not None:
@@ -307,7 +305,7 @@ class Inbox:
             return {}
         cursors = d.get("cursors")
         if not isinstance(cursors, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) and STREAM_ID_RE.fullmatch(v) for k, v in cursors.items()
+            isinstance(k, str) and is_stream_id(v) for k, v in cursors.items()
         ):
             raise ACEError("storage_failed", "cursors.json is invalid")
         return dict(cursors)

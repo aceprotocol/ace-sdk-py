@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import re
 import socket
 import threading
 import time
@@ -12,7 +11,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Literal, NamedTuple
 
-from ._encoding import unix_now, wire_int
+from ._encoding import is_stream_id, unix_now, wire_int
 from .auth import RelayAuthRequest, create_auth_headers
 from .discovery import VerifiedPeer, verify_peer_record
 from .errors import ACEError
@@ -20,7 +19,6 @@ from .limits import MAX_ENVELOPE_BYTES, MAX_INBOX_PAGE
 from .registration import _KEEP, create_registration_request
 from .types import ACEIdentity, ACEMessage, AgentProfile, DiscoverQuery
 
-STREAM_ID_RE = re.compile(r"[0-9]+-[0-9]+")
 DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 _SSE_FRAME_LIMIT = MAX_ENVELOPE_BYTES + 512
 _MAX_CONNECT_FAILURES = 10
@@ -327,7 +325,7 @@ class RelayClient:
         entries = []
         for m in messages:
             sid = m.get("streamId") if isinstance(m, dict) else None
-            if not isinstance(sid, str) or STREAM_ID_RE.fullmatch(sid) is None or "message" not in m:
+            if not is_stream_id(sid) or "message" not in m:
                 raise _protocol("inbox entries must be {streamId, message}")
             entries.append(RelayEntry(sid, m["message"], False))
         return InboxPage(entries, self._cursor(obj))
@@ -394,13 +392,14 @@ class RelayClient:
         if not isinstance(w, dict):
             raise _protocol("webhook must be an object or null")
         failures, updated_at = wire_int(w.get("failures")), wire_int(w.get("updatedAt"))
-        delivered, last_error = w.get("lastDeliveredAt"), w.get("lastError")
-        delivered_at = None if delivered is None else wire_int(delivered)
+        # Optional fields: absent is fine; present but malformed (null included) is a protocol error.
+        delivered_at = wire_int(w["lastDeliveredAt"]) if "lastDeliveredAt" in w else None
+        last_error = w.get("lastError")
         if (
             not isinstance(w.get("url"), str) or w.get("status") not in ("active", "disabled")
             or failures is None or updated_at is None
-            or (delivered is not None and delivered_at is None)
-            or not (last_error is None or isinstance(last_error, str))
+            or ("lastDeliveredAt" in w and delivered_at is None)
+            or ("lastError" in w and not isinstance(last_error, str))
         ):
             raise _protocol("webhook response must be {url, status, failures, updatedAt, …}")
         return Webhook(w["url"], w["status"], failures, updated_at, delivered_at, last_error)
@@ -578,7 +577,7 @@ class RelayClient:
                 return
             if etype not in ("catchup", "message"):
                 continue
-            if eid is None or STREAM_ID_RE.fullmatch(eid) is None:
+            if not is_stream_id(eid):
                 raise _protocol("SSE event without a valid stream id")
             if len(payload) > MAX_ENVELOPE_BYTES:
                 raise _protocol("SSE data exceeds MAX_ENVELOPE_BYTES")

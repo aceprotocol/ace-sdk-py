@@ -20,15 +20,7 @@ from ace import (
 )
 from ace.relay import compare_stream_ids, normalize_relay_url
 
-from .fake_relay import FakeRelay
 from .helpers import raises
-
-
-@pytest.fixture
-def relay():
-    r = FakeRelay()
-    yield r
-    r.close()
 
 
 @pytest.fixture

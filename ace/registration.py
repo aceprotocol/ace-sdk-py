@@ -143,8 +143,7 @@ def verify_registration_request(
     ``invalid_profile``; binding -> ``invalid_signature``; authorization -> ``invalid_authorization``.
     ``request_digest`` is hex SHA-256 of the ``register-request`` signData.
     """
-    if type(window_seconds) is not int or window_seconds < 0:
-        raise ACEError("invalid_argument", "window_seconds must be a non-negative integer")
+    check_wire_int(window_seconds, "window_seconds")
     bad = "invalid_registration"
     if not isinstance(body, dict):
         raise ACEError(bad, "registration request must be an object")

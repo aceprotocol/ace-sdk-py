@@ -20,7 +20,8 @@ MAX_SAFE_INTEGER = (1 << 53) - 1
 ACE_ID_RE = re.compile(r"ace:sha256:[0-9a-f]{64}")
 MESSAGE_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 CONVERSATION_ID_RE = re.compile(r"[0-9a-f]{64}")
-TIMESTAMP_RE = re.compile(r"0|[1-9][0-9]{0,15}")  # used with fullmatch
+_TIMESTAMP_RE = re.compile(r"0|[1-9][0-9]{0,15}")
+_STREAM_ID_RE = re.compile(r"[0-9]{1,20}-[0-9]{1,20}")
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 _B64_RE = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
 _HEX_SIG_RE = re.compile(r"0x[0-9a-f]{130}")
@@ -87,6 +88,19 @@ def check_wire_int(value: object, what: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or wire_int(value) is None:
         raise ACEError("invalid_argument", f"{what} must be an integer in [0, 2^53-1]")
     return value
+
+
+def is_stream_id(value: object) -> bool:
+    """A relay stream ID ``<ms>-<seq>``, each part 1..20 digits."""
+    return isinstance(value, str) and _STREAM_ID_RE.fullmatch(value) is not None
+
+
+def parse_timestamp(value: str | None) -> int | None:
+    """A timestamp header: canonical decimal in [0, 2^53-1], else None."""
+    if value is None or _TIMESTAMP_RE.fullmatch(value) is None:
+        return None
+    n = int(value)
+    return n if n <= MAX_SAFE_INTEGER else None
 
 
 def unix_now(clock: Callable[[], int] | None) -> int:

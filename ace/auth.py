@@ -2,14 +2,11 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Callable, Literal, Mapping, NamedTuple, Sequence
 
 from ._encoding import (
     CONTROL_CHAR_RE,
-    MAX_SAFE_INTEGER,
-    TIMESTAMP_RE,
     check_fresh,
     check_wire_int,
     decimal,
@@ -17,6 +14,8 @@ from ._encoding import (
     encode_signature,
     is_ace_id,
     is_https_url,
+    is_stream_id,
+    parse_timestamp,
     wire_int,
 )
 from ._signing import build_sign_data, encode_payload, verify_signature
@@ -24,7 +23,6 @@ from .errors import ACEError
 from .limits import MAX_INBOX_PAGE, TIMESTAMP_WINDOW_SECONDS
 from .types import SIGNING_SCHEMES, ACEIdentity, SigningScheme
 
-_SINCE_RE = re.compile(r"-|[0-9]+-[0-9]+")
 _WEBHOOK_METHODS = ("PUT", "GET", "DELETE")
 
 
@@ -56,7 +54,7 @@ class RelayAuthRequest:
     def __post_init__(self) -> None:
         a = self.action
         if a in ("listen", "inbox"):
-            if not isinstance(self.since, str) or _SINCE_RE.fullmatch(self.since) is None:
+            if self.since != "-" and not is_stream_id(self.since):
                 raise _bad("since must be '-' or '<ms>-<seq>'")
         if a == "inbox" and (type(self.limit) is not int or not 1 <= self.limit <= MAX_INBOX_PAGE):
             raise _bad(f"limit must be an integer in 1..{MAX_INBOX_PAGE}")
@@ -70,7 +68,7 @@ class RelayAuthRequest:
                     raise _bad("max_price and currency must be strings or None")
             if type(self.ttl) is not int or wire_int(self.ttl) is None:
                 raise _bad("ttl must be an integer in [0, 2^53-1]")
-        if a == "webhook":
+        elif a == "webhook":
             if self.method not in _WEBHOOK_METHODS:
                 raise _bad("method must be PUT, GET or DELETE")
             if not isinstance(self.url, str) or not isinstance(self.secret, str):
@@ -82,7 +80,7 @@ class RelayAuthRequest:
                     raise _bad("secret must be 16..128 characters without control characters")
             elif self.url != "" or self.secret != "":
                 raise _bad(f"{self.method} takes no url or secret")
-        elif a not in ("listen", "inbox", "unregister", "intent"):
+        elif a not in ("listen", "inbox", "unregister"):
             raise _bad("unknown action")
 
     @classmethod
@@ -162,11 +160,12 @@ def parse_auth_headers(headers: Mapping[str, str | Sequence[str] | None]) -> Rel
     ace_id, ts, sig = found.get("x-ace-id"), found.get("x-ace-timestamp"), found.get("x-ace-signature")
     if not is_ace_id(ace_id):
         raise _bad("X-ACE-Id is missing or not an ACE ID")
-    if ts is None or TIMESTAMP_RE.fullmatch(ts) is None or int(ts) > MAX_SAFE_INTEGER:
+    timestamp = parse_timestamp(ts)
+    if timestamp is None:
         raise _bad("X-ACE-Timestamp is missing or malformed")
     if not sig or len(sig) > 512:
         raise _bad("X-ACE-Signature is missing")
-    return RelayAuth(ace_id, int(ts), sig)  # type: ignore[arg-type]
+    return RelayAuth(ace_id, timestamp, sig)  # type: ignore[arg-type]
 
 
 def verify_auth_headers(
@@ -187,8 +186,7 @@ def verify_auth_headers(
     (409 ``replay``)."""
     if not isinstance(auth, RelayAuth) or not isinstance(req, RelayAuthRequest) or scheme not in SIGNING_SCHEMES:
         raise _bad("expected RelayAuth, RelayAuthRequest and a signing scheme")
-    if type(window_seconds) is not int or window_seconds < 0:
-        raise _bad("window_seconds must be a non-negative integer")
+    check_wire_int(window_seconds, "window_seconds")
     if auth.ace_id != ace_id:
         raise _bad("X-ACE-Id does not match the signer")
     check_fresh(auth.timestamp, clock, window_seconds, "X-ACE-Timestamp")

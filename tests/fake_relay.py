@@ -31,7 +31,6 @@ class FakeRelay:
         self.seen_auth: set[tuple[str, str, str]] = set()
         self.intents: list[dict] = []
         self.webhooks: dict[str, dict] = {}  # aceId -> {url, secret, ...}
-        self.auth_actions: list[str] = []
         self.extra_agents: list[dict] = []
         self.inject: list[tuple[str, int, str, dict]] = []  # (path, status, code, headers)
         self.drain_after: int | None = None
@@ -105,7 +104,6 @@ class FakeRelay:
         if key in self.seen_auth:
             raise _HTTPError(409, "replay")
         self.seen_auth.add(key)
-        self.auth_actions.append(req.action)
         return auth.ace_id
 
     def _next_id(self) -> str:

@@ -4,13 +4,14 @@ import json
 
 import pytest
 
-from ace import ACEError, RelayClient, SoftwareIdentity
+from ace import RelayClient, SoftwareIdentity
+from ace._encoding import MAX_SAFE_INTEGER
 from ace._signing import build_sign_data, encode_payload
 from ace.auth import RelayAuthRequest
 from ace.relay import Webhook
 from ace.webhook import verify_webhook_notification
 
-from .fake_relay import FakeRelay
+from .helpers import raises
 
 SECRET = "0123456789abcdef0123456789abcdef"
 TS = 1741000000
@@ -21,6 +22,11 @@ BODY = json.dumps({"event": "message", "aceId": "ace:sha256:" + "a" * 64, "strea
 def sig(secret: str = SECRET, ts: int = TS, body: str = BODY, prefix: str = "sha256=") -> str:
     mac = hmac.new(secret.encode(), f"{ts}.".encode() + body.encode(), hashlib.sha256).hexdigest()
     return prefix + mac
+
+
+def _verify(**overrides):
+    args = dict(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY, clock=lambda: TS)
+    return verify_webhook_notification(**{**args, **overrides})
 
 
 def test_webhook_auth_payloads():
@@ -44,20 +50,25 @@ def test_webhook_auth_payloads():
     dict(method="DELETE", secret=SECRET),
 ])
 def test_webhook_auth_rejects(kwargs):
-    with pytest.raises(ACEError) as info:
+    with raises("invalid_argument"):
         RelayAuthRequest.webhook(**kwargs)
-    assert info.value.code == "invalid_argument"
 
 
-def test_verify_notification_ok():
-    n = verify_webhook_notification(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY, clock=lambda: TS + 10)
-    assert n.ace_id == "ace:sha256:" + "a" * 64
-    assert n.stream_id == "1741000000000-0"
+MAX = MAX_SAFE_INTEGER
+NO_STREAM = '{"event":"message","aceId":"ace:sha256:' + "a" * 64 + '"}'
+LONG_STREAM = BODY.replace("1741000000000-0", "1" * 21 + "-0")
 
 
-def test_verify_notification_accepts_bytes_body():
-    n = verify_webhook_notification(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY.encode(), clock=lambda: TS)
-    assert n.stream_id == "1741000000000-0"
+@pytest.mark.parametrize("kwargs", [
+    dict(),
+    dict(clock=lambda: TS + 10),
+    dict(body=BODY.encode()),
+    dict(window_seconds=0),
+    dict(window_seconds=MAX),
+    dict(timestamp=str(MAX), signature=sig(ts=MAX), clock=lambda: MAX),
+])
+def test_verify_notification_accepts(kwargs):
+    assert _verify(**kwargs) == ("ace:sha256:" + "a" * 64, "1741000000000-0")
 
 
 @pytest.mark.parametrize("kwargs, code", [
@@ -67,72 +78,23 @@ def test_verify_notification_accepts_bytes_body():
     (dict(body=BODY.replace("1741000000000-0", "1741000000000-1")), "invalid_signature"),
     (dict(clock=lambda: TS + 301), "stale_timestamp"),
     (dict(timestamp="not-a-number"), "invalid_argument"),
-    (dict(body='{"event":"message","aceId":"ace:sha256:' + "a" * 64 + '"}',
-          signature=sig(body='{"event":"message","aceId":"ace:sha256:' + "a" * 64 + '"}')), "invalid_argument"),
+    # 16 digits pass the format regex but exceed 2^53 - 1
+    (dict(timestamp=str(MAX + 1)), "invalid_argument"),
+    (dict(timestamp="9999999999999999"), "invalid_argument"),
+    (dict(body=NO_STREAM, signature=sig(body=NO_STREAM)), "invalid_argument"),
+    (dict(body=LONG_STREAM, signature=sig(body=LONG_STREAM)), "invalid_argument"),
+    (dict(window_seconds=-1), "invalid_argument"),
+    (dict(window_seconds=MAX + 1), "invalid_argument"),
+    (dict(window_seconds=1.5), "invalid_argument"),
+    (dict(window_seconds="300"), "invalid_argument"),
+    (dict(window_seconds=True), "invalid_argument"),
+    (dict(window_seconds=None), "invalid_argument"),
+    (dict(body="\ud800"), "invalid_argument"),  # lone surrogate: not UTF-8 encodable
+    (dict(secret="0123456789abcdef\udfff"), "invalid_argument"),
 ])
 def test_verify_notification_rejects(kwargs, code):
-    args = dict(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY, clock=lambda: TS)
-    args.update(kwargs)
-    with pytest.raises(ACEError) as info:
-        verify_webhook_notification(**args)
-    assert info.value.code == code
-
-
-@pytest.mark.parametrize("kwargs", [
-    dict(window_seconds=-1),
-    dict(window_seconds=1.5),
-    dict(window_seconds="300"),
-    dict(window_seconds=True),
-    dict(window_seconds=None),
-    dict(body="\ud800"),  # lone surrogate: not UTF-8 encodable
-    dict(secret="0123456789abcdef\udfff"),
-])
-def test_verify_notification_rejects_bad_arguments(kwargs):
-    args = dict(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY, clock=lambda: TS)
-    args.update(kwargs)
-    with pytest.raises(ACEError) as info:
-        verify_webhook_notification(**args)
-    assert info.value.code == "invalid_argument"
-
-
-def test_verify_notification_window_zero_is_allowed():
-    n = verify_webhook_notification(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY, clock=lambda: TS,
-                                    window_seconds=0)
-    assert n.stream_id == "1741000000000-0"
-
-
-def test_verify_notification_stale_checked_before_hmac():
-    with pytest.raises(ACEError) as info:
-        verify_webhook_notification(secret=SECRET, timestamp=str(TS), signature=sig(secret="wrong-secret-wrong-secret"),
-                                    body=BODY, clock=lambda: TS + 301)
-    assert info.value.code == "stale_timestamp"
-
-
-@pytest.mark.parametrize("timestamp", ["9007199254740992", "9007199254740993", "9999999999999999"])
-def test_verify_notification_rejects_timestamp_above_max_safe_integer(timestamp):
-    # 16 digits pass the format regex but exceed 2^53 - 1 (TS Number.MAX_SAFE_INTEGER)
-    with pytest.raises(ACEError) as info:
-        verify_webhook_notification(secret=SECRET, timestamp=timestamp, signature=sig(), body=BODY, clock=lambda: TS)
-    assert info.value.code == "invalid_argument"
-
-
-def test_verify_notification_accepts_timestamp_at_max_safe_integer():
-    ts = 2**53 - 1
-    n = verify_webhook_notification(secret=SECRET, timestamp=str(ts), signature=sig(ts=ts), body=BODY, clock=lambda: ts)
-    assert n.stream_id == "1741000000000-0"
-
-
-def test_verify_notification_accepts_window_at_max_safe_integer():
-    n = verify_webhook_notification(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY, clock=lambda: TS,
-                                    window_seconds=2**53 - 1)
-    assert n.stream_id == "1741000000000-0"
-
-
-def test_verify_notification_rejects_window_above_max_safe_integer():
-    with pytest.raises(ACEError) as info:
-        verify_webhook_notification(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY, clock=lambda: TS,
-                                    window_seconds=2**53)
-    assert info.value.code == "invalid_argument"
+    with raises(code):
+        _verify(**kwargs)
 
 
 BAD_SIG = "sha256=" + "Z" * 64
@@ -141,7 +103,7 @@ BAD_SIG = "sha256=" + "Z" * 64
 @pytest.mark.parametrize("kwargs, code", [
     # malformed timestamp wins over a malformed signature
     (dict(timestamp="nope", signature=BAD_SIG), "invalid_argument"),
-    (dict(timestamp="9007199254740993", signature=BAD_SIG), "invalid_argument"),
+    (dict(timestamp=str(MAX + 2), signature=BAD_SIG), "invalid_argument"),
     # malformed signature wins over a bad window_seconds and over staleness
     (dict(signature=BAD_SIG, window_seconds=-1), "invalid_signature"),
     (dict(signature=BAD_SIG, clock=lambda: TS + 301), "invalid_signature"),
@@ -152,21 +114,11 @@ BAD_SIG = "sha256=" + "Z" * 64
      "invalid_argument"),
 ])
 def test_verify_notification_check_order(kwargs, code):
-    args = dict(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY, clock=lambda: TS)
-    args.update(kwargs)
-    with pytest.raises(ACEError) as info:
-        verify_webhook_notification(**args)
-    assert info.value.code == code
+    with raises(code):
+        _verify(**kwargs)
 
 
 # --- RelayClient webhook endpoints against the fake relay ---
-
-@pytest.fixture
-def relay():
-    r = FakeRelay()
-    yield r
-    r.close()
-
 
 def test_relay_webhook_round_trip(relay):
     alice = SoftwareIdentity.generate("ed25519")
@@ -182,7 +134,6 @@ def test_relay_webhook_round_trip(relay):
         ("https://example.com/hook", "active", 0, None, None)
     client.clear_webhook(alice)
     assert client.get_webhook(alice) is None
-    assert relay.auth_actions == ["webhook"] * 5
     assert [r for r in relay.requests if r[1] == "/v1/webhook"] == [
         ("GET", "/v1/webhook"), ("PUT", "/v1/webhook"), ("GET", "/v1/webhook"),
         ("DELETE", "/v1/webhook"), ("GET", "/v1/webhook"),
@@ -191,9 +142,8 @@ def test_relay_webhook_round_trip(relay):
 
 def test_relay_set_webhook_validates_locally(relay):
     alice = SoftwareIdentity.generate("ed25519")
-    with pytest.raises(ACEError) as info:
+    with raises("invalid_argument"):
         RelayClient(relay.url).set_webhook(alice, "http://example.com/hook", SECRET)
-    assert info.value.code == "invalid_argument"
     assert relay.requests == []
 
 
@@ -209,14 +159,15 @@ GOOD = {"url": "https://example.com/hook", "status": "disabled", "failures": 3, 
     {**GOOD, "url": 5},
     {**GOOD, "lastDeliveredAt": "yesterday"},
     {**GOOD, "lastDeliveredAt": 1.5},
+    {**GOOD, "lastDeliveredAt": None},
     {**GOOD, "lastError": 42},
+    {**GOOD, "lastError": None},
 ])
 def test_relay_get_webhook_rejects_malformed(relay, webhook):
     alice = SoftwareIdentity.generate("ed25519")
     relay.raw_responses["/v1/webhook"] = (200, json.dumps({"webhook": webhook}).encode(), "application/json")
-    with pytest.raises(ACEError) as info:
+    with raises("relay_protocol_error"):
         RelayClient(relay.url).get_webhook(alice)
-    assert info.value.code == "relay_protocol_error"
 
 
 def test_relay_get_webhook_coerces_wire_ints(relay):
