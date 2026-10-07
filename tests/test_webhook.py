@@ -108,6 +108,51 @@ def test_verify_notification_stale_checked_before_hmac():
     assert info.value.code == "stale_timestamp"
 
 
+@pytest.mark.parametrize("timestamp", ["9007199254740992", "9007199254740993", "9999999999999999"])
+def test_verify_notification_rejects_timestamp_above_max_safe_integer(timestamp):
+    # 16 digits pass the format regex but exceed 2^53 - 1 (TS Number.MAX_SAFE_INTEGER)
+    with pytest.raises(ACEError) as info:
+        verify_webhook_notification(secret=SECRET, timestamp=timestamp, signature=sig(), body=BODY, clock=lambda: TS)
+    assert info.value.code == "invalid_argument"
+
+
+def test_verify_notification_accepts_timestamp_at_max_safe_integer():
+    ts = 2**53 - 1
+    n = verify_webhook_notification(secret=SECRET, timestamp=str(ts), signature=sig(ts=ts), body=BODY, clock=lambda: ts)
+    assert n.stream_id == "1741000000000-0"
+
+
+def test_verify_notification_rejects_window_above_max_safe_integer():
+    with pytest.raises(ACEError) as info:
+        verify_webhook_notification(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY, clock=lambda: TS,
+                                    window_seconds=2**53)
+    assert info.value.code == "invalid_argument"
+
+
+BAD_SIG = "sha256=" + "Z" * 64
+
+
+@pytest.mark.parametrize("kwargs, code", [
+    # malformed timestamp wins over a malformed signature
+    (dict(timestamp="nope", signature=BAD_SIG), "invalid_argument"),
+    (dict(timestamp="9007199254740993", signature=BAD_SIG), "invalid_argument"),
+    # malformed signature wins over a bad window_seconds and over staleness
+    (dict(signature=BAD_SIG, window_seconds=-1), "invalid_signature"),
+    (dict(signature=BAD_SIG, clock=lambda: TS + 301), "invalid_signature"),
+    # well-formed but wrong HMAC: staleness is reported first
+    (dict(signature=sig(secret="wrong-secret-wrong-secret"), clock=lambda: TS + 301), "stale_timestamp"),
+    # bad window_seconds wins over staleness and a wrong HMAC
+    (dict(signature=sig(secret="wrong-secret-wrong-secret"), window_seconds=-1, clock=lambda: TS + 301),
+     "invalid_argument"),
+])
+def test_verify_notification_check_order(kwargs, code):
+    args = dict(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY, clock=lambda: TS)
+    args.update(kwargs)
+    with pytest.raises(ACEError) as info:
+        verify_webhook_notification(**args)
+    assert info.value.code == code
+
+
 # --- RelayClient webhook endpoints against the fake relay ---
 
 @pytest.fixture
