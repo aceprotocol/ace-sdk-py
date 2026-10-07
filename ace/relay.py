@@ -105,6 +105,16 @@ class IntentPage(NamedTuple):
     cursor: str | None
 
 
+@dataclass(frozen=True)
+class Webhook:
+    url: str
+    status: str  # "active" | "disabled"
+    failures: int
+    updated_at: int
+    last_delivered_at: int | None = None
+    last_error: str | None = None
+
+
 def _protocol(msg: str) -> ACEError:
     return ACEError("relay_protocol_error", msg)
 
@@ -371,6 +381,24 @@ class RelayClient:
                 raise _protocol("malformed intent entry")
             out.append(Intent(i["intentId"], i["from"], i["need"], tuple(tags_v), opt[0], opt[1], *ints))  # type: ignore[arg-type]
         return IntentPage(out, self._cursor(obj))
+
+    def set_webhook(self, identity: ACEIdentity, url: str, secret: str) -> None:
+        req = RelayAuthRequest.webhook("PUT", url, secret)
+        self._call("PUT", "/v1/webhook", body={"url": url, "secret": secret}, identity=identity, auth=req)
+
+    def get_webhook(self, identity: ACEIdentity) -> Webhook | None:
+        obj = self._object(self._call("GET", "/v1/webhook", identity=identity, auth=RelayAuthRequest.webhook("GET")), "webhook")
+        w = obj.get("webhook")
+        if w is None:
+            return None
+        if not isinstance(w, dict) or not isinstance(w.get("url"), str) or w.get("status") not in ("active", "disabled") \
+                or wire_int(w.get("failures")) is None or wire_int(w.get("updatedAt")) is None:
+            raise _protocol("webhook response must be {url, status, failures, updatedAt, …}")
+        return Webhook(w["url"], w["status"], w["failures"], w["updatedAt"], wire_int(w.get("lastDeliveredAt")),
+                       w.get("lastError") if isinstance(w.get("lastError"), str) else None)
+
+    def clear_webhook(self, identity: ACEIdentity) -> None:
+        self._call("DELETE", "/v1/webhook", identity=identity, auth=RelayAuthRequest.webhook("DELETE"))
 
     # --- SSE ---
 

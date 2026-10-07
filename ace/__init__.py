@@ -50,7 +50,7 @@ from .registration import (
     create_registration_request,
     verify_registration_request,
 )
-from .relay import Intent, RelayClient
+from .relay import Intent, RelayClient, Webhook
 from .replay import ReplayDetector
 from .state_machine import (
     ThreadEvent,
@@ -100,6 +100,7 @@ from .types import (
     is_economic_type,
     is_message_type,
 )
+from .webhook import WebhookNotification, verify_webhook_notification
 
 __all__ = [
     # types
@@ -111,6 +112,7 @@ __all__ = [
     "ParsedMessage", "ThreadState", "ThreadSnapshot", "ThreadHistoryEntry", "ThreadEvent",
     "ReplayState", "RegistrationRequest", "RelayAuthRequest", "ReceiveSource", "ReceiveOutcome",
     "PendingSend", "Intent", "ACEStore", "ACEErrorCode", "ACEErrorCategory", "SoftwareIdentityExport",
+    "Webhook", "WebhookNotification",
     # values
     "ACEError", "MESSAGE_TYPES", "ECONOMIC_TYPES", "is_message_type", "is_economic_type",
     "MAX_PLAINTEXT_BYTES", "MAX_PAYLOAD_BYTES", "MAX_ENVELOPE_BYTES", "MAX_JSON_DEPTH",
@@ -126,5 +128,5 @@ __all__ = [
     "validate_profile", "create_registration_file", "create_registration_request", "verify_registration_request",
     "create_auth_headers", "parse_auth_headers", "verify_auth_headers",
     "ReplayDetector", "ThreadStateMachine", "ThreadStore", "PeerStore", "Inbox", "PullResult", "Outbox",
-    "RelayClient", "MemoryStore", "FileStore",
+    "RelayClient", "MemoryStore", "FileStore", "verify_webhook_notification",
 ]

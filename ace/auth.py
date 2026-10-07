@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Callable, Literal, Mapping, NamedTuple, Sequence
 
 from ._encoding import (
+    CONTROL_CHAR_RE,
     MAX_SAFE_INTEGER,
     check_fresh,
     check_wire_int,
@@ -14,6 +15,7 @@ from ._encoding import (
     decode_signature,
     encode_signature,
     is_ace_id,
+    is_https_url,
     wire_int,
 )
 from ._signing import build_sign_data, encode_payload, verify_signature
@@ -23,6 +25,7 @@ from .types import SIGNING_SCHEMES, ACEIdentity, SigningScheme
 
 _SINCE_RE = re.compile(r"-|[0-9]+-[0-9]+")
 _TS_RE = re.compile(r"0|[1-9][0-9]{0,15}")
+_WEBHOOK_METHODS = ("PUT", "GET", "DELETE")
 
 
 def _bad(msg: str) -> ACEError:
@@ -34,10 +37,11 @@ class RelayAuthRequest:
     """What an authenticated relay call signs. Build with the classmethods.
 
     ``listen(since)``, ``inbox(since, limit)``, ``unregister()``,
-    ``intent(need, tags, max_price, currency, ttl)``. ``since`` is ``"-"`` or ``<ms>-<seq>``.
+    ``intent(need, tags, max_price, currency, ttl)``, ``webhook(method, url, secret)``.
+    ``since`` is ``"-"`` or ``<ms>-<seq>``.
     """
 
-    action: Literal["listen", "inbox", "unregister", "intent"]
+    action: Literal["listen", "inbox", "unregister", "intent", "webhook"]
     since: str | None = None
     limit: int | None = None
     need: str | None = None
@@ -45,6 +49,9 @@ class RelayAuthRequest:
     max_price: str | None = None
     currency: str | None = None
     ttl: int | None = None
+    method: str | None = None
+    url: str = ""
+    secret: str = ""
 
     def __post_init__(self) -> None:
         a = self.action
@@ -63,7 +70,19 @@ class RelayAuthRequest:
                     raise _bad("max_price and currency must be strings or None")
             if type(self.ttl) is not int or wire_int(self.ttl) is None:
                 raise _bad("ttl must be an integer in [0, 2^53-1]")
-        elif a not in ("listen", "inbox", "unregister"):
+        if a == "webhook":
+            if self.method not in _WEBHOOK_METHODS:
+                raise _bad("method must be PUT, GET or DELETE")
+            if not isinstance(self.url, str) or not isinstance(self.secret, str):
+                raise _bad("url and secret must be strings")
+            if self.method == "PUT":
+                if not is_https_url(self.url):
+                    raise _bad("url must match the ACE HTTPS URL grammar")
+                if not 16 <= len(self.secret) <= 128 or CONTROL_CHAR_RE.search(self.secret) is not None:
+                    raise _bad("secret must be 16..128 characters without control characters")
+            elif self.url != "" or self.secret != "":
+                raise _bad(f"{self.method} takes no url or secret")
+        elif a not in ("listen", "inbox", "unregister", "intent"):
             raise _bad("unknown action")
 
     @classmethod
@@ -87,6 +106,10 @@ class RelayAuthRequest:
             raise _bad("tags must be a sequence of strings")
         return cls("intent", need=need, tags=tuple(tags), max_price=max_price, currency=currency, ttl=ttl)
 
+    @classmethod
+    def webhook(cls, method: str, url: str = "", secret: str = "") -> "RelayAuthRequest":
+        return cls("webhook", method=method, url=url, secret=secret)
+
     def payload(self) -> bytes:
         if self.action == "listen":
             return encode_payload(self.since)  # type: ignore[arg-type]
@@ -94,6 +117,8 @@ class RelayAuthRequest:
             return encode_payload(self.since, decimal(self.limit))  # type: ignore[arg-type]
         if self.action == "unregister":
             return b""
+        if self.action == "webhook":
+            return encode_payload(self.method, self.url, self.secret)  # type: ignore[arg-type]
         return encode_payload(
             self.need, ",".join(self.tags), self.max_price or "", self.currency or "", decimal(self.ttl),  # type: ignore[arg-type]
         )

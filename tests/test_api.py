@@ -28,6 +28,8 @@ EXPECTED = {
     # pipeline
     "ReceiveSource", "ReceiveOutcome", "PendingSend", "Intent", "ACEStore", "ThreadStore", "PeerStore",
     "Inbox", "PullResult", "Outbox", "RelayClient", "MemoryStore", "FileStore",
+    # webhooks
+    "Webhook", "WebhookNotification", "verify_webhook_notification",
 }
 
 
