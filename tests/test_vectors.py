@@ -39,7 +39,7 @@ V = VECTORS["vectors"]
 
 
 def test_version_and_sections():
-    assert VECTORS["version"] == "2"
+    assert VECTORS["version"] == "3"
     assert {"envelopes", "bodies", "transitions", "replay", "signatures", "auth", "registrations",
             "registrationErrors", "urls", "base64", "peerBinding"} <= set(V)
 
@@ -211,6 +211,8 @@ def _auth_request(r: dict) -> RelayAuthRequest:
         return RelayAuthRequest.inbox(r["since"], r["limit"])
     if r["action"] == "unregister":
         return RelayAuthRequest.unregister()
+    if r["action"] == "webhook":
+        return RelayAuthRequest.webhook(r["method"], r["url"], r["secret"])
     return RelayAuthRequest.intent(r["need"], r["tags"], r["maxPrice"], r["currency"], r["ttl"])
 
 
