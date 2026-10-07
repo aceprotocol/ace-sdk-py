@@ -10,7 +10,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, NamedTuple
+from typing import Any, Callable, Iterator, Literal, NamedTuple
 
 from ._encoding import unix_now, wire_int
 from .auth import RelayAuthRequest, create_auth_headers
@@ -108,7 +108,7 @@ class IntentPage(NamedTuple):
 @dataclass(frozen=True)
 class Webhook:
     url: str
-    status: str  # "active" | "disabled"
+    status: Literal["active", "disabled"]
     failures: int
     updated_at: int
     last_delivered_at: int | None = None

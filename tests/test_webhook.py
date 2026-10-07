@@ -122,6 +122,12 @@ def test_verify_notification_accepts_timestamp_at_max_safe_integer():
     assert n.stream_id == "1741000000000-0"
 
 
+def test_verify_notification_accepts_window_at_max_safe_integer():
+    n = verify_webhook_notification(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY, clock=lambda: TS,
+                                    window_seconds=2**53 - 1)
+    assert n.stream_id == "1741000000000-0"
+
+
 def test_verify_notification_rejects_window_above_max_safe_integer():
     with pytest.raises(ACEError) as info:
         verify_webhook_notification(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY, clock=lambda: TS,

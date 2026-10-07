@@ -216,6 +216,11 @@ def _auth_request(r: dict) -> RelayAuthRequest:
     return RelayAuthRequest.intent(r["need"], r["tags"], r["maxPrice"], r["currency"], r["ttl"])
 
 
+def test_auth_vector_count():
+    assert len(V["auth"]) == 18
+    assert sum(1 for v in V["auth"] if v["action"] == "webhook") == 6
+
+
 @pytest.mark.parametrize("v", V["auth"], ids=lambda v: f'{v["agent"]}-{v["action"]}-{v["payloadHex"][:12]}')
 def test_auth(v):
     ident = agent(v["agent"])

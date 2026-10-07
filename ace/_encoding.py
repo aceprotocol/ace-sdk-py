@@ -20,6 +20,7 @@ MAX_SAFE_INTEGER = (1 << 53) - 1
 ACE_ID_RE = re.compile(r"ace:sha256:[0-9a-f]{64}")
 MESSAGE_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 CONVERSATION_ID_RE = re.compile(r"[0-9a-f]{64}")
+TIMESTAMP_RE = re.compile(r"0|[1-9][0-9]{0,15}")  # used with fullmatch
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 _B64_RE = re.compile(r"(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?")
 _HEX_SIG_RE = re.compile(r"0x[0-9a-f]{130}")

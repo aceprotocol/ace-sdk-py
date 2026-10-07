@@ -9,6 +9,7 @@ from typing import Callable, Literal, Mapping, NamedTuple, Sequence
 from ._encoding import (
     CONTROL_CHAR_RE,
     MAX_SAFE_INTEGER,
+    TIMESTAMP_RE,
     check_fresh,
     check_wire_int,
     decimal,
@@ -24,7 +25,6 @@ from .limits import MAX_INBOX_PAGE, TIMESTAMP_WINDOW_SECONDS
 from .types import SIGNING_SCHEMES, ACEIdentity, SigningScheme
 
 _SINCE_RE = re.compile(r"-|[0-9]+-[0-9]+")
-_TS_RE = re.compile(r"0|[1-9][0-9]{0,15}")
 _WEBHOOK_METHODS = ("PUT", "GET", "DELETE")
 
 
@@ -162,7 +162,7 @@ def parse_auth_headers(headers: Mapping[str, str | Sequence[str] | None]) -> Rel
     ace_id, ts, sig = found.get("x-ace-id"), found.get("x-ace-timestamp"), found.get("x-ace-signature")
     if not is_ace_id(ace_id):
         raise _bad("X-ACE-Id is missing or not an ACE ID")
-    if ts is None or _TS_RE.fullmatch(ts) is None or int(ts) > MAX_SAFE_INTEGER:
+    if ts is None or TIMESTAMP_RE.fullmatch(ts) is None or int(ts) > MAX_SAFE_INTEGER:
         raise _bad("X-ACE-Timestamp is missing or malformed")
     if not sig or len(sig) > 512:
         raise _bad("X-ACE-Signature is missing")

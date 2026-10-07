@@ -8,11 +8,10 @@ import json
 import re
 from typing import Callable, NamedTuple
 
-from ._encoding import check_fresh, is_ace_id
+from ._encoding import TIMESTAMP_RE, check_fresh, is_ace_id
 from .errors import ACEError
 from .limits import TIMESTAMP_WINDOW_SECONDS
 
-_TS_RE = re.compile(r"0|[1-9][0-9]{0,15}")
 _MAX_SAFE_INTEGER = 2**53 - 1  # the TS SDK's Number.MAX_SAFE_INTEGER bound
 _SIG_RE = re.compile(r"sha256=[0-9a-f]{64}")
 _STREAM_RE = re.compile(r"[0-9]{1,20}-[0-9]{1,20}")
@@ -42,7 +41,7 @@ def verify_webhook_notification(
     ``{"event":"message","aceId","streamId"}`` (``invalid_argument``)."""
     if not isinstance(secret, str) or not isinstance(timestamp, str) or not isinstance(signature, str):
         raise ACEError("invalid_argument", "secret, timestamp and signature must be strings")
-    if _TS_RE.fullmatch(timestamp) is None or int(timestamp) > _MAX_SAFE_INTEGER:
+    if TIMESTAMP_RE.fullmatch(timestamp) is None or int(timestamp) > _MAX_SAFE_INTEGER:
         raise ACEError("invalid_argument", "X-ACE-Webhook-Timestamp is malformed")
     if _SIG_RE.fullmatch(signature) is None:
         raise ACEError("invalid_signature", "X-ACE-Webhook-Signature is malformed")
