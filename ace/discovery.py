@@ -356,10 +356,13 @@ _V4_BLOCKED = [
 _V6_BLOCKED = [
     ipaddress.ip_network(n)
     for n in (
-        "::/128",
-        "::1/128",
+        "::/96",  # IPv4-compatible (deprecated); includes :: and ::1
+        "::ffff:0:0:0/96",  # SIIT IPv4-translated
+        "64:ff9b:1::/48",  # local-use NAT64
         "100::/64",
+        "2001::/32",  # Teredo
         "2001:db8::/32",
+        "2002::/16",  # 6to4
         "fc00::/7",
         "fe80::/10",
         "ff00::/8",

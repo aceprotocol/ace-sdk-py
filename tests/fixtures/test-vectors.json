@@ -4440,6 +4440,62 @@
           "blocked": false
         },
         {
+          "address": "2002:7f00:1::1",
+          "blocked": true
+        },
+        {
+          "address": "2002:808:808::1",
+          "blocked": true
+        },
+        {
+          "address": "2003::1",
+          "blocked": false
+        },
+        {
+          "address": "2001:0:7f00:1::1",
+          "blocked": true
+        },
+        {
+          "address": "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+          "blocked": true
+        },
+        {
+          "address": "2001:1::1",
+          "blocked": false
+        },
+        {
+          "address": "::7f00:1",
+          "blocked": true
+        },
+        {
+          "address": "::a00:1",
+          "blocked": true
+        },
+        {
+          "address": "::808:808",
+          "blocked": true
+        },
+        {
+          "address": "::8.8.8.8",
+          "blocked": true
+        },
+        {
+          "address": "64:ff9b:1:7f00:0:100::",
+          "blocked": true
+        },
+        {
+          "address": "64:ff9b:1:808:8:800::",
+          "blocked": true
+        },
+        {
+          "address": "::ffff:0:a00:1",
+          "blocked": true
+        },
+        {
+          "address": "::ffff:0:808:808",
+          "blocked": true
+        },
+        {
           "address": "example.com",
           "blocked": true
         },

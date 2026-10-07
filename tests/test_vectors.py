@@ -56,7 +56,7 @@ def test_version_and_sections():
     assert counts == {
         "webhooks": 21,
         "relayUrls": 43,
-        "blockedAddresses": 77,
+        "blockedAddresses": 91,
         "relayErrors": 41,
         "directReceive": 17,
     }
