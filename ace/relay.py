@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import http.client
+import ipaddress
 import json
+import re
 import socket
 import threading
 import time
@@ -11,10 +13,10 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, Literal, NamedTuple
 
-from ._encoding import is_stream_id, unix_now, wire_int
+from ._encoding import is_ace_id, is_stream_id, unix_now, wire_int
 from .auth import RelayAuthRequest, create_auth_headers
 from .discovery import VerifiedPeer, verify_peer_record
-from .errors import ACEError
+from .errors import ACEError, ACEErrorCode
 from .limits import MAX_ENVELOPE_BYTES, MAX_INBOX_PAGE
 from .registration import _KEEP, create_registration_request
 from .types import ACEIdentity, ACEMessage, AgentProfile, DiscoverQuery
@@ -28,28 +30,62 @@ _REGISTER_STATUSES = ("registered", "idempotent", "refreshed", "rotated")
 _sleep = time.sleep  # patched by tests
 
 
+_PORT_RE = re.compile(r"[1-9][0-9]{0,4}")
+_HOST_RE = re.compile(r"[A-Za-z0-9.-]+")
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
 def normalize_relay_url(url: object) -> str:
-    """Lowercase scheme and host, no trailing ``/``. Only ``http``/``https`` are accepted."""
+    """Normalize a relay base URL (08-relay § Client Rules, Relay URL); ``invalid_argument``.
+
+    ``http``/``https`` only; no ``?``, ``#``, userinfo, whitespace or control characters
+    (nothing is trimmed). The host is ASCII ``[A-Za-z0-9.-]+`` or a bracketed IPv6 literal;
+    a port has no leading zero. Scheme and host are lowercased, ``:443`` (https) / ``:80``
+    (http) dropped and all trailing ``/`` removed; the rest of the path is kept verbatim.
+    """
     if not isinstance(url, str):
         raise ACEError("invalid_argument", "relay URL must be a string")
-    try:
-        parts = urllib.parse.urlsplit(url.strip())
-    except ValueError:
-        raise ACEError("invalid_argument", "invalid relay URL") from None
-    scheme = parts.scheme.lower()
-    if scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
+    if "?" in url or "#" in url or any(ord(c) <= 0x20 or ord(c) == 0x7F for c in url):
+        raise ACEError(
+            "invalid_argument", "relay URL must not contain '?', '#', whitespace or controls"
+        )
+    scheme, sep, rest = url.partition("://")
+    scheme = scheme.lower()
+    if not sep or scheme not in _DEFAULT_PORTS:
         raise ACEError("invalid_argument", "relay URL must be http(s)://host[:port][/path]")
-    if parts.query or parts.fragment:
-        raise ACEError("invalid_argument", "relay URL must not have a query or fragment")
-    host = parts.hostname.lower()
-    if ":" in host:
-        host = f"[{host}]"
-    try:
-        port = parts.port
-    except ValueError:
-        raise ACEError("invalid_argument", "invalid relay URL port") from None
-    netloc = host if port is None else f"{host}:{port}"
-    return f"{scheme}://{netloc}{parts.path.rstrip('/')}"
+    slash = rest.find("/")
+    authority, path = (rest, "") if slash < 0 else (rest[:slash], rest[slash:])
+    if "@" in authority:
+        raise ACEError("invalid_argument", "relay URL must not contain userinfo")
+    if authority.startswith("["):
+        end = authority.find("]")
+        if end < 0:
+            raise ACEError("invalid_argument", "invalid relay URL host")
+        host, port_part = authority[: end + 1], authority[end + 1 :]
+        if port_part and not port_part.startswith(":"):
+            raise ACEError("invalid_argument", "invalid relay URL host")
+        try:
+            if "%" in host:  # no zone in a relay URL
+                raise ValueError(host)
+            ipaddress.IPv6Address(host[1:-1])
+        except ValueError:
+            raise ACEError("invalid_argument", "invalid relay URL IPv6 host") from None
+    else:
+        host, colon, port_part = authority.partition(":")
+        port_part = colon + port_part
+        if _HOST_RE.fullmatch(host) is None:
+            raise ACEError("invalid_argument", "relay URL host must be ASCII [A-Za-z0-9.-]")
+    port: int | None = None
+    if port_part:
+        digits = port_part[1:]
+        if _PORT_RE.fullmatch(digits) is None or not 1 <= int(digits) <= 65535:
+            raise ACEError(
+                "invalid_argument", "relay URL port must be 1..65535 without leading zeros"
+            )
+        port = int(digits)
+    host = host.lower()
+    netloc = host if port is None or port == _DEFAULT_PORTS[scheme] else f"{host}:{port}"
+    return f"{scheme}://{netloc}{path.rstrip('/')}"
 
 
 def compare_stream_ids(a: str, b: str) -> int:
@@ -60,10 +96,11 @@ def compare_stream_ids(a: str, b: str) -> int:
 
 
 class RelayEntry(NamedTuple):
-    """One queued envelope: ``message`` is the raw JSON object (decode it via the Inbox)."""
+    """One queued envelope. ``message`` is its raw JSON bytes, undecoded: pass it to
+    ``Inbox.receive``, which quarantines anything that is not an envelope."""
 
     stream_id: str
-    message: Any
+    message: bytes
     catchup: bool = False
 
 
@@ -117,13 +154,41 @@ def _protocol(msg: str) -> ACEError:
     return ACEError("relay_protocol_error", msg)
 
 
-def _retry_after(value: str | None) -> int | None:
-    if value is None or not value.strip().isdigit():
+def _join_tags(tags: object) -> str | None:
+    """A list of tags as the comma-joined query value; None or empty is omitted."""
+    if tags is None:
         return None
-    return int(value.strip())
+    if not isinstance(tags, (list, tuple)) or not all(
+        isinstance(t, str) and t and "," not in t for t in tags
+    ):
+        raise ACEError("invalid_argument", "tags must be a list of non-empty strings without ','")
+    return ",".join(tags) or None
 
 
-def _map_status(status: int, body: bytes, retry_after: int | None) -> ACEError:
+def _raw_json(value: object) -> bytes:
+    """Re-serialize a JSON value parsed from a relay response (compact UTF-8). A lone
+    surrogate escape yields invalid UTF-8, which the Inbox quarantines."""
+    text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return text.encode("utf-8", "surrogatepass")
+
+
+_RETRY_AFTER_RE = re.compile(r"[0-9]+")
+
+
+def _retry_after(value: str | None) -> int | None:
+    """``Retry-After`` as delay-seconds only; an HTTP-date or anything else is ignored."""
+    if value is None or _RETRY_AFTER_RE.fullmatch(value) is None:
+        return None
+    return int(value)
+
+
+def _map_relay_response(status: int, body: bytes, retry_after: str | None) -> ACEError:
+    """Map one relay response other than the call's expected success to an ``ACEError``
+    (08-relay § Client Rules, Responses).
+
+    The ``409 replay`` retry happens before this mapping. Internal; exercised by the
+    ``relayErrors`` vectors.
+    """
     relay_code = message = None
     try:
         obj = json.loads(body.decode("utf-8")) if body else None
@@ -133,15 +198,30 @@ def _map_status(status: int, body: bytes, retry_after: int | None) -> ACEError:
                 message = obj["message"][:500]
     except (UnicodeDecodeError, ValueError, RecursionError):
         pass
-    text = f"relay HTTP {status}" + (f" {relay_code}" if relay_code else "") + (f": {message}" if message else "")
-    kw: dict[str, Any] = {"status": status, "relay_code": relay_code}
-    if status >= 500 or status in (408, 429):
-        return ACEError("relay_unavailable", text, retry_after_seconds=retry_after, **kw)
-    if 400 <= status < 500:
-        mapped = {(400, "envelope_expired"): "envelope_expired", (404, "unknown_peer"): "unknown_peer",
-                  (403, "not_registered"): "not_registered"}.get((status, relay_code or ""), "relay_rejected")
-        return ACEError(mapped, text, **kw)  # type: ignore[arg-type]
-    return _protocol(f"unexpected {text}")
+    text = (
+        f"relay HTTP {status}"
+        + (f" {relay_code}" if relay_code else "")
+        + (f": {message}" if message else "")
+    )
+    code: ACEErrorCode
+    if status < 400 or status >= 600:
+        code = "relay_protocol_error"  # 1xx, an unexpected 2xx, 3xx, out of range
+    elif status == 408 or status >= 500:
+        code = "relay_unavailable"
+    elif status == 429:
+        code = "relay_unavailable" if relay_code in (None, "rate_limited") else "relay_rejected"
+    elif 400 <= status < 500:
+        code = {
+            (400, "envelope_expired"): "envelope_expired",
+            (403, "not_registered"): "not_registered",
+            (404, "unknown_peer"): "unknown_peer",
+        }.get((status, relay_code or ""), "relay_rejected")  # type: ignore[assignment]
+    else:
+        code = "relay_protocol_error"
+    err = ACEError(code, text, status=status, relay_code=relay_code)
+    if err.category == "transient":
+        err.retry_after_seconds = _retry_after(retry_after)
+    return err
 
 
 _CONNECTED = object()  # internal listen marker: a connection was established
@@ -151,11 +231,10 @@ class RelayClient:
     """Synchronous client for one relay (``http.client``; one connection per request).
 
     Authenticated calls sign ``X-ACE-*`` headers with ``ts = max(now, last + 1)`` and retry
-    once on ``409 replay``. Errors: network failures, timeouts, 5xx, 408 and 429 are
-    ``relay_unavailable`` (with ``retry_after_seconds``); oversized or malformed responses
-    ``relay_protocol_error``; 400 ``envelope_expired``, 404 ``unknown_peer`` and
-    403 ``not_registered`` keep their code; other 4xx are ``relay_rejected`` (with
-    ``status`` and ``relay_code``).
+    once on ``409 replay``. Redirects are never followed. Network failures and timeouts are
+    ``relay_unavailable``; oversized or malformed responses ``relay_protocol_error``; HTTP
+    errors map as in 08-relay § Client Rules (errors keep ``status`` and ``relay_code``;
+    ``retry_after_seconds`` only on transient ones).
     """
 
     def __init__(
@@ -206,8 +285,13 @@ class RelayClient:
         return target
 
     def _send_once(
-        self, method: str, path: str, query: dict[str, Any] | None, body: bytes | None, headers: dict[str, str],
-    ) -> tuple[int, bytes, int | None]:
+        self,
+        method: str,
+        path: str,
+        query: dict[str, Any] | None,
+        body: bytes | None,
+        headers: dict[str, str],
+    ) -> tuple[int, bytes, str | None]:
         conn = self._connection(self._timeout)
         try:
             hdrs = {"Accept": "application/json", **headers}
@@ -216,9 +300,11 @@ class RelayClient:
             conn.request(method, self._target(path, query), body=body, headers=hdrs)
             resp = conn.getresponse()
             data = resp.read(self._max_bytes + 1)
-            return resp.status, data, _retry_after(resp.getheader("Retry-After"))
+            return resp.status, data, resp.getheader("Retry-After")
         except (OSError, http.client.HTTPException) as exc:
-            raise ACEError("relay_unavailable", f"relay request failed: {type(exc).__name__}: {exc}") from None
+            raise ACEError(
+                "relay_unavailable", f"relay request failed: {type(exc).__name__}: {exc}"
+            ) from None
         finally:
             conn.close()
 
@@ -233,9 +319,15 @@ class RelayClient:
         auth: RelayAuthRequest | None = None,
         expect: tuple[int, ...] = (200,),
     ) -> Any:
-        payload = None if body is None else json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        payload = (
+            None
+            if body is None
+            else json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
         for attempt in (0, 1):
-            headers = create_auth_headers(identity, auth, self._next_ts()) if auth is not None else {}  # type: ignore[arg-type]
+            headers = (
+                create_auth_headers(identity, auth, self._next_ts()) if auth is not None else {}
+            )  # type: ignore[arg-type]
             status, data, retry_after = self._send_once(method, path, query, payload, headers)
             if len(data) > self._max_bytes:
                 raise _protocol("response exceeds max_response_bytes")
@@ -244,7 +336,9 @@ class RelayClient:
                     return json.loads(data.decode("utf-8"))
                 except (UnicodeDecodeError, ValueError, RecursionError):
                     raise _protocol("response is not JSON") from None
-            err = _map_status(status, data, retry_after)
+            if 200 <= status < 300:
+                raise _protocol(f"unexpected relay HTTP {status}")
+            err = _map_relay_response(status, data, retry_after)
             if auth is not None and attempt == 0 and status == 409 and err.relay_code == "replay":
                 continue
             raise err
@@ -265,7 +359,9 @@ class RelayClient:
 
     # --- endpoints ---
 
-    def register(self, identity: ACEIdentity, profile: AgentProfile | dict | None | object = _KEEP) -> str:
+    def register(
+        self, identity: ACEIdentity, profile: AgentProfile | dict | None | object = _KEEP
+    ) -> str:
         """``POST /v1/register``. Omitted profile keeps it, ``None`` removes it.
 
         Returns ``"registered" | "idempotent" | "refreshed" | "rotated"``.
@@ -282,6 +378,8 @@ class RelayClient:
 
     def lookup_peer(self, ace_id: str) -> VerifiedPeer:
         """``GET /v1/peer``: the record must be for ``ace_id`` and verify (``invalid_peer``)."""
+        if not is_ace_id(ace_id):
+            raise ACEError("invalid_argument", "ace_id must be an ACE ID")
         obj = self._object(self._call("GET", "/v1/peer", query={"aceId": ace_id}), "peer")
         if obj.get("aceId") != ace_id:
             raise ACEError("invalid_peer", "relay returned a record for another aceId")
@@ -291,9 +389,13 @@ class RelayClient:
         """``GET /v1/discover``. Unverifiable entries are dropped and counted in ``rejected``."""
         q = query or DiscoverQuery()
         params = {
-            "q": q.q, "tags": q.tags, "chain": q.chain, "scheme": q.scheme,
+            "q": q.q,
+            "tags": _join_tags(q.tags),
+            "chain": q.chain,
+            "scheme": q.scheme,
             "online": None if q.online is None else ("true" if q.online else "false"),
-            "limit": q.limit, "cursor": q.cursor,
+            "limit": q.limit,
+            "cursor": q.cursor,
         }
         obj = self._object(self._call("GET", "/v1/discover", query=params), "discover")
         agents = obj.get("agents")
@@ -313,10 +415,13 @@ class RelayClient:
             raise ACEError("invalid_argument", "send expects an ACEMessage")
         self._call("POST", "/v1/send", body={"message": env.to_dict()})
 
-    def fetch_inbox(self, identity: ACEIdentity, *, since: str | None = None, limit: int | None = None) -> InboxPage:
+    def fetch_inbox(
+        self, identity: ACEIdentity, *, since: str | None = None, limit: int | None = None
+    ) -> InboxPage:
         req = RelayAuthRequest.inbox(since or "-", MAX_INBOX_PAGE if limit is None else limit)
+        query = {"since": None if req.since == "-" else req.since, "limit": req.limit}
         obj = self._object(
-            self._call("GET", "/v1/inbox", query={"since": req.since, "limit": req.limit}, identity=identity, auth=req),
+            self._call("GET", "/v1/inbox", query=query, identity=identity, auth=req),
             "inbox",
         )
         messages = obj.get("messages")
@@ -327,7 +432,7 @@ class RelayClient:
             sid = m.get("streamId") if isinstance(m, dict) else None
             if not is_stream_id(sid) or "message" not in m:
                 raise _protocol("inbox entries must be {streamId, message}")
-            entries.append(RelayEntry(sid, m["message"], False))
+            entries.append(RelayEntry(sid, _raw_json(m["message"]), False))
         return InboxPage(entries, self._cursor(obj))
 
     def post_intent(
@@ -347,7 +452,10 @@ class RelayClient:
         if currency is not None:
             body["currency"] = currency
         obj = self._object(
-            self._call("POST", "/v1/intents", body=body, identity=identity, auth=req, expect=(200, 201)), "intent",
+            self._call(
+                "POST", "/v1/intents", body=body, identity=identity, auth=req, expect=(200, 201)
+            ),
+            "intent",
         )
         intent_id, expires_at = obj.get("intentId"), wire_int(obj.get("expiresAt"))
         if not isinstance(intent_id, str) or expires_at is None:
@@ -355,11 +463,15 @@ class RelayClient:
         return PostedIntent(intent_id, expires_at)
 
     def list_intents(
-        self, *, q: str | None = None, tags: str | None = None, limit: int | None = None, cursor: str | None = None,
+        self,
+        *,
+        q: str | None = None,
+        tags: list[str] | tuple[str, ...] | None = None,
+        limit: int | None = None,
+        cursor: str | None = None,
     ) -> IntentPage:
-        obj = self._object(
-            self._call("GET", "/v1/intents", query={"q": q, "tags": tags, "limit": limit, "cursor": cursor}), "intents",
-        )
+        query = {"q": q, "tags": _join_tags(tags), "limit": limit, "cursor": cursor}
+        obj = self._object(self._call("GET", "/v1/intents", query=query), "intents")
         raw = obj.get("intents")
         if not isinstance(raw, list):
             raise _protocol("intents must be a list")
@@ -367,37 +479,53 @@ class RelayClient:
         for i in raw:
             if not isinstance(i, dict):
                 raise _protocol("intent entries must be objects")
-            tags_v = i.get("tags", [])
+            tags_v = i.get("tags")
             ints = [wire_int(i.get(k)) for k in ("ttl", "createdAt", "expiresAt")]
             opt = [i.get(k) for k in ("maxPrice", "currency")]
+            # optional members: absent is fine, present but not a string (null included) is not
             if (
-                not isinstance(i.get("intentId"), str) or not isinstance(i.get("from"), str)
-                or not isinstance(i.get("need"), str) or not isinstance(tags_v, list)
-                or not all(isinstance(t, str) for t in tags_v) or None in ints
-                or not all(v is None or isinstance(v, str) for v in opt)
+                not isinstance(i.get("intentId"), str)
+                or not isinstance(i.get("from"), str)
+                or not isinstance(i.get("need"), str)
+                or not isinstance(tags_v, list)
+                or not all(isinstance(t, str) for t in tags_v)
+                or None in ints
+                or any(k in i and not isinstance(i[k], str) for k in ("maxPrice", "currency"))
             ):
                 raise _protocol("malformed intent entry")
-            out.append(Intent(i["intentId"], i["from"], i["need"], tuple(tags_v), opt[0], opt[1], *ints))  # type: ignore[arg-type]
+            out.append(
+                Intent(i["intentId"], i["from"], i["need"], tuple(tags_v), opt[0], opt[1], *ints)
+            )  # type: ignore[arg-type]
         return IntentPage(out, self._cursor(obj))
 
     def set_webhook(self, identity: ACEIdentity, url: str, secret: str) -> None:
         req = RelayAuthRequest.webhook("PUT", url, secret)
-        self._call("PUT", "/v1/webhook", body={"url": url, "secret": secret}, identity=identity, auth=req)
+        self._call(
+            "PUT", "/v1/webhook", body={"url": url, "secret": secret}, identity=identity, auth=req
+        )
 
     def get_webhook(self, identity: ACEIdentity) -> Webhook | None:
-        obj = self._object(self._call("GET", "/v1/webhook", identity=identity, auth=RelayAuthRequest.webhook("GET")), "webhook")
+        obj = self._object(
+            self._call(
+                "GET", "/v1/webhook", identity=identity, auth=RelayAuthRequest.webhook("GET")
+            ),
+            "webhook",
+        )
         w = obj.get("webhook")
         if w is None:
             return None
         if not isinstance(w, dict):
             raise _protocol("webhook must be an object or null")
         failures, updated_at = wire_int(w.get("failures")), wire_int(w.get("updatedAt"))
-        # Optional fields: absent is fine; present but malformed (null included) is a protocol error.
+        # Optional fields: absent is fine; present but malformed (null included) is a
+        # protocol error.
         delivered_at = wire_int(w["lastDeliveredAt"]) if "lastDeliveredAt" in w else None
         last_error = w.get("lastError")
         if (
-            not isinstance(w.get("url"), str) or w.get("status") not in ("active", "disabled")
-            or failures is None or updated_at is None
+            not isinstance(w.get("url"), str)
+            or w.get("status") not in ("active", "disabled")
+            or failures is None
+            or updated_at is None
             or ("lastDeliveredAt" in w and delivered_at is None)
             or ("lastError" in w and not isinstance(last_error, str))
         ):
@@ -405,7 +533,9 @@ class RelayClient:
         return Webhook(w["url"], w["status"], failures, updated_at, delivered_at, last_error)
 
     def clear_webhook(self, identity: ACEIdentity) -> None:
-        self._call("DELETE", "/v1/webhook", identity=identity, auth=RelayAuthRequest.webhook("DELETE"))
+        self._call(
+            "DELETE", "/v1/webhook", identity=identity, auth=RelayAuthRequest.webhook("DELETE")
+        )
 
     # --- SSE ---
 
@@ -420,14 +550,20 @@ class RelayClient:
     ) -> Iterator[RelayEntry]:
         """``GET /v1/listen`` as a generator of ``RelayEntry`` (catchup, then live).
 
-        Reconnects internally with backoff 1, 2, 4 ... 30 s (``Retry-After`` honored, capped
-        at 30 s), resuming after the last yielded stream ID, and on ``event: drain``.
-        Ten consecutive failed connects raise ``relay_unavailable``; a non-retryable status
-        raises the mapped error (``relay_rejected`` etc.); a frame larger than
-        ``MAX_ENVELOPE_BYTES + 512`` raises ``relay_protocol_error``. Setting ``stop`` (or
-        closing the generator) ends the stream; a connection idle for ``idle_timeout``
-        seconds is treated as dropped. ``on_open`` runs each time a connection is established
-        (the first and every reconnect); an exception from it ends the stream as is.
+        Each entry's ``message`` is the frame's raw data, undecoded (the Inbox quarantines a
+        frame that is not an envelope). Reconnects internally, resuming after the last
+        yielded stream ID: immediately on ``event: drain`` or a clean end of stream once that
+        connection carried a ``catchup``, ``message`` or ``drain`` frame, otherwise (including
+        a stream that delivered only ``connected``, heartbeats or nothing) with backoff
+        1, 2, 4 ... 30 s (``Retry-After`` honored, capped at 30 s). Only ``catchup``,
+        ``message`` and ``drain`` frames reset the failure count; ten consecutive failures
+        raise ``relay_unavailable``.
+        A non-retryable status raises the mapped error (``relay_rejected`` etc.); a frame
+        larger than ``MAX_ENVELOPE_BYTES + 512`` raises ``relay_protocol_error``. Setting
+        ``stop`` (or closing the generator) ends the stream; a connection idle for
+        ``idle_timeout`` seconds is treated as dropped. ``on_open`` runs each time a connection
+        is established (the first and every reconnect); an exception from it ends the stream
+        as is.
         """
         resume = since or "-"
         RelayAuthRequest.listen(resume)  # validate
@@ -438,24 +574,34 @@ class RelayClient:
             # yield is the caller's and propagates as is. Once stopped, the watcher's socket
             # shutdown surfaces as a stream error or EOF, both of which end here.
             stream = self._listen_once(identity, resume, stop, idle_timeout)
+            got_event = False  # a catchup / message / drain frame arrived on this connection
             try:
                 while True:
+                    failure: ACEError | None = None
                     try:
                         entry = next(stream)
-                    except StopIteration:  # drain or EOF -> reconnect immediately unless stopped
-                        failures = 0
-                        break
+                    except StopIteration:
+                        if got_event:  # drain or EOF after progress: reconnect at once
+                            failures = 0
+                            break
+                        failure = ACEError(
+                            "relay_unavailable", "listen stream ended without progress"
+                        )
                     except ACEError as exc:
+                        if exc.code != "relay_unavailable" and not stopped():
+                            raise
+                        failure = exc
+                    if failure is not None:
                         if stopped():
                             return
-                        if exc.code != "relay_unavailable":
-                            raise
                         failures += 1
                         if failures >= _MAX_CONNECT_FAILURES:
-                            raise
+                            raise failure
                         delay = min(2 ** (failures - 1), _MAX_BACKOFF_SECONDS)
-                        if exc.retry_after_seconds is not None:
-                            delay = min(max(delay, exc.retry_after_seconds), _MAX_BACKOFF_SECONDS)
+                        if failure.retry_after_seconds is not None:
+                            delay = min(
+                                max(delay, failure.retry_after_seconds), _MAX_BACKOFF_SECONDS
+                            )
                         if stop is not None:
                             if stop.wait(delay):
                                 return
@@ -468,16 +614,20 @@ class RelayClient:
                         if on_open is not None:
                             on_open()
                         continue
-                    failures = 0
+                    failures, got_event = 0, True  # catchup / message / drain is progress
                     if entry is None:
-                        continue  # connected / heartbeat-level progress
+                        continue  # drain
                     yield entry
                     resume = entry.stream_id
             finally:
                 stream.close()
 
     def _listen_once(
-        self, identity: ACEIdentity, since: str, stop: threading.Event | None, idle_timeout: float,
+        self,
+        identity: ACEIdentity,
+        since: str,
+        stop: threading.Event | None,
+        idle_timeout: float,
     ) -> Iterator[RelayEntry | object | None]:
         conn = self._connection(max(self._timeout, idle_timeout))
         done = threading.Event()
@@ -486,9 +636,14 @@ class RelayClient:
         try:
             for attempt in (0, 1):
                 req = RelayAuthRequest.listen(since)
-                headers = {**create_auth_headers(identity, req, self._next_ts()), "Accept": "text/event-stream"}
+                headers = {
+                    **create_auth_headers(identity, req, self._next_ts()),
+                    "Accept": "text/event-stream",
+                }
                 try:
-                    conn.request("GET", self._target("/v1/listen", {"since": since}), headers=headers)
+                    conn.request(
+                        "GET", self._target("/v1/listen", {"since": since}), headers=headers
+                    )
                     sock = conn.sock  # getresponse() may detach it from the connection
                     resp = conn.getresponse()
                 except (OSError, http.client.HTTPException) as exc:
@@ -496,7 +651,9 @@ class RelayClient:
                 if resp.status == 200:
                     break
                 data = resp.read(64 * 1024)
-                err = _map_status(resp.status, data, _retry_after(resp.getheader("Retry-After")))
+                if 200 <= resp.status < 300:
+                    raise _protocol(f"unexpected listen HTTP {resp.status}")
+                err = _map_relay_response(resp.status, data, resp.getheader("Retry-After"))
                 if attempt == 0 and resp.status == 409 and err.relay_code == "replay":
                     conn.close()
                     conn = self._connection(max(self._timeout, idle_timeout))
@@ -510,7 +667,9 @@ class RelayClient:
 
                 def watch() -> None:
                     while not done.is_set():
-                        if stop.wait(0.5):  # the period only bounds how long the watcher outlives its stream
+                        if stop.wait(
+                            0.5
+                        ):  # the period only bounds how long the watcher outlives its stream
                             try:
                                 if sock is not None:
                                     sock.shutdown(socket.SHUT_RDWR)
@@ -532,27 +691,24 @@ class RelayClient:
 
     @staticmethod
     def _parse_sse(resp: http.client.HTTPResponse) -> Iterator[RelayEntry | None]:
+        """Yield one entry per ``catchup`` / ``message`` event and ``None`` for ``drain`` (then
+        return); other event types are skipped. Returns at a clean end of stream. Lines end
+        with CR, LF or CRLF. An event is dispatched only if it has a ``data`` field; ``id`` and
+        ``event`` apply to the event they appear in only."""
+        reader = _SSELines(resp)
         event_id: str | None = None
         event_type = ""
         data: list[bytes] = []
         size = 0
         while True:
-            try:
-                line = resp.readline(_SSE_FRAME_LIMIT + 2)
-            except (OSError, http.client.HTTPException, ValueError) as exc:
-                raise ACEError("relay_unavailable", f"listen stream dropped: {exc}") from None
-            if not line:
-                raise ACEError("relay_unavailable", "listen stream closed by the relay")
-            if not line.endswith(b"\n"):
-                if len(line) > _SSE_FRAME_LIMIT:
-                    raise _protocol("SSE frame exceeds the size limit")
-                raise ACEError("relay_unavailable", "listen stream ended mid-line")
+            line = reader.next_line()
+            if line is None:
+                return  # clean end of stream: reconnect immediately
             if line.startswith(b":"):
                 continue  # heartbeat / comment
-            size += len(line)
+            size += len(line) + 1
             if size > _SSE_FRAME_LIMIT + 2:
                 raise _protocol("SSE frame exceeds the size limit")
-            line = line.rstrip(b"\n").rstrip(b"\r")
             if line:
                 field, _, value = line.partition(b":")
                 if value.startswith(b" "):
@@ -564,25 +720,64 @@ class RelayClient:
                 elif field == b"data":
                     data.append(value)
                 continue
-            # dispatch
-            if not data and event_id is None and not event_type:
-                size = 0
+            # dispatch: only an event with a data field; id and type are per event
+            if not data:
+                event_id, event_type, size = None, "", 0
                 continue
             etype, eid, payload = event_type or "message", event_id, b"\n".join(data)
             event_id, event_type, data, size = None, "", [], 0
-            if etype == "connected":
-                yield None
-                continue
             if etype == "drain":
+                yield None  # progress: the relay asked for a reconnect, which is immediate
                 return
             if etype not in ("catchup", "message"):
-                continue
+                continue  # connected, or an unknown type: not progress
             if not is_stream_id(eid):
                 raise _protocol("SSE event without a valid stream id")
-            if len(payload) > MAX_ENVELOPE_BYTES:
-                raise _protocol("SSE data exceeds MAX_ENVELOPE_BYTES")
-            try:
-                message = json.loads(payload.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError, RecursionError):
-                raise _protocol("SSE data is not JSON") from None
-            yield RelayEntry(eid, message, etype == "catchup")
+            yield RelayEntry(eid, payload, etype == "catchup")  # type: ignore[arg-type]
+
+
+class _SSELines:
+    """Split an SSE byte stream into lines ending in CR, LF or CRLF (CR LF is one ending).
+
+    A line longer than the frame limit is ``relay_protocol_error``; a read error or a stream
+    that ends mid-line is ``relay_unavailable``; a stream that ends at a line boundary
+    returns None.
+    """
+
+    def __init__(self, resp: http.client.HTTPResponse) -> None:
+        self._resp = resp
+        self._buf = b""
+        self._skip_lf = False
+
+    def _fill(self) -> bool:
+        try:
+            chunk = self._resp.read1(8192)
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            raise ACEError("relay_unavailable", f"listen stream dropped: {exc}") from None
+        if not chunk:
+            return False
+        self._buf += chunk
+        return True
+
+    def next_line(self) -> bytes | None:
+        while True:
+            if self._skip_lf and self._buf:
+                if self._buf.startswith(b"\n"):
+                    self._buf = self._buf[1:]
+                self._skip_lf = False
+            cr, lf = self._buf.find(b"\r"), self._buf.find(b"\n")
+            ends = [i for i in (cr, lf) if i >= 0]
+            if ends:
+                i = min(ends)
+                line, self._buf = self._buf[:i], self._buf[i + 1 :]
+                if i == cr:
+                    self._skip_lf = True
+                if len(line) > _SSE_FRAME_LIMIT:
+                    raise _protocol("SSE frame exceeds the size limit")
+                return line
+            if len(self._buf) > _SSE_FRAME_LIMIT:
+                raise _protocol("SSE frame exceeds the size limit")
+            if not self._fill():
+                if self._buf:
+                    raise ACEError("relay_unavailable", "listen stream ended mid-line")
+                return None

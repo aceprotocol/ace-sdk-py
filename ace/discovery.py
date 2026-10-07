@@ -9,6 +9,7 @@ import re
 import socket
 import ssl
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
@@ -61,7 +62,9 @@ class VerifiedPeer:
     def __post_init__(self) -> None:
         # Also blocks dataclasses.replace(): a modified peer would no longer be verified.
         if getattr(_MINTING, "active", False) is not True:
-            raise ACEError("invalid_argument", "VerifiedPeer is created only by the verify_* functions")
+            raise ACEError(
+                "invalid_argument", "VerifiedPeer is created only by the verify_* functions"
+            )
 
     @property
     def address(self) -> str:
@@ -78,6 +81,7 @@ def _make_peer(**kw: Any) -> VerifiedPeer:
 
 
 # --- profile ------------------------------------------------------------------------
+
 
 def _tag_list(items: list[str], name: str, max_count: int) -> None:
     if len(items) > max_count:
@@ -97,39 +101,56 @@ def validate_profile(profile: AgentProfile | dict) -> AgentProfile:
 
     def text(value: str | None, name: str, lo: int, hi: int) -> None:
         if value is not None and (not lo <= len(value) <= hi or CONTROL_CHAR_RE.search(value)):
-            raise ACEError("invalid_profile", f"profile.{name} must be {lo}-{hi} characters without control characters")
+            raise ACEError(
+                "invalid_profile",
+                f"profile.{name} must be {lo}-{hi} characters without control characters",
+            )
 
     text(p.name, "name", 1, 64)
     text(p.description, "description", 0, 256)
     if p.image is not None and (len(p.image) > 512 or not is_https_url(p.image)):
-        raise ACEError("invalid_profile", "profile.image must be an HTTPS URL of at most 512 characters")
+        raise ACEError(
+            "invalid_profile", "profile.image must be an HTTPS URL of at most 512 characters"
+        )
     if p.tags is not None:
         _tag_list(p.tags, "tags", 10)
     if p.capabilities is not None:
         _tag_list(p.capabilities, "capabilities", 20)
     if p.chains is not None:
         if len(p.chains) > 10 or not all(_CAIP2_RE.fullmatch(c) for c in p.chains):
-            raise ACEError("invalid_profile", "profile.chains must be at most 10 CAIP-2 identifiers")
+            raise ACEError(
+                "invalid_profile", "profile.chains must be at most 10 CAIP-2 identifiers"
+            )
     if p.endpoint is not None and not is_https_url(p.endpoint):
         raise ACEError("invalid_profile", "profile.endpoint must be an HTTPS URL")
     if p.pricing is not None:
         text(p.pricing.currency, "pricing.currency", 1, 16)
         m = p.pricing.max_amount
         if m is not None and (len(m) > 32 or _AMOUNT_RE.fullmatch(m) is None):
-            raise ACEError("invalid_profile", "profile.pricing.maxAmount must match ^[0-9]+(\\.[0-9]+)?$ (1-32 chars)")
+            raise ACEError(
+                "invalid_profile",
+                "profile.pricing.maxAmount must match ^[0-9]+(\\.[0-9]+)?$ (1-32 chars)",
+            )
     return p
 
 
 def _raw_profile(p: AgentProfile) -> dict:
     """The attribute values of a (possibly hand-built) profile, for strict re-parsing."""
-    d: dict[str, Any] = {k: getattr(p, k) for k in
-                         ("name", "description", "image", "tags", "capabilities", "chains", "endpoint")}
+    d: dict[str, Any] = {
+        k: getattr(p, k)
+        for k in ("name", "description", "image", "tags", "capabilities", "chains", "endpoint")
+    }
     pr = p.pricing
-    d["pricing"] = {"currency": pr.currency, "maxAmount": pr.max_amount} if isinstance(pr, ProfilePricing) else pr
+    d["pricing"] = (
+        {"currency": pr.currency, "maxAmount": pr.max_amount}
+        if isinstance(pr, ProfilePricing)
+        else pr
+    )
     return d
 
 
 # --- keys / binding -------------------------------------------------------------------
+
 
 def decode_signing_key(scheme: object, text: object, code: ACEErrorCode) -> bytes:
     raw = decode_b64(text, code, "signingPublicKey", max_bytes=64)
@@ -177,7 +198,9 @@ def verify_peer_record(record: dict) -> VerifiedPeer:
     enc_b64, sig_b64 = record["encryptionPublicKey"], record["signingPublicKey"]
     signature = record.get("registrationSignature")
     sig = decode_signature(signature, scheme, code)  # type: ignore[arg-type]
-    if not verify_signature(binding_sign_data(ace_id, registered_at, enc_b64, sig_b64), sig, scheme, signing_key):  # type: ignore[arg-type]
+    if not verify_signature(
+        binding_sign_data(ace_id, registered_at, enc_b64, sig_b64), sig, scheme, signing_key
+    ):  # type: ignore[arg-type]
         raise ACEError(code, "registrationSignature does not verify")
     profile = None
     if record.get("profile") is not None:
@@ -186,13 +209,22 @@ def verify_peer_record(record: dict) -> VerifiedPeer:
         except ACEError as exc:
             raise ACEError(code, exc.message) from None
     return _make_peer(
-        ace_id=ace_id, scheme=scheme, signing_public_key=signing_key, encryption_public_key=enc_key,
-        registered_at=registered_at, registration_signature=signature, source="relay", profile=profile,
+        ace_id=ace_id,
+        scheme=scheme,
+        signing_public_key=signing_key,
+        encryption_public_key=enc_key,
+        registered_at=registered_at,
+        registration_signature=signature,
+        source="relay",
+        profile=profile,
     )
 
 
 def verify_registration_file(
-    reg: RegistrationFile | dict, *, pinned_at: int | None = None, clock: Callable[[], int] | None = None,
+    reg: RegistrationFile | dict,
+    *,
+    pinned_at: int | None = None,
+    clock: Callable[[], int] | None = None,
 ) -> VerifiedPeer:
     """Run all 01 rules (including the ID hash); failures are ``invalid_registration``.
 
@@ -225,8 +257,13 @@ def verify_registration_file(
             raise ACEError(code, "signing.address is not Base58") from None
         if len(signing_key) != 32 or base58.b58encode(signing_key).decode("ascii") != s.address:
             raise ACEError(code, "signing.address must be the Base58 of a 32-byte key")
-        if s.signing_public_key is not None and decode_b64(s.signing_public_key, code, "signing.signingPublicKey") != signing_key:
-            raise ACEError(code, "signing.signingPublicKey must equal Base58Decode(signing.address)")
+        if (
+            s.signing_public_key is not None
+            and decode_b64(s.signing_public_key, code, "signing.signingPublicKey") != signing_key
+        ):
+            raise ACEError(
+                code, "signing.signingPublicKey must equal Base58Decode(signing.address)"
+            )
     else:
         if s.signing_public_key is None:
             raise ACEError(code, "secp256k1 requires signing.signingPublicKey")
@@ -238,9 +275,14 @@ def verify_registration_file(
     enc_key = decode_encryption_key(s.encryption_public_key, code)
     now = unix_now(clock)
     return _make_peer(
-        ace_id=reg.id, scheme=s.scheme, signing_public_key=bytes(signing_key), encryption_public_key=enc_key,
-        registered_at=now if pinned_at is None else pinned_at, registration_signature=None,
-        source="registration", profile=None,
+        ace_id=reg.id,
+        scheme=s.scheme,
+        signing_public_key=bytes(signing_key),
+        encryption_public_key=enc_key,
+        registered_at=now if pinned_at is None else pinned_at,
+        registration_signature=None,
+        source="registration",
+        profile=None,
     )
 
 
@@ -249,7 +291,9 @@ def verify_registration_file(
 AdoptOutcome = Literal["adopted", "unchanged", "rotated"]
 
 
-def adopt_decision(pin: VerifiedPeer | None, candidate: VerifiedPeer, now: int) -> tuple[VerifiedPeer, AdoptOutcome]:
+def adopt_decision(
+    pin: VerifiedPeer | None, candidate: VerifiedPeer, now: int
+) -> tuple[VerifiedPeer, AdoptOutcome]:
     """Internal pure rule used by PeerStore.adopt: returns the binding to store and the outcome.
 
     Rotation to a different encryption key requires a signed (relay) binding with a
@@ -269,14 +313,20 @@ def adopt_decision(pin: VerifiedPeer | None, candidate: VerifiedPeer, now: int) 
             return pin, "unchanged"
         newer = candidate if candidate.registered_at > pin.registered_at else pin
         merged = _make_peer(
-            ace_id=pin.ace_id, scheme=pin.scheme, signing_public_key=pin.signing_public_key,
-            encryption_public_key=pin.encryption_public_key, registered_at=newer.registered_at,
-            registration_signature=newer.registration_signature, source=newer.source,
+            ace_id=pin.ace_id,
+            scheme=pin.scheme,
+            signing_public_key=pin.signing_public_key,
+            encryption_public_key=pin.encryption_public_key,
+            registered_at=newer.registered_at,
+            registration_signature=newer.registration_signature,
+            source=newer.source,
             profile=candidate.profile if candidate.source == "relay" else pin.profile,
         )
         return merged, "unchanged"
     if unsigned:
-        raise ACEError("stale_peer_binding", "an unsigned source cannot rotate a pinned encryption key")
+        raise ACEError(
+            "stale_peer_binding", "an unsigned source cannot rotate a pinned encryption key"
+        )
     if candidate.registered_at > pin.registered_at:
         return candidate, "rotated"
     raise ACEError("stale_peer_binding", "a different encryption key requires a newer registeredAt")
@@ -284,19 +334,51 @@ def adopt_decision(pin: VerifiedPeer | None, candidate: VerifiedPeer, now: int) 
 
 # --- well-known fetch --------------------------------------------------------------------
 
-_V4_BLOCKED = [ipaddress.ip_network(n) for n in (
-    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
-    "192.0.0.0/24", "192.0.2.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
-    "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
-)]
-_V6_BLOCKED = [ipaddress.ip_network(n) for n in (
-    "::/128", "::1/128", "100::/64", "2001:db8::/32", "fc00::/7", "fe80::/10", "ff00::/8",
-)]
+_V4_BLOCKED = [
+    ipaddress.ip_network(n)
+    for n in (
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.0.0.0/24",
+        "192.0.2.0/24",
+        "192.168.0.0/16",
+        "198.18.0.0/15",
+        "198.51.100.0/24",
+        "203.0.113.0/24",
+        "224.0.0.0/4",
+        "240.0.0.0/4",
+    )
+]
+_V6_BLOCKED = [
+    ipaddress.ip_network(n)
+    for n in (
+        "::/128",
+        "::1/128",
+        "100::/64",
+        "2001:db8::/32",
+        "fc00::/7",
+        "fe80::/10",
+        "ff00::/8",
+    )
+]
 _V6_EMBEDDED = [ipaddress.ip_network("::ffff:0:0/96"), ipaddress.ip_network("64:ff9b::/96")]
 
 
 def is_blocked_address(ip: str) -> bool:
-    addr = ipaddress.ip_address(ip.split("%", 1)[0])
+    """True if the IP literal ``ip`` lies in a blocked range (08-relay § Client Rules,
+    Blocked Addresses). A value that is not an IP literal is blocked (fail closed)."""
+    if not isinstance(ip, str):
+        return True
+    if ":" in ip:  # only an IPv6 literal may carry a %zone
+        ip = ip.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
     if isinstance(addr, ipaddress.IPv6Address):
         for net in _V6_EMBEDDED:
             if addr in net:
@@ -309,30 +391,98 @@ def is_blocked_address(ip: str) -> bool:
 
 _getaddrinfo = socket.getaddrinfo  # injectable resolver (tests)
 _create_connection = socket.create_connection
+_ssl_context = ssl.create_default_context  # injectable trust store (tests)
+
+
+class _DeadlineSSLSocket(ssl.SSLSocket):
+    """Before every send/receive, the socket timeout is set to the time left until the
+    request deadline, so a peer that trickles bytes cannot stretch the total time."""
+
+    _ace_deadline: float | None = None
+
+    def _ace_arm(self) -> None:
+        if self._ace_deadline is not None:
+            left = self._ace_deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("request deadline exceeded")
+            self.settimeout(left)
+
+    def recv(self, *args: Any, **kwargs: Any) -> bytes:
+        self._ace_arm()
+        return super().recv(*args, **kwargs)
+
+    def recv_into(self, *args: Any, **kwargs: Any) -> int:
+        self._ace_arm()
+        return super().recv_into(*args, **kwargs)
+
+    def read(self, *args: Any, **kwargs: Any) -> Any:
+        self._ace_arm()
+        return super().read(*args, **kwargs)
+
+    def send(self, *args: Any, **kwargs: Any) -> int:
+        self._ace_arm()
+        return super().send(*args, **kwargs)
 
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     """HTTPS to a pre-validated IP: no second DNS lookup; SNI and certificate
-    verification still use ``domain``."""
+    verification still use ``domain``. ``timeout`` is a TOTAL deadline for connect,
+    TLS handshake, request and response, counted from construction. Shared by the
+    well-known fetch and ``post_direct`` (through ``_pinned_request``)."""
 
-    def __init__(self, domain: str, ip: str, timeout: float) -> None:
-        super().__init__(domain, 443, timeout=timeout, context=ssl.create_default_context())
+    def __init__(self, domain: str, ip: str, timeout: float, port: int = 443) -> None:
+        super().__init__(domain, port, timeout=timeout)
         self._ace_ip = ip
-        self._ace_ctx = ssl.create_default_context()  # CERT_REQUIRED + hostname check
+        self._ace_deadline = time.monotonic() + timeout
+        self._ace_ctx = _ssl_context()  # CERT_REQUIRED + hostname check
+        self._ace_ctx.sslsocket_class = _DeadlineSSLSocket
+
+    def _ace_left(self) -> float:
+        left = self._ace_deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("request deadline exceeded")
+        return left
 
     def connect(self) -> None:
-        raw = _create_connection((self._ace_ip, 443), timeout=self.timeout)
+        raw = _create_connection((self._ace_ip, self.port), timeout=self._ace_left())
         try:
-            self.sock = self._ace_ctx.wrap_socket(raw, server_hostname=self.host)
+            raw.settimeout(self._ace_left())
+            sock = self._ace_ctx.wrap_socket(raw, server_hostname=self.host)
         except BaseException:
             raw.close()
             raise
+        sock._ace_deadline = self._ace_deadline
+        self.sock = sock
 
 
-def _resolve(domain: str, allow_private: bool) -> list[str]:
+def _pinned_request(
+    host: str,
+    ip: str,
+    port: int,
+    method: str,
+    target: str,
+    *,
+    headers: dict[str, str],
+    body: bytes | None = None,
+    timeout: float,
+    max_bytes: int,
+) -> tuple[int, Any, bytes]:
+    """One HTTPS request to the vetted ``ip`` within a total ``timeout``; reads at most
+    ``max_bytes + 1`` body bytes. Returns ``(status, response, body)``. Raises ``OSError``
+    (including ``TimeoutError``), ``ssl.SSLError`` or ``http.client.HTTPException``."""
+    conn = _PinnedHTTPSConnection(host, ip, float(timeout), port)
+    try:
+        conn.request(method, target, body=body, headers=headers)
+        resp = conn.getresponse()
+        return resp.status, resp, resp.read(max_bytes + 1)
+    finally:
+        conn.close()
+
+
+def _resolve(domain: str, allow_private: bool, port: int = 443) -> list[str]:
     """Resolve once; ``blocked_address`` if ANY address is in a blocked range."""
     try:
-        infos = _getaddrinfo(domain, 443, proto=socket.IPPROTO_TCP)
+        infos = _getaddrinfo(domain, port, proto=socket.IPPROTO_TCP)
     except (socket.gaierror, OSError) as exc:
         raise ACEError("fetch_failed", f"DNS resolution failed: {exc}") from None
     ips: list[str] = []
@@ -357,8 +507,9 @@ def fetch_registration_file(
     """GET ``https://<domain>/.well-known/ace.json`` with SSRF protection, then verify it.
 
     Connects to the vetted IP (no re-resolution), never follows redirects, requires
-    ``application/json`` and reads at most ``max_bytes + 1`` bytes. Network errors,
-    timeouts, 5xx and 429 are ``fetch_failed``; everything else ``invalid_registration``.
+    ``application/json`` and reads at most ``max_bytes + 1`` bytes. ``timeout`` bounds the
+    whole exchange (connect, headers and body). Network errors, timeouts, 5xx and 429 are
+    ``fetch_failed``; everything else ``invalid_registration``.
     """
     if not isinstance(domain, str) or _DOMAIN_RE.fullmatch(domain) is None:
         raise ACEError("invalid_argument", "invalid domain")
@@ -367,26 +518,30 @@ def fetch_registration_file(
     if type(max_bytes) is not int or max_bytes < 1:
         raise ACEError("invalid_argument", "max_bytes must be a positive integer")
     ip = _resolve(domain, allow_private_addresses)[0]
-    conn = _PinnedHTTPSConnection(domain, ip, timeout)
     try:
-        try:
-            conn.request("GET", "/.well-known/ace.json", headers={"Accept": "application/json"})
-            resp = conn.getresponse()
-        except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
-            raise ACEError("fetch_failed", f"fetch failed: {exc}") from None
-        if resp.status >= 500 or resp.status == 429:
-            raise ACEError("fetch_failed", f"HTTP {resp.status}", status=resp.status)
-        if resp.status != 200:
-            raise ACEError("invalid_registration", f"HTTP {resp.status} (redirects are not followed)", status=resp.status)
-        media = (resp.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
-        if media != "application/json":
-            raise ACEError("invalid_registration", "content-type must be application/json")
-        try:
-            body = resp.read(max_bytes + 1)
-        except (OSError, http.client.HTTPException) as exc:
-            raise ACEError("fetch_failed", f"read failed: {exc}") from None
-    finally:
-        conn.close()
+        status, resp, body = _pinned_request(
+            domain,
+            ip,
+            443,
+            "GET",
+            "/.well-known/ace.json",
+            headers={"Accept": "application/json"},
+            timeout=timeout,
+            max_bytes=max_bytes,
+        )
+    except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+        raise ACEError("fetch_failed", f"fetch failed: {type(exc).__name__}: {exc}") from None
+    if status >= 500 or status == 429:
+        raise ACEError("fetch_failed", f"HTTP {status}", status=status)
+    if status != 200:
+        raise ACEError(
+            "invalid_registration",
+            f"HTTP {status} (redirects are not followed)",
+            status=status,
+        )
+    media = (resp.getheader("Content-Type") or "").split(";", 1)[0].strip().lower()
+    if media != "application/json":
+        raise ACEError("invalid_registration", "content-type must be application/json")
     if len(body) > max_bytes:
         raise ACEError("invalid_registration", f"registration file exceeds {max_bytes} bytes")
     try:
@@ -396,4 +551,3 @@ def fetch_registration_file(
     reg = RegistrationFile.from_dict(data)
     verify_registration_file(reg)
     return reg
-

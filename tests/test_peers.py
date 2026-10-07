@@ -8,7 +8,7 @@ import pytest
 
 from ace import ACEError, FileStore, MemoryStore, PeerStore, SoftwareIdentity, verify_peer_record
 from ace.peers import _peer_key
-from ace.registration import create_registration_request
+from ace.registration import create_registration_file, create_registration_request
 
 from .helpers import raises
 
@@ -37,7 +37,11 @@ class StubRelay:
 
 
 def relay_record(identity, ts, profile=None):
-    req = create_registration_request(identity, profile, ts) if profile else create_registration_request(identity, timestamp=ts)
+    req = (
+        create_registration_request(identity, profile, ts)
+        if profile
+        else create_registration_request(identity, timestamp=ts)
+    )
     rec = {k: req[k] for k in ("aceId", "scheme", "encryptionPublicKey", "signingPublicKey")}
     rec.update(registrationSignature=req["signature"], registeredAt=ts)
     if profile:
@@ -49,7 +53,9 @@ def rotated(identity):
     """Same signing key, new encryption key."""
     exp = identity.export_private_key()
     other = SoftwareIdentity.generate(identity.get_signing_scheme()).export_private_key()
-    return SoftwareIdentity.from_export({**exp, "encryptionPrivateKey": other["encryptionPrivateKey"]})
+    return SoftwareIdentity.from_export(
+        {**exp, "encryptionPrivateKey": other["encryptionPrivateKey"]}
+    )
 
 
 @pytest.fixture(params=["memory", "file"])
@@ -65,14 +71,21 @@ def test_adopt_outcomes(store):
     p1 = verify_peer_record(relay_record(bob, t - 100))
     assert peers.adopt(p1).outcome == "adopted"
     res = peers.adopt(verify_peer_record(relay_record(bob, t - 50, {"name": "Bob"})))
-    assert res.outcome == "unchanged" and res.peer.registered_at == t - 50 and res.peer.profile.name == "Bob"
+    assert (
+        res.outcome == "unchanged"
+        and res.peer.registered_at == t - 50
+        and res.peer.profile.name == "Bob"
+    )
     # older entry with same key keeps the newer timestamp
     assert peers.adopt(p1).peer.registered_at == t - 50
     bob2 = rotated(bob)
     with raises("stale_peer_binding"):
         peers.adopt(verify_peer_record(relay_record(bob2, t - 60)))
     res = peers.adopt(verify_peer_record(relay_record(bob2, t - 10)))
-    assert res.outcome == "rotated" and res.peer.encryption_public_key == bob2.get_encryption_public_key()
+    assert (
+        res.outcome == "rotated"
+        and res.peer.encryption_public_key == bob2.get_encryption_public_key()
+    )
     with raises("invalid_peer"):
         peers.adopt(verify_peer_record(relay_record(bob2, t + 301)))
     imposter = SoftwareIdentity.generate("secp256k1")
@@ -84,14 +97,14 @@ def test_registration_file_never_rotates(store):
     clock = Clock()
     peers = PeerStore(store, clock=clock)
     bob = SoftwareIdentity.generate("secp256k1")
-    reg = bob.to_registration_file(name="Bob", endpoint="https://bob.example/ace")
+    reg = create_registration_file(bob, name="Bob", endpoint="https://bob.example/ace")
     pinned = peers.pin_registration_file(reg, pinned_at=100)
     assert pinned.source == "registration" and pinned.registered_at == 100
     before = store.read(_peer_key(bob.get_ace_id()))
     clock.t += 1000
     assert peers.pin_registration_file(reg, pinned_at=500).registered_at == 100  # kept exactly
     assert store.read(_peer_key(bob.get_ace_id())) == before  # no write: fetchedAt unchanged
-    reg2 = rotated(bob).to_registration_file(name="Bob", endpoint="https://bob.example/ace")
+    reg2 = create_registration_file(rotated(bob), name="Bob", endpoint="https://bob.example/ace")
     with raises("stale_peer_binding"):
         peers.pin_registration_file(reg2, pinned_at=10**9)
     # a signed relay binding with newer registeredAt may rotate a file pin
@@ -108,8 +121,18 @@ def test_persisted_format_and_reverify(tmp_path):
     raw = store.read(_peer_key(bob.get_ace_id()))
     d = json.loads(raw)
     assert raw == json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    assert set(d) == {"aceId", "encryptionPublicKey", "fetchedAt", "profile", "registeredAt",
-                      "registrationSignature", "scheme", "signingPublicKey", "source", "version"}
+    assert set(d) == {
+        "aceId",
+        "encryptionPublicKey",
+        "fetchedAt",
+        "profile",
+        "registeredAt",
+        "registrationSignature",
+        "scheme",
+        "signingPublicKey",
+        "source",
+        "version",
+    }
     assert d["fetchedAt"] == clock.t and d["source"] == "relay" and d["profile"] == {"name": "Bob"}
     # corrupt binding -> storage_failed, never overwritten
     d["registeredAt"] += 1
@@ -140,6 +163,8 @@ def test_resolve_ttl_and_fallbacks():
     assert peers.resolve(bob.get_ace_id()).ace_id == bob.get_ace_id()  # stale pin returned
     with raises("relay_unavailable"):
         peers.resolve(bob.get_ace_id(), max_age_seconds=0)
+    relay.error = ACEError("storage_failed", "a local failure is retryable too")
+    assert peers.resolve(bob.get_ace_id()).ace_id == bob.get_ace_id()
     relay.error = ACEError("relay_rejected", "nope")
     with raises("relay_rejected"):
         peers.resolve(bob.get_ace_id())
@@ -160,7 +185,9 @@ def test_resolve_without_relay():
     bob = SoftwareIdentity.generate("ed25519")
     with raises("unknown_peer"):
         peers.resolve(bob.get_ace_id())
-    peers.pin_registration_file(bob.to_registration_file(name="B", endpoint="https://b.example/a"), pinned_at=0)
+    peers.pin_registration_file(
+        create_registration_file(bob, name="B", endpoint="https://b.example/a"), pinned_at=0
+    )
     assert peers.resolve(bob.get_ace_id(), max_age_seconds=0).ace_id == bob.get_ace_id()
     with raises("invalid_argument"):
         peers.resolve("bob")

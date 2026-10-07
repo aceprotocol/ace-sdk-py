@@ -41,11 +41,18 @@ def encode_payload(*fields: str | bytes) -> bytes:
 
 def build_sign_data(action: str, ace_id: str, timestamp: int, payload: bytes = b"") -> bytes:
     """SHA-256("ace.v1" || lp(action) || lp(aceId) || ts[8 BE] || lp(payload))."""
-    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or not 0 <= timestamp <= MAX_SAFE_INTEGER:
+    if (
+        isinstance(timestamp, bool)
+        or not isinstance(timestamp, int)
+        or not 0 <= timestamp <= MAX_SAFE_INTEGER
+    ):
         raise ACEError("invalid_argument", "timestamp must be an integer in [0, 2^53-1]")
     return hashlib.sha256(
-        _DOMAIN_PREFIX + _prefix(action.encode("utf-8")) + _prefix(ace_id.encode("utf-8"))
-        + struct.pack(">Q", timestamp) + _prefix(payload)
+        _DOMAIN_PREFIX
+        + _prefix(action.encode("utf-8"))
+        + _prefix(ace_id.encode("utf-8"))
+        + struct.pack(">Q", timestamp)
+        + _prefix(payload)
     ).digest()
 
 
@@ -89,7 +96,11 @@ def verify_ed25519(sign_data: bytes, sig: bytes, public_key: bytes) -> bool:
 
 
 def verify_secp256k1(sign_data: bytes, sig: bytes, public_key: bytes) -> bool:
-    if len(sig) != 65 or len(sign_data) != 32 or not is_valid_signing_public_key("secp256k1", public_key):
+    if (
+        len(sig) != 65
+        or len(sign_data) != 32
+        or not is_valid_signing_public_key("secp256k1", public_key)
+    ):
         return False
     r = int.from_bytes(sig[:32], "big")
     s = int.from_bytes(sig[32:64], "big")
@@ -97,7 +108,9 @@ def verify_secp256k1(sign_data: bytes, sig: bytes, public_key: bytes) -> bool:
     if v not in (0, 1) or not 1 <= r < SECP256K1_N or not 1 <= s <= SECP256K1_HALF_N:
         return False
     try:
-        recovered = SecpPublicKey.from_signature_and_message(bytes(sig), bytes(sign_data), hasher=None)
+        recovered = SecpPublicKey.from_signature_and_message(
+            bytes(sig), bytes(sign_data), hasher=None
+        )
     except Exception:
         return False
     return hmac.compare_digest(recovered.format(compressed=True), bytes(public_key))

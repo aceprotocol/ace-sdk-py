@@ -58,9 +58,13 @@ _EXPANDED_SIZE = _MLKEM_SEED_SIZE + _X_SIZE  # 96
 
 def _check_length(value: bytes, expected: int, what: str) -> None:
     if not isinstance(value, (bytes, bytearray)):
-        raise ACEError("invalid_argument", f"X-Wing {what} must be bytes, got {type(value).__name__}")
+        raise ACEError(
+            "invalid_argument", f"X-Wing {what} must be bytes, got {type(value).__name__}"
+        )
     if len(value) != expected:
-        raise ACEError("invalid_argument", f"X-Wing {what} must be exactly {expected} bytes, got {len(value)}")
+        raise ACEError(
+            "invalid_argument", f"X-Wing {what} must be exactly {expected} bytes, got {len(value)}"
+        )
 
 
 def check_public_key(public_key: bytes) -> None:

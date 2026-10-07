@@ -22,11 +22,13 @@ from ace.threads import (
     thread_key,
 )
 
-from .helpers import raises
+from .helpers import raises, wire
 from .pipeline import Agent, Clock
 
 
-def rfq_snapshot(local: str, peer: str, conv: str, thread_id: str, ts: int, from_id: str | None = None) -> ThreadSnapshot:
+def rfq_snapshot(
+    local: str, peer: str, conv: str, thread_id: str, ts: int, from_id: str | None = None
+) -> ThreadSnapshot:
     entry = ThreadHistoryEntry("rfq", str(uuid.uuid4()), ts, from_id or peer)
     return ThreadSnapshot(conv, thread_id, local, peer, "rfq", (entry,))
 
@@ -34,7 +36,7 @@ def rfq_snapshot(local: str, peer: str, conv: str, thread_id: str, ts: int, from
 def fill(store, local: str, peer: str, conv: str, n: int, ts: int) -> ThreadStore:
     threads = ThreadStore(store, local, clock=lambda: ts)
     for i in range(n):
-        threads.save(ThreadRecord(rfq_snapshot(local, peer, conv, f"fill-{i}", ts), None))
+        threads._save(ThreadRecord(rfq_snapshot(local, peer, conv, f"fill-{i}", ts), None))
     return threads
 
 
@@ -43,7 +45,9 @@ def make_pair():
     alice, bob = Agent("alice", "ed25519", clock), Agent("bob", "secp256k1", clock)
     alice.pin(bob)
     bob.pin(alice)
-    conv = compute_conversation_id(alice.identity.get_encryption_public_key(), bob.identity.get_encryption_public_key())
+    conv = compute_conversation_id(
+        alice.identity.get_encryption_public_key(), bob.identity.get_encryption_public_key()
+    )
     return clock, alice, bob, conv
 
 
@@ -58,13 +62,23 @@ def test_index_format_and_maintenance():
     threads = fill(store, bob.id, alice.id, conv, 2, 1000)
     assert thread_index_key(alice.id) == f"threads/index/{sha256_hex(alice.id)}.json"
     entries = sorted(thread_key(conv, t)[: -len(".json")] for t in ("fill-0", "fill-1"))
-    assert read_index(store, alice.id) == json.dumps({"open": entries, "version": 1}, separators=(",", ":")).encode()
-    assert len(threads.records()) == 2 and len(threads.list()) == 2  # the index is not a thread record
-    assert threads.open_thread_count(alice.id) == 2
+    assert (
+        read_index(store, alice.id)
+        == json.dumps({"open": entries, "version": 1}, separators=(",", ":")).encode()
+    )
+    assert (
+        len(threads._records()) == 2 and len(threads.list()) == 2
+    )  # the index is not a thread record
+    assert threads._open_thread_count(alice.id) == 2
     done = threads.get(conv, "fill-0")
     reject = ThreadHistoryEntry("reject", str(uuid.uuid4()), 1001, bob.id)
-    threads.save(ThreadRecord(ThreadSnapshot(conv, "fill-0", bob.id, alice.id, "rejected", (*done.history, reject)), None))
-    assert threads.open_thread_count(alice.id) == 1
+    threads._save(
+        ThreadRecord(
+            ThreadSnapshot(conv, "fill-0", bob.id, alice.id, "rejected", (*done.history, reject)),
+            None,
+        )
+    )
+    assert threads._open_thread_count(alice.id) == 1
     assert threads.remove(conv, "fill-1") is True
     assert read_index(store, alice.id) is None
 
@@ -73,19 +87,23 @@ def test_bound_on_receive_and_stage():
     clock, alice, bob, conv = make_pair()
     inbox = bob.open()  # replay state first: the filled threads model earlier receipts
     threads = fill(bob.store, bob.id, alice.id, conv, MAX_OPEN_THREADS_PER_PEER, clock.t)
-    env = alice.outbox.stage(alice.peers.get(bob.id), "rfq", {"need": "x"}, thread_id="one-more").message
-    out = inbox.receive(env.to_dict(), ReceiveSource.relay("https://relay.example", "1-0"))
+    env = alice.outbox.stage(
+        alice.peers.get(bob.id), "rfq", {"need": "x"}, thread_id="one-more"
+    ).message
+    out = inbox.receive(wire(env), ReceiveSource.relay("https://relay.example", "1-0"))
     assert out.kind == "quarantined" and out.error.code == "limit_exceeded"
     assert bob.host.calls == [] and threads.get(conv, "one-more") is None
     # sender side: pre-checked before any crypto
     with raises("limit_exceeded"):
         bob.outbox.stage(bob.peers.get(alice.id), "rfq", {"need": "y"}, thread_id="mine")
     # an existing thread still advances
-    offer = bob.outbox.stage(bob.peers.get(alice.id), "offer", {"price": "1", "currency": "USDC"}, thread_id="fill-7")
+    offer = bob.outbox.stage(
+        bob.peers.get(alice.id), "offer", {"price": "1", "currency": "USDC"}, thread_id="fill-7"
+    )
     assert offer.message.type == "offer"
     threads.remove(conv, "fill-0")
     bob.outbox.stage(bob.peers.get(alice.id), "rfq", {"need": "y"}, thread_id="mine")
-    assert threads.open_thread_count(alice.id) == MAX_OPEN_THREADS_PER_PEER
+    assert threads._open_thread_count(alice.id) == MAX_OPEN_THREADS_PER_PEER
     inbox.close()
 
 
@@ -95,12 +113,15 @@ def test_stale_index_entries_are_reconciled_at_the_bound():
     threads = fill(store, bob.id, alice.id, conv, 3, 1000)
     real = json.loads(read_index(store, alice.id))["open"]
     ghosts = [f"threads/{sha256_hex(f'ghost-{i}')}" for i in range(MAX_OPEN_THREADS_PER_PEER)]
-    store.write(thread_index_key(alice.id), json.dumps({"open": sorted(real + ghosts), "version": 1}).encode())
-    assert threads.open_thread_count(alice.id) == 3
+    store.write(
+        thread_index_key(alice.id),
+        json.dumps({"open": sorted(real + ghosts), "version": 1}).encode(),
+    )
+    assert threads._open_thread_count(alice.id) == 3
     assert json.loads(read_index(store, alice.id))["open"] == real
     store.write(thread_index_key(alice.id), b'{"open":[1],"version":1}')
     with raises("storage_failed"):
-        threads.open_thread_count(alice.id)
+        threads._open_thread_count(alice.id)
 
 
 def test_prunes_idle_threads_without_local_entry():
@@ -109,10 +130,10 @@ def test_prunes_idle_threads_without_local_entry():
     old = 10_000
     now = old + THREAD_RETENTION_SECONDS + 1
     seed = ThreadStore(store, bob.id, clock=lambda: old)
-    seed.save(ThreadRecord(rfq_snapshot(bob.id, alice.id, conv, "idle", old), None))
-    seed.save(ThreadRecord(rfq_snapshot(bob.id, alice.id, conv, "mine", old, bob.id), None))
-    seed.save(ThreadRecord(rfq_snapshot(bob.id, alice.id, conv, "recent", now - 10), None))
+    seed._save(ThreadRecord(rfq_snapshot(bob.id, alice.id, conv, "idle", old), None))
+    seed._save(ThreadRecord(rfq_snapshot(bob.id, alice.id, conv, "mine", old, bob.id), None))
+    seed._save(ThreadRecord(rfq_snapshot(bob.id, alice.id, conv, "recent", now - 10), None))
     later = ThreadStore(store, bob.id, clock=lambda: now)
-    later.save(ThreadRecord(rfq_snapshot(bob.id, alice.id, conv, "trigger", now), None))
+    later._save(ThreadRecord(rfq_snapshot(bob.id, alice.id, conv, "trigger", now), None))
     assert sorted(s.thread_id for s in later.list()) == ["mine", "recent", "trigger"]
-    assert later.open_thread_count(alice.id) == 3
+    assert later._open_thread_count(alice.id) == 3

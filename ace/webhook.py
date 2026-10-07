@@ -37,7 +37,11 @@ def verify_webhook_notification(
     that is not UTF-8 encodable -> ``invalid_argument``; freshness -> ``stale_timestamp``; HMAC
     (constant-time) -> ``invalid_signature``; then the body must be
     ``{"event":"message","aceId","streamId"}`` (``invalid_argument``)."""
-    if not isinstance(secret, str) or not isinstance(timestamp, str) or not isinstance(signature, str):
+    if (
+        not isinstance(secret, str)
+        or not isinstance(timestamp, str)
+        or not isinstance(signature, str)
+    ):
         raise ACEError("invalid_argument", "secret, timestamp and signature must be strings")
     ts = parse_timestamp(timestamp)
     if ts is None:
@@ -52,13 +56,19 @@ def verify_webhook_notification(
         raise ACEError("invalid_argument", "secret and body must be encodable as UTF-8") from None
     check_fresh(ts, clock, window_seconds, "X-ACE-Webhook-Timestamp")
     expected = hmac.new(key, f"{ts}.".encode() + raw, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(expected, signature[len("sha256="):]):
+    if not hmac.compare_digest(expected, signature[len("sha256=") :]):
         raise ACEError("invalid_signature", "X-ACE-Webhook-Signature does not verify")
     try:
         obj = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
         raise ACEError("invalid_argument", "notification body is not JSON") from None
-    if not isinstance(obj, dict) or obj.get("event") != "message" or not is_ace_id(obj.get("aceId")) \
-            or not is_stream_id(obj.get("streamId")):
-        raise ACEError("invalid_argument", "notification body must be {event: message, aceId, streamId}")
+    if (
+        not isinstance(obj, dict)
+        or obj.get("event") != "message"
+        or not is_ace_id(obj.get("aceId"))
+        or not is_stream_id(obj.get("streamId"))
+    ):
+        raise ACEError(
+            "invalid_argument", "notification body must be {event: message, aceId, streamId}"
+        )
     return WebhookNotification(obj["aceId"], obj["streamId"])

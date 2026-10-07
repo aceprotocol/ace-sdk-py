@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 
@@ -18,6 +19,7 @@ from ace import (
     create_message,
     verify_registration_file,
 )
+from ace.registration import create_registration_file
 from ace.relay import compare_stream_ids, normalize_relay_url
 
 from .helpers import raises
@@ -29,9 +31,16 @@ def ids():
 
 
 def _rfq(sender, recipient, ts=None, thread_id="t1"):
-    peer = verify_registration_file(recipient.to_registration_file(name="R", endpoint="https://r.example/ace"))
-    return create_message(sender, peer, "rfq", {"need": "x"}, ThreadStateMachine(sender.get_ace_id()),
-                          thread_id=thread_id, timestamp=ts)
+    peer = verify_registration_file(create_registration_file(recipient, name="R", endpoint="https://r.example/ace"))
+    return create_message(
+        sender,
+        peer,
+        "rfq",
+        {"need": "x"},
+        ThreadStateMachine(sender.get_ace_id()),
+        thread_id=thread_id,
+        timestamp=ts,
+    )
 
 
 def test_normalize_url():
@@ -52,12 +61,16 @@ def test_register_lookup_discover(relay, ids):
     assert client.register(bob) == "registered"
     assert client.register(alice) == "refreshed"  # strictly increasing timestamps per client
     peer = client.lookup_peer(alice.get_ace_id())
-    assert peer.encryption_public_key == alice.get_encryption_public_key() and peer.source == "relay"
+    assert (
+        peer.encryption_public_key == alice.get_encryption_public_key() and peer.source == "relay"
+    )
     assert peer.profile is not None and peer.profile.name == "Alice"
     with raises("unknown_peer") as info:
         client.lookup_peer("ace:sha256:" + "0" * 64)
     assert info.value.status == 404 and info.value.relay_code == "unknown_peer"
-    relay.extra_agents.append({**relay.identities[bob.get_ace_id()], "registeredAt": 5})  # bad binding
+    relay.extra_agents.append(
+        {**relay.identities[bob.get_ace_id()], "registeredAt": 5}
+    )  # bad binding
     result = client.discover(DiscoverQuery(limit=10))
     assert {p.ace_id for p in result.agents} == {alice.get_ace_id(), bob.get_ace_id()}
     assert result.rejected == 1 and result.cursor is None
@@ -85,10 +98,16 @@ def test_send_and_fetch_inbox(relay, ids):
         client.send(env)
     client.send(envs[0])  # exact duplicate is ok
     page = client.fetch_inbox(bob, limit=2)
-    assert [e.message["messageId"] for e in page.entries] == [envs[0].message_id, envs[1].message_id]
+    assert [json.loads(e.message)["messageId"] for e in page.entries] == [
+        envs[0].message_id,
+        envs[1].message_id,
+    ]
+    assert all(isinstance(e.message, bytes) for e in page.entries)
+    assert relay.queries[-1] == ("/v1/inbox", {"limit": "2"})  # since '-' is omitted
     assert page.cursor == page.entries[-1].stream_id
     rest = client.fetch_inbox(bob, since=page.cursor)
-    assert [e.message["messageId"] for e in rest.entries] == [envs[2].message_id]
+    assert relay.queries[-1] == ("/v1/inbox", {"since": page.cursor, "limit": "100"})
+    assert [json.loads(e.message)["messageId"] for e in rest.entries] == [envs[2].message_id]
     assert client.fetch_inbox(bob, since=rest.cursor).entries == []
     with raises("not_registered"):
         client.fetch_inbox(SoftwareIdentity.generate("ed25519"))
@@ -151,13 +170,23 @@ def test_unregister_and_intents(relay, ids):
     alice, bob = ids
     client = RelayClient(relay.url)
     client.register(alice)
-    posted = client.post_intent(alice, "translate 500 words", ttl=3600, tags=["translate", "fr"],
-                                max_price="10", currency="USDC")
+    posted = client.post_intent(
+        alice,
+        "translate 500 words",
+        ttl=3600,
+        tags=["translate", "fr"],
+        max_price="10",
+        currency="USDC",
+    )
     page = client.list_intents()
     assert len(page.intents) == 1
     intent = page.intents[0]
     assert intent.intent_id == posted.intent_id and intent.from_id == alice.get_ace_id()
-    assert intent.tags == ("translate", "fr") and intent.max_price == "10" and intent.expires_at == posted.expires_at
+    assert (
+        intent.tags == ("translate", "fr")
+        and intent.max_price == "10"
+        and intent.expires_at == posted.expires_at
+    )
     client.unregister(alice)
     assert alice.get_ace_id() not in relay.identities
     with raises("not_registered"):
@@ -179,11 +208,11 @@ def test_listen_catchup_live_and_drain(relay, ids):
     entry = next(gen)
     got.append(entry)
     assert opens == [1]
-    assert entry.catchup and entry.message["messageId"] == first.message_id
+    assert entry.catchup and json.loads(entry.message)["messageId"] == first.message_id
     second = _rfq(alice, bob, thread_id="b")
     client.send(second)
     entry = next(gen)  # after the drain the client reconnects from the last stream id
-    assert entry.message["messageId"] == second.message_id
+    assert json.loads(entry.message)["messageId"] == second.message_id
     assert compare_stream_ids(entry.stream_id, got[0].stream_id) > 0
     assert relay.requests.count(("GET", "/v1/listen")) == 2
     assert opens == [1, 1]  # on_open runs again after the reconnect
@@ -216,7 +245,7 @@ def test_listen_error_thrown_at_yield_propagates(relay, ids):
     client.register(bob)
     relay.enqueue_raw(bob.get_ace_id(), {"n": 0})
     gen = client.listen(bob)
-    assert next(gen).message == {"n": 0}
+    assert json.loads(next(gen).message) == {"n": 0}
     with raises("relay_unavailable"):  # the consumer's error, not a dropped stream: no retry
         gen.throw(ACEError("relay_unavailable", "from the consumer"))
     assert relay.requests.count(("GET", "/v1/listen")) == 1
@@ -270,7 +299,7 @@ def test_listen_generator_close_closes_connection(relay, ids):
     client.register(bob)
     relay.enqueue_raw(bob.get_ace_id(), {"n": 0})
     gen = client.listen(bob)
-    assert next(gen).message == {"n": 0}
+    assert json.loads(next(gen).message) == {"n": 0}
     assert relay.open_listens == 1
     gen.close()
     _until(lambda: relay.open_listens == 0)
@@ -299,11 +328,15 @@ def test_listen_backoff_and_retry_after(relay, ids, monkeypatch):
     client.register(bob)
     sleeps = []
     monkeypatch.setattr(relay_mod, "_sleep", sleeps.append)
-    relay.inject.extend([
-        ("/v1/listen", 503, "down", {}), ("/v1/listen", 503, "down", {}),
-        ("/v1/listen", 429, "rate_limited", {"Retry-After": "7"}), ("/v1/listen", 500, "x", {}),
-        ("/v1/listen", 429, "rate_limited", {"Retry-After": "999"}),
-    ])
+    relay.inject.extend(
+        [
+            ("/v1/listen", 503, "down", {}),
+            ("/v1/listen", 503, "down", {}),
+            ("/v1/listen", 429, "rate_limited", {"Retry-After": "7"}),
+            ("/v1/listen", 500, "x", {}),
+            ("/v1/listen", 429, "rate_limited", {"Retry-After": "999"}),
+        ]
+    )
     sid = relay.enqueue_raw(bob.get_ace_id(), {"hello": 1})
     entry = next(client.listen(bob))
     assert entry.stream_id == sid
@@ -327,9 +360,13 @@ def test_listen_protocol_errors(relay, ids, monkeypatch):
     _, bob = ids
     client = RelayClient(relay.url)
     client.register(bob)
-    relay.raw_responses["/v1/listen"] = (200, b"id: 1-0\nevent: message\ndata: {bad\n\n", "text/event-stream")
-    with raises("relay_protocol_error"):
-        next(client.listen(bob))
+    # a non-JSON frame is yielded raw (the Inbox quarantines it); it never wedges the stream
+    relay.raw_responses["/v1/listen"] = (
+        200,
+        b"id: 1-0\nevent: message\ndata: {bad\n\n",
+        "text/event-stream",
+    )
+    assert next(client.listen(bob)) == relay_mod.RelayEntry("1-0", b"{bad", False)
     big = b"id: 1-0\nevent: message\ndata: " + b"x" * (relay_mod.MAX_ENVELOPE_BYTES + 600) + b"\n\n"
     relay.raw_responses["/v1/listen"] = (200, big, "text/event-stream")
     with raises("relay_protocol_error"):
@@ -345,3 +382,156 @@ def test_listen_protocol_errors(relay, ids, monkeypatch):
 def test_send_requires_message():
     with raises("invalid_argument"):
         RelayClient("https://relay.example").send({"ace": "1.0"})  # type: ignore[arg-type]
+
+
+SSE = "text/event-stream"
+
+
+def test_listen_line_endings(relay, ids):
+    _, bob = ids
+    client = RelayClient(relay.url)
+    client.register(bob)
+    for nl in (b"\r", b"\r\n", b"\n"):
+        frame = nl.join(
+            [b": hi", b"id: 1-0", b"event: catchup", b'data: {"a":', b"data: 1}", b"", b""]
+        )
+        relay.raw_responses["/v1/listen"] = (200, frame, SSE)
+        assert next(client.listen(bob)) == relay_mod.RelayEntry("1-0", b'{"a":\n1}', True)
+
+
+def test_listen_clean_eof_reconnects_immediately(relay, ids, monkeypatch):
+    _, bob = ids
+    client = RelayClient(relay.url)
+    client.register(bob)
+    sleeps = []
+    monkeypatch.setattr(relay_mod, "_sleep", sleeps.append)
+    relay.raw_responses["/v1/listen"] = [
+        (200, b"id: 1-0\nevent: message\ndata: {}\n\n", SSE),
+        (200, b"event: drain\ndata: {}\n\n", SSE),  # drain is an event frame: at once
+        (200, b"", SSE),  # ended before any event frame: a failure (backoff)
+        (200, b"id: 2-0\nevent: message\ndata: {}\n\n", SSE),
+    ]
+    gen = client.listen(bob)
+    assert [next(gen).stream_id, next(gen).stream_id] == ["1-0", "2-0"]
+    assert sleeps == [1] and relay.requests.count(("GET", "/v1/listen")) == 4
+    assert [q for p, q in relay.queries if p == "/v1/listen"][1:] == [
+        {"since": "1-0"},
+        {"since": "1-0"},
+        {"since": "1-0"},
+    ]
+
+
+def test_listen_connected_only_streams_exhaust_failures(relay, ids, monkeypatch):
+    _, bob = ids
+    client = RelayClient(relay.url)
+    client.register(bob)
+    sleeps = []
+    monkeypatch.setattr(relay_mod, "_sleep", sleeps.append)
+    # 200, `connected`, then EOF, forever: neither connected nor comments are progress
+    relay.raw_responses["/v1/listen"] = (200, b'event: connected\ndata: {}\n\n: hb\n\n', SSE)
+    with raises("relay_unavailable"):
+        next(client.listen(bob))
+    assert relay.requests.count(("GET", "/v1/listen")) == 10
+    assert sleeps == [1, 2, 4, 8, 16, 30, 30, 30, 30]
+
+
+def test_sse_dispatch_needs_data_and_id_is_per_event():
+    class R:
+        def __init__(self, b):
+            self.b = b
+
+        def read1(self, n):
+            out, self.b = self.b, b""
+            return out
+
+    frames = (
+        b"id: 1-0\nevent: message\n\n"  # no data: not dispatched
+        b"data: a\n\n"  # no id here: the earlier id does not carry over
+    )
+    with raises("relay_protocol_error"):
+        list(RelayClient._parse_sse(R(frames)))  # type: ignore[arg-type]
+    ok = b"id: 1-0\n\nid: 2-0\ndata: b\n\n"
+    assert list(RelayClient._parse_sse(R(ok))) == [  # type: ignore[arg-type]
+        relay_mod.RelayEntry("2-0", b"b", False)
+    ]
+
+
+def test_listen_any_event_resets_failures(relay, ids, monkeypatch):
+    _, bob = ids
+    client = RelayClient(relay.url)
+    client.register(bob)
+    sleeps = []
+    monkeypatch.setattr(relay_mod, "_sleep", sleeps.append)
+    relay.inject.extend([("/v1/listen", 503, "down", {})] * 9)
+    relay.raw_responses["/v1/listen"] = [
+        # a catchup frame (progress), then a drop mid-line
+        (200, b"id: 0-1\nevent: catchup\ndata: {}\n\nid: 1-", SSE),
+        (200, b"id: 1-0\nevent: message\ndata: {}\n\n", SSE),
+    ]
+    gen = client.listen(bob)
+    # 10 failures, but not consecutive
+    assert [next(gen).stream_id, next(gen).stream_id] == ["0-1", "1-0"]
+    assert sleeps == [1, 2, 4, 8, 16, 30, 30, 30, 30, 1]
+
+
+def test_http_error_mapping_wiring(relay, ids):
+    alice, bob = ids
+    client = RelayClient(relay.url)
+    client.register(alice)
+    relay.inject.append(("/v1/peer", 302, "moved", {"Retry-After": "3"}))
+    with raises("relay_protocol_error") as info:
+        client.lookup_peer(alice.get_ace_id())
+    assert info.value.status == 302 and info.value.retry_after_seconds == 3
+    relay.inject.append(("/v1/send", 429, "recipient_inbox_full", {"Retry-After": "7"}))
+    with raises("relay_rejected") as info:
+        client.send(_rfq(bob, alice))
+    assert (
+        info.value.relay_code == "recipient_inbox_full" and info.value.retry_after_seconds is None
+    )
+    relay.inject.append(("/v1/send", 429, "rate_limited", {"Retry-After": "7"}))
+    with raises("relay_unavailable") as info:
+        client.send(_rfq(bob, alice))
+    assert info.value.retry_after_seconds == 7
+
+
+def test_argument_validation_and_tags(relay, ids):
+    alice, _ = ids
+    client = RelayClient(relay.url)
+    with raises("invalid_argument"):
+        client.lookup_peer("not-an-ace-id")
+    client.discover(DiscoverQuery(tags=["a", "b"]))
+    assert relay.queries[-1] == ("/v1/discover", {"tags": "a,b"})
+    client.list_intents(tags=("x",), limit=5)
+    assert relay.queries[-1] == ("/v1/intents", {"tags": "x", "limit": "5"})
+    client.list_intents(tags=[])
+    assert relay.queries[-1] == ("/v1/intents", {})
+    for bad in ("a,b", ["a,b"], [""], [1]):
+        with raises("invalid_argument"):
+            client.list_intents(tags=bad)  # type: ignore[arg-type]
+        with raises("invalid_argument"):
+            client.discover(DiscoverQuery(tags=bad))  # type: ignore[arg-type]
+
+
+def test_list_intents_strict_entries(relay):
+    client = RelayClient(relay.url)
+    base = {
+        "intentId": "i",
+        "from": "ace:sha256:" + "0" * 64,
+        "need": "n",
+        "tags": [],
+        "ttl": 60,
+        "createdAt": 1,
+        "expiresAt": 61,
+    }
+    ok = json.dumps({"intents": [base], "cursor": None}).encode()
+    relay.raw_responses["/v1/intents"] = (200, ok, "application/json")
+    assert client.list_intents().intents[0].tags == ()
+    for bad in (
+        {k: v for k, v in base.items() if k != "tags"},
+        {**base, "maxPrice": None},
+        {**base, "currency": 5},
+    ):
+        body = json.dumps({"intents": [bad], "cursor": None}).encode()
+        relay.raw_responses["/v1/intents"] = (200, body, "application/json")
+        with raises("relay_protocol_error"):
+            client.list_intents()

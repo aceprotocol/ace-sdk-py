@@ -85,7 +85,10 @@ _KEEP = object()
 
 
 def registration_payload(enc_b64: str, sig_b64: str, scheme: str, profile: object = _KEEP) -> bytes:
-    """The ``register-request`` payload (02). ``profile``: _KEEP, None, or a validated AgentProfile."""
+    """The ``register-request`` payload (02).
+
+    ``profile``: _KEEP, None, or a validated AgentProfile.
+    """
     fields = (enc_b64, sig_b64, scheme)
     if profile is _KEEP:
         return encode_payload(*fields, "keep")
@@ -94,32 +97,52 @@ def registration_payload(enc_b64: str, sig_b64: str, scheme: str, profile: objec
     assert isinstance(profile, AgentProfile)
     pr = profile.pricing
     return encode_payload(
-        *fields, "replace", profile.name or "", profile.description or "", profile.image or "",
-        encode_payload(*(profile.tags or [])), encode_payload(*(profile.capabilities or [])),
-        encode_payload(*(profile.chains or [])), profile.endpoint or "",
-        "present" if pr else "absent", pr.currency if pr else "", (pr.max_amount or "") if pr else "",
+        *fields,
+        "replace",
+        profile.name or "",
+        profile.description or "",
+        profile.image or "",
+        encode_payload(*(profile.tags or [])),
+        encode_payload(*(profile.capabilities or [])),
+        encode_payload(*(profile.chains or [])),
+        profile.endpoint or "",
+        "present" if pr else "absent",
+        pr.currency if pr else "",
+        (pr.max_amount or "") if pr else "",
     )
 
 
 def create_registration_request(
-    identity: ACEIdentity, profile: AgentProfile | dict | None | object = _KEEP, timestamp: int | None = None,
+    identity: ACEIdentity,
+    profile: AgentProfile | dict | None | object = _KEEP,
+    timestamp: int | None = None,
 ) -> RegistrationRequest:
     """Build a ``POST /v1/register`` body. Omitted profile keeps it; ``None`` removes it."""
     ts = unix_now(None) if timestamp is None else timestamp
     check_wire_int(ts, "timestamp")
     enc = identity.get_encryption_public_key()
     if not isinstance(enc, (bytes, bytearray)) or len(enc) != KEM_PUBLIC_KEY_SIZE:
-        raise ACEError("invalid_key", f"identity encryption public key must be {KEM_PUBLIC_KEY_SIZE} bytes")
-    snapshot = profile if profile is _KEEP or profile is None else validate_profile(copy.deepcopy(profile))  # type: ignore[arg-type]
+        raise ACEError(
+            "invalid_key", f"identity encryption public key must be {KEM_PUBLIC_KEY_SIZE} bytes"
+        )
+    snapshot = (
+        profile if profile is _KEEP or profile is None else validate_profile(copy.deepcopy(profile))
+    )  # type: ignore[arg-type]
     epk, spk = to_base64(enc), to_base64(identity.get_signing_public_key())
     ace_id, scheme = identity.get_ace_id(), identity.get_signing_scheme()
     signature = identity.sign(binding_sign_data(ace_id, ts, epk, spk))
     authorization = identity.sign(
-        build_sign_data("register-request", ace_id, ts, registration_payload(epk, spk, scheme, snapshot))
+        build_sign_data(
+            "register-request", ace_id, ts, registration_payload(epk, spk, scheme, snapshot)
+        )
     )
     result: RegistrationRequest = {
-        "aceId": ace_id, "encryptionPublicKey": epk, "signingPublicKey": spk, "scheme": scheme,
-        "timestamp": ts, "signature": encode_signature(signature, scheme),
+        "aceId": ace_id,
+        "encryptionPublicKey": epk,
+        "signingPublicKey": spk,
+        "scheme": scheme,
+        "timestamp": ts,
+        "signature": encode_signature(signature, scheme),
         "authorization": encode_signature(authorization, scheme),
     }
     if snapshot is not _KEEP:
@@ -134,13 +157,17 @@ class VerifiedRegistration(NamedTuple):
 
 
 def verify_registration_request(
-    body: object, *, clock: Callable[[], int] | None = None, window_seconds: int = TIMESTAMP_WINDOW_SECONDS,
+    body: object,
+    *,
+    clock: Callable[[], int] | None = None,
+    window_seconds: int = TIMESTAMP_WINDOW_SECONDS,
 ) -> VerifiedRegistration:
     """Verify a registration request. Check order (first failure wins):
 
     schema -> ``invalid_registration``; freshness -> ``stale_timestamp``; ID hash ->
     ``invalid_registration``; signing/encryption key -> ``invalid_key``; profile ->
-    ``invalid_profile``; binding -> ``invalid_signature``; authorization -> ``invalid_authorization``.
+    ``invalid_profile``; binding -> ``invalid_signature``; authorization ->
+    ``invalid_authorization``.
     ``request_digest`` is hex SHA-256 of the ``register-request`` signData.
     """
     check_wire_int(window_seconds, "window_seconds")
@@ -173,17 +200,30 @@ def verify_registration_request(
     if not verify_signature(binding_sign_data(ace_id, ts, epk, spk), sig, scheme, signing_key):  # type: ignore[arg-type]
         raise ACEError("invalid_signature", "registration binding signature does not verify")
     snapshot = profile if has_profile else _KEEP
-    request_sign_data = build_sign_data("register-request", ace_id, ts, registration_payload(epk, spk, scheme, snapshot))  # type: ignore[arg-type]
+    request_sign_data = build_sign_data(
+        "register-request", ace_id, ts, registration_payload(epk, spk, scheme, snapshot)
+    )  # type: ignore[arg-type]
     if not verify_signature(request_sign_data, auth, scheme, signing_key):  # type: ignore[arg-type]
         raise ACEError("invalid_authorization", "registration authorization does not verify")
     request: RegistrationRequest = {
-        "aceId": ace_id, "encryptionPublicKey": epk, "signingPublicKey": spk, "scheme": scheme,  # type: ignore[typeddict-item]
-        "timestamp": ts, "signature": body["signature"], "authorization": body["authorization"],
+        "aceId": ace_id,
+        "encryptionPublicKey": epk,
+        "signingPublicKey": spk,
+        "scheme": scheme,  # type: ignore[typeddict-item]
+        "timestamp": ts,
+        "signature": body["signature"],
+        "authorization": body["authorization"],
     }
     if has_profile:
         request["profile"] = None if profile is None else profile.to_dict()
     peer = _make_peer(
-        ace_id=ace_id, scheme=scheme, signing_public_key=signing_key, encryption_public_key=enc_key,
-        registered_at=ts, registration_signature=body["signature"], source="relay", profile=profile,
+        ace_id=ace_id,
+        scheme=scheme,
+        signing_public_key=signing_key,
+        encryption_public_key=enc_key,
+        registered_at=ts,
+        registration_signature=body["signature"],
+        source="relay",
+        profile=profile,
     )
     return VerifiedRegistration(request, peer, hashlib.sha256(request_sign_data).hexdigest())

@@ -35,8 +35,9 @@ class FakeRelay:
         self.inject: list[tuple[str, int, str, dict]] = []  # (path, status, code, headers)
         self.drain_after: int | None = None
         self.requests: list[tuple[str, str]] = []
+        self.queries: list[tuple[str, dict]] = []  # (path, query) per request
         self.auth_timestamps: list[int] = []
-        self.raw_responses: dict[str, tuple[int, bytes, str]] = {}
+        self.raw_responses: dict[str, tuple[int, bytes, str] | list[tuple[int, bytes, str]]] = {}
         self._seq = 0
         self.cond = threading.Condition()
         self.stopping = False
@@ -96,8 +97,14 @@ class FakeRelay:
             raise _HTTPError(403, "not_registered")
         from ace import from_base64
         try:
-            verify_auth_headers(auth, req, ace_id=auth.ace_id, scheme=ident["scheme"],
-                                signing_public_key=from_base64(ident["signingPublicKey"]), clock=self.clock)
+            verify_auth_headers(
+                auth,
+                req,
+                ace_id=auth.ace_id,
+                scheme=ident["scheme"],
+                signing_public_key=from_base64(ident["signingPublicKey"]),
+                clock=self.clock,
+            )
         except ACEError as exc:
             raise _HTTPError(401 if exc.code == "invalid_signature" else 400, exc.code) from None
         key = (req.action, auth.ace_id, auth.signature)
@@ -114,6 +121,7 @@ class FakeRelay:
         def k(s):
             a, b = s.split("-")
             return (int(a), int(b))
+
         entries = self.streams.get(ace_id, [])
         if since == "-":
             return list(entries)
@@ -133,12 +141,16 @@ class FakeRelay:
         path = parsed.path
         query = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
         self.requests.append((method, path))
+        self.queries.append((path, query))
         for i, (p, status, code, headers) in enumerate(self.inject):
             if p == path:
                 del self.inject[i]
                 return self._error(h, status, code, headers)
         if path in self.raw_responses:
-            status, body, ctype = self.raw_responses[path]
+            raw_spec = self.raw_responses[path]
+            if isinstance(raw_spec, list):  # a sequence: one per request, the last one repeats
+                raw_spec = raw_spec.pop(0) if len(raw_spec) > 1 else raw_spec[0]
+            status, body, ctype = raw_spec
             h.send_response(status)
             h.send_header("Content-Type", ctype)
             h.send_header("Content-Length", str(len(body)))
@@ -163,8 +175,11 @@ class FakeRelay:
         req = reg.request
         prev = self.identities.get(req["aceId"])
         record = {
-            "aceId": req["aceId"], "scheme": req["scheme"], "encryptionPublicKey": req["encryptionPublicKey"],
-            "signingPublicKey": req["signingPublicKey"], "registrationSignature": req["signature"],
+            "aceId": req["aceId"],
+            "scheme": req["scheme"],
+            "encryptionPublicKey": req["encryptionPublicKey"],
+            "signingPublicKey": req["signingPublicKey"],
+            "registrationSignature": req["signature"],
             "registeredAt": req["timestamp"],
         }
         profile = req.get("profile", prev.get("profile") if prev else None)
@@ -195,8 +210,11 @@ class FakeRelay:
         self._reply(h, 200, rec)
 
     def _get_v1_discover(self, h, query, body):
-        agents = [r for r in self.identities.values()
-                  if not query.get("q") or query["q"].lower() in json.dumps(r.get("profile", {})).lower()]
+        agents = [
+            r
+            for r in self.identities.values()
+            if not query.get("q") or query["q"].lower() in json.dumps(r.get("profile", {})).lower()
+        ]
         self._reply(h, 200, {"agents": agents + self.extra_agents, "cursor": None})
 
     def _post_v1_send(self, h, query, body):
@@ -212,8 +230,13 @@ class FakeRelay:
         if env.to_id not in self.identities:
             raise _HTTPError(404, "unknown_peer")
         from ace import from_base64
+
         try:
-            verify_envelope_signature(env, scheme=sender["scheme"], signing_public_key=from_base64(sender["signingPublicKey"]))
+            verify_envelope_signature(
+                env,
+                scheme=sender["scheme"],
+                signing_public_key=from_base64(sender["signingPublicKey"]),
+            )
         except ACEError:
             raise _HTTPError(401, "invalid_signature") from None
         fp = envelope_fingerprint(env)
@@ -234,8 +257,14 @@ class FakeRelay:
         ace_id = self._auth(h, RelayAuthRequest.inbox(since, limit))
         with self.cond:
             entries = self._after(ace_id, since)[:limit]
-        self._reply(h, 200, {"messages": [{"streamId": s, "message": m} for s, m in entries],
-                             "cursor": entries[-1][0] if entries else None})
+        self._reply(
+            h,
+            200,
+            {
+                "messages": [{"streamId": s, "message": m} for s, m in entries],
+                "cursor": entries[-1][0] if entries else None,
+            },
+        )
 
     def _get_v1_listen(self, h, query, body):
         since = query.get("since", "-")
@@ -283,7 +312,10 @@ class FakeRelay:
                     frame("event: drain\ndata: {}\n\n")
                     return
                 try:
-                    frame(f"id: {sid}\nevent: {'catchup' if catchup else 'message'}\ndata: {json.dumps(msg)}\n\n")
+                    frame(
+                        f"id: {sid}\nevent: {'catchup' if catchup else 'message'}\n"
+                        f"data: {json.dumps(msg)}\n\n"
+                    )
                 except OSError:
                     return
                 sent += 1
@@ -291,12 +323,24 @@ class FakeRelay:
             catchup = False
 
     def _post_v1_intents(self, h, query, body):
-        req = RelayAuthRequest.intent(body["need"], body.get("tags") or (), body.get("maxPrice"),
-                                      body.get("currency"), wire_int(body["ttl"]))
+        req = RelayAuthRequest.intent(
+            body["need"],
+            body.get("tags") or (),
+            body.get("maxPrice"),
+            body.get("currency"),
+            wire_int(body["ttl"]),
+        )
         ace_id = self._auth(h, req)
         now = self.clock()
-        intent = {"intentId": str(uuid.uuid4()), "from": ace_id, "need": body["need"], "tags": body.get("tags") or [],
-                  "ttl": body["ttl"], "createdAt": now, "expiresAt": now + body["ttl"]}
+        intent = {
+            "intentId": str(uuid.uuid4()),
+            "from": ace_id,
+            "need": body["need"],
+            "tags": body.get("tags") or [],
+            "ttl": body["ttl"],
+            "createdAt": now,
+            "expiresAt": now + body["ttl"],
+        }
         for k in ("maxPrice", "currency"):
             if body.get(k) is not None:
                 intent[k] = body[k]
@@ -308,13 +352,21 @@ class FakeRelay:
 
     def _put_v1_webhook(self, h, query, body):
         ace_id = self._auth(h, RelayAuthRequest.webhook("PUT", body["url"], body["secret"]))
-        self.webhooks[ace_id] = {"url": body["url"], "secret": body["secret"], "updatedAt": self.clock()}
+        self.webhooks[ace_id] = {
+            "url": body["url"],
+            "secret": body["secret"],
+            "updatedAt": self.clock(),
+        }
         self._reply(h, 200, {"ok": True})
 
     def _get_v1_webhook(self, h, query, body):
         ace_id = self._auth(h, RelayAuthRequest.webhook("GET"))
         w = self.webhooks.get(ace_id)
-        out = None if w is None else {"url": w["url"], "status": "active", "failures": 0, "updatedAt": w["updatedAt"]}
+        out = (
+            None
+            if w is None
+            else {"url": w["url"], "status": "active", "failures": 0, "updatedAt": w["updatedAt"]}
+        )
         self._reply(h, 200, {"webhook": out})
 
     def _delete_v1_webhook(self, h, query, body):

@@ -58,18 +58,48 @@ def receive_one(agent: Agent, client: RelayClient):
 def test_full_deal_rfq_to_confirm(world):
     clock, relay, client, alice, bob = world
     t = "deal-42"
-    rfq = send(alice, client, bob, "rfq", {"need": "Translate 500 words EN→FR", "maxPrice": "10", "currency": "USDC"}, t)
+    rfq = send(
+        alice,
+        client,
+        bob,
+        "rfq",
+        {"need": "Translate 500 words EN→FR", "maxPrice": "10", "currency": "USDC"},
+        t,
+    )
     m = receive_one(bob, client)
     assert m.type == "rfq" and m.body["need"].endswith("EN→FR") and m.message_id == rfq.message_id
     offer = send(bob, client, alice, "offer", {"price": "8", "currency": "USDC"}, t)
     assert receive_one(alice, client).type == "offer"
     send(alice, client, bob, "accept", {"offerId": offer.message_id}, t)
     assert receive_one(bob, client).type == "accept"
-    invoice = send(bob, client, alice, "invoice", {"offerId": offer.message_id, "amount": "8", "currency": "USDC",
-                                                   "settlementMethod": "solana-spl"}, t)
+    invoice = send(
+        bob,
+        client,
+        alice,
+        "invoice",
+        {
+            "offerId": offer.message_id,
+            "amount": "8",
+            "currency": "USDC",
+            "settlementMethod": "solana-spl",
+        },
+        t,
+    )
     assert receive_one(alice, client).type == "invoice"
-    send(alice, client, bob, "receipt", {"referenceId": invoice.message_id, "amount": "8", "currency": "USDC",
-                                         "settlementMethod": "solana-spl", "proof": {"tx": "abc"}}, t)
+    send(
+        alice,
+        client,
+        bob,
+        "receipt",
+        {
+            "referenceId": invoice.message_id,
+            "amount": "8",
+            "currency": "USDC",
+            "settlementMethod": "solana-spl",
+            "proof": {"tx": "abc"},
+        },
+        t,
+    )
     assert receive_one(bob, client).type == "receipt"
     deliver = send(bob, client, alice, "deliver", {"type": "inline", "content": "Bonjour"}, t)
     assert receive_one(alice, client).body["content"] == "Bonjour"
@@ -140,7 +170,11 @@ def test_follow_yields_initial_pull_then_live_with_on_live(world):
         try:
             for o in bob.inbox.follow(client, stop=stop, on_live=on_live):
                 m = o.message
-                events.append(f"{m.type}:{m.body.get('message', m.body.get('need'))}" if o.kind == "delivered" else o.kind)
+                events.append(
+                    f"{m.type}:{m.body.get('message', m.body.get('need'))}"
+                    if o.kind == "delivered"
+                    else o.kind
+                )
                 if o.kind == "delivered" and m.type == "rfq":
                     relay.drain_after = 0  # the next event drains the stream: a reconnect
                     send(alice, client, bob, "text", {"message": "after"}, None)
@@ -173,10 +207,23 @@ def test_role_violation_is_quarantined(world):
     rfq = send(alice, client, bob, "rfq", {"need": "x"}, "d")
     receive_one(bob, client)
     # alice forges a seller move (offer) on a thread where she is the buyer
-    fake = ThreadSnapshot(rfq.conversation_id, "d", alice.id, bob.id, "rfq",
-                          (ThreadHistoryEntry("rfq", rfq.message_id, rfq.timestamp, bob.id),))
-    env = create_message(alice.identity, alice.peers.get(bob.id), "offer", {"price": "1", "currency": "USDC"},
-                         ThreadStateMachine.from_state([fake], alice.id), thread_id="d", timestamp=clock.t)
+    fake = ThreadSnapshot(
+        rfq.conversation_id,
+        "d",
+        alice.id,
+        bob.id,
+        "rfq",
+        (ThreadHistoryEntry("rfq", rfq.message_id, rfq.timestamp, bob.id),),
+    )
+    env = create_message(
+        alice.identity,
+        alice.peers.get(bob.id),
+        "offer",
+        {"price": "1", "currency": "USDC"},
+        ThreadStateMachine.from_state([fake], alice.id),
+        thread_id="d",
+        timestamp=clock.t,
+    )
     client.send(env)
     result = bob.inbox.pull(client)
     assert [o.kind for o in result.outcomes] == ["quarantined"] and result.blocked is None

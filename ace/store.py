@@ -16,7 +16,7 @@ from ._encoding import canonical_state_bytes, wire_int
 from .errors import ACEError
 
 KEY_RE = re.compile(r"[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*")
-LOCK_NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]*")
+LOCK_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")  # 06-security § Appendix A
 MAX_KEY_LENGTH = 200
 MAX_VALUE_BYTES = 64 * 1024 * 1024
 _STALE_LOCK_SECONDS = 60
@@ -33,9 +33,10 @@ class ACEStore(Protocol):
     - ``list(prefix)`` returns the keys starting with ``prefix``, sorted ascending.
     - ``lock(name, timeout)`` returns a context manager holding an exclusive,
       non-reentrant lock from ``__enter__`` (or earlier) until ``__exit__``. A timeout is
-      ``receiver_busy`` for the ``receive`` lock and ``storage_failed`` otherwise.
+      ``receiver_busy`` for the ``receive`` lock and ``lock_busy`` otherwise.
 
-    Keys match ``^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$`` (at most 200 characters).
+    Keys match ``^[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$`` (at most 200 characters),
+    lock names ``^[a-z0-9][a-z0-9_-]{0,63}$``. A value over 64 MiB is ``invalid_argument``.
     Every I/O failure is ``ACEError(storage_failed)``.
     """
 
@@ -53,7 +54,7 @@ def check_key(key: object) -> str:
 
 
 def _check_lock_args(name: object, timeout: object) -> tuple[str, float]:
-    if not isinstance(name, str) or LOCK_NAME_RE.fullmatch(name) is None or len(name) > 64:
+    if not isinstance(name, str) or LOCK_NAME_RE.fullmatch(name) is None:
         raise ACEError("invalid_argument", f"invalid lock name {str(name)[:64]!r}")
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not timeout >= 0:
         raise ACEError("invalid_argument", "timeout must be a non-negative number")
@@ -63,7 +64,7 @@ def _check_lock_args(name: object, timeout: object) -> tuple[str, float]:
 def _busy(name: str) -> ACEError:
     if name == "receive":
         return ACEError("receiver_busy", "another receiver holds the receive lock")
-    return ACEError("storage_failed", f"timed out waiting for lock {name!r}")
+    return ACEError("lock_busy", f"timed out waiting for lock {name!r}")
 
 
 def _check_value(value: object) -> bytes:
@@ -71,7 +72,7 @@ def _check_value(value: object) -> bytes:
         raise ACEError("invalid_argument", "store values must be bytes")
     data = bytes(value)
     if len(data) > MAX_VALUE_BYTES:
-        raise ACEError("storage_failed", "value exceeds 64 MiB")
+        raise ACEError("invalid_argument", "value exceeds 64 MiB")
     return data
 
 
@@ -205,7 +206,9 @@ class FileStore:
             except FileNotFoundError:
                 return False
             if not stat.S_ISDIR(st.st_mode):
-                raise ACEError("storage_failed", f"{part!r} is not a directory (symlinks are refused)")
+                raise ACEError(
+                    "storage_failed", f"{part!r} is not a directory (symlinks are refused)"
+                )
         return True
 
     def _ensure_dir(self, rel_parts: list[str]) -> str:
@@ -219,7 +222,9 @@ class FileStore:
                 pass
             st = os.lstat(path)
             if not stat.S_ISDIR(st.st_mode):
-                raise ACEError("storage_failed", f"{part!r} is not a directory (symlinks are refused)")
+                raise ACEError(
+                    "storage_failed", f"{part!r} is not a directory (symlinks are refused)"
+                )
         return path
 
     @staticmethod
@@ -346,7 +351,11 @@ class FileStore:
                             if (key + "/").startswith(prefix) or prefix.startswith(key + "/"):
                                 stack.append((entry.path, rel))
                         elif entry.is_file(follow_symlinks=False):
-                            if key.startswith(prefix) and len(key) <= MAX_KEY_LENGTH and KEY_RE.fullmatch(key):
+                            if (
+                                key.startswith(prefix)
+                                and len(key) <= MAX_KEY_LENGTH
+                                and KEY_RE.fullmatch(key)
+                            ):
                                 out.append(key)
         except OSError as exc:
             raise _io_error(f"list {prefix}", exc) from None
@@ -383,7 +392,9 @@ class FileStore:
         except OSError as exc:
             raise _io_error("create locks directory", exc) from None
         path = self._lock_path(name)
-        content = canonical_state_bytes({"createdAt": int(time.time()), "host": self._host, "pid": os.getpid()})
+        content = canonical_state_bytes(
+            {"createdAt": int(time.time()), "host": self._host, "pid": os.getpid()}
+        )
         while True:
             try:
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -392,7 +403,9 @@ class FileStore:
                     continue
                 if time.monotonic() >= deadline:
                     raise _busy(name) from None
-                time.sleep(min(_POLL_SECONDS, max(0.0, deadline - time.monotonic())) or _POLL_SECONDS)
+                time.sleep(
+                    min(_POLL_SECONDS, max(0.0, deadline - time.monotonic())) or _POLL_SECONDS
+                )
                 continue
             except OSError as exc:
                 raise _io_error(f"create lock {name}", exc) from None
@@ -457,6 +470,7 @@ class FileStore:
 
 
 # --- JSON records -----------------------------------------------------------------------
+
 
 def write_record(store: ACEStore, key: str, obj: dict) -> None:
     """Write ``obj`` as a ``version: 1`` record (compact UTF-8, sorted keys, non-ASCII and

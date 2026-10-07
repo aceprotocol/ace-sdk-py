@@ -50,7 +50,12 @@ class PendingSend:
         if not isinstance(d, dict):
             raise bad
         rid, status, staged = d.get("requestId"), d.get("status"), wire_int(d.get("stagedAt"))
-        if not isinstance(rid, str) or not rid or status not in ("pending", "expired") or staged is None:
+        if (
+            not isinstance(rid, str)
+            or not rid
+            or status not in ("pending", "expired")
+            or staged is None
+        ):
             raise bad
         try:
             message = decode_envelope(d.get("message"))
@@ -90,7 +95,9 @@ def _index_entry(record_key: str) -> str:
     return record_key[: -len(".json")]
 
 
-def snapshot_from_dict(d: object, local_ace_id: str, code: str = "storage_failed") -> ThreadSnapshot:
+def snapshot_from_dict(
+    d: object, local_ace_id: str, code: str = "storage_failed"
+) -> ThreadSnapshot:
     """Parse and replay-validate a snapshot (``ThreadStateMachine.from_state``)."""
     try:
         snap = ThreadSnapshot.from_dict(d)
@@ -100,7 +107,9 @@ def snapshot_from_dict(d: object, local_ace_id: str, code: str = "storage_failed
     return snap
 
 
-def rebuild_snapshot(base: ThreadSnapshot, history: list[ThreadHistoryEntry]) -> ThreadSnapshot | None:
+def rebuild_snapshot(
+    base: ThreadSnapshot, history: list[ThreadHistoryEntry]
+) -> ThreadSnapshot | None:
     """Re-derive the state of ``history`` (no references: bodies are not stored).
 
     Returns ``None`` for an empty history; an invalid history is ``storage_failed``.
@@ -113,7 +122,14 @@ def rebuild_snapshot(base: ThreadSnapshot, history: list[ThreadHistoryEntry]) ->
         if rule is None:
             raise ACEError("storage_failed", "thread history does not replay")
         state = rule[0]
-    snap = ThreadSnapshot(base.conversation_id, base.thread_id, base.local_ace_id, base.peer_ace_id, state, tuple(history))
+    snap = ThreadSnapshot(
+        base.conversation_id,
+        base.thread_id,
+        base.local_ace_id,
+        base.peer_ace_id,
+        state,
+        tuple(history),
+    )
     return snapshot_from_dict(snap.to_dict(), base.local_ace_id)
 
 
@@ -131,7 +147,9 @@ class ThreadStore:
     extra entries, which are reconciled when the bound is reached.
     """
 
-    def __init__(self, store: ACEStore, local_ace_id: str, *, clock: Callable[[], int] | None = None) -> None:
+    def __init__(
+        self, store: ACEStore, local_ace_id: str, *, clock: Callable[[], int] | None = None
+    ) -> None:
         if not is_ace_id(local_ace_id):
             raise ACEError("invalid_argument", "local_ace_id must be an ACE ID")
         self._store = store
@@ -142,15 +160,17 @@ class ThreadStore:
     # --- public ---
 
     def get(self, conversation_id: str, thread_id: str) -> ThreadSnapshot | None:
-        rec = self.load(conversation_id, thread_id)
+        rec = self._load(conversation_id, thread_id)
         return rec.snapshot if rec else None
 
     def list(self) -> list[ThreadSnapshot]:
-        snaps = [self._load_key(k).snapshot for k in self._store.list("threads/") if _is_record_key(k)]
+        snaps = [
+            self._load_key(k).snapshot for k in self._store.list("threads/") if _is_record_key(k)
+        ]
         return sorted(snaps, key=lambda s: (s.conversation_id, s.thread_id))
 
     def remove(self, conversation_id: str, thread_id: str) -> bool:
-        with self.locked():
+        with self._locked():
             key = thread_key(conversation_id, thread_id)
             if self._store.read(key) is None:
                 return False
@@ -164,15 +184,15 @@ class ThreadStore:
             return True
 
     def allowed_types(self, conversation_id: str, thread_id: str, sender_ace_id: str) -> list[str]:
-        machine, _ = self.machine(conversation_id, thread_id)
+        machine, _ = self._machine(conversation_id, thread_id)
         return machine.allowed_types(conversation_id, thread_id, sender_ace_id)
 
-    # --- internal (Inbox / Outbox) ---
+    # --- internal (Inbox / Outbox; not part of the public API) ---
 
-    def locked(self, timeout: float = 10.0):
+    def _locked(self, timeout: float = 10.0):
         return self._store.lock("threads", timeout)
 
-    def load(self, conversation_id: str, thread_id: str) -> ThreadRecord | None:
+    def _load(self, conversation_id: str, thread_id: str) -> ThreadRecord | None:
         key = thread_key(conversation_id, thread_id)
         d = load_record(self._store, key)
         if d is None:
@@ -195,34 +215,38 @@ class ThreadStore:
         pending = None if d.get("pending") is None else PendingSend.from_dict(d["pending"])
         return ThreadRecord(snap, pending)
 
-    def machine(self, conversation_id: str, thread_id: str) -> tuple[ThreadStateMachine, ThreadRecord | None]:
-        rec = self.load(conversation_id, thread_id)
+    def _machine(
+        self, conversation_id: str, thread_id: str
+    ) -> tuple[ThreadStateMachine, ThreadRecord | None]:
+        rec = self._load(conversation_id, thread_id)
         snaps = [rec.snapshot] if rec else []
         try:
             return ThreadStateMachine.from_state(snaps, self.local_ace_id), rec
         except ACEError as exc:
             raise ACEError("storage_failed", exc.message) from None
 
-    def save(self, record: ThreadRecord) -> None:
+    def _save(self, record: ThreadRecord) -> None:
         snap = record.snapshot
         key = thread_key(snap.conversation_id, snap.thread_id)
         is_open = snap.state not in TERMINAL_STATES
         if is_open:
-            self._set_open(snap.peer_ace_id, key, True)  # index first: a crash leaves only an extra entry
+            self._set_open(
+                snap.peer_ace_id, key, True
+            )  # index first: a crash leaves only an extra entry
         write_record(self._store, key, record.to_dict())
         if not is_open:
             self._set_open(snap.peer_ace_id, key, False)
         self._maybe_prune()
 
-    def delete(self, snapshot: ThreadSnapshot) -> None:
+    def _delete(self, snapshot: ThreadSnapshot) -> None:
         key = thread_key(snapshot.conversation_id, snapshot.thread_id)
         self._store.delete(key)
         self._set_open(snapshot.peer_ace_id, key, False)
 
-    def records(self) -> list[ThreadRecord]:
+    def _records(self) -> list[ThreadRecord]:
         return [self._load_key(k) for k in self._store.list("threads/") if _is_record_key(k)]
 
-    def open_thread_count(self, peer_ace_id: str) -> int:
+    def _open_thread_count(self, peer_ace_id: str) -> int:
         """Non-terminal threads held with ``peer_ace_id`` (caller holds the lock). At the bound
         the index is reconciled against the records first, dropping stale entries."""
         entries = self._read_index(peer_ace_id)
@@ -244,11 +268,14 @@ class ThreadStore:
             self._write_index(peer_ace_id, live)
         return len(live)
 
-    def check_can_open(self, peer_ace_id: str) -> None:
+    def _check_can_open(self, peer_ace_id: str) -> None:
         """``limit_exceeded`` if a new thread with ``peer_ace_id`` would exceed
         ``MAX_OPEN_THREADS_PER_PEER`` (caller holds the lock)."""
-        if self.open_thread_count(peer_ace_id) >= MAX_OPEN_THREADS_PER_PEER:
-            raise ACEError("limit_exceeded", f"open thread limit {MAX_OPEN_THREADS_PER_PEER} reached for this peer")
+        if self._open_thread_count(peer_ace_id) >= MAX_OPEN_THREADS_PER_PEER:
+            raise ACEError(
+                "limit_exceeded",
+                f"open thread limit {MAX_OPEN_THREADS_PER_PEER} reached for this peer",
+            )
 
     def _read_index(self, peer_ace_id: str) -> list[str]:
         key = thread_index_key(peer_ace_id)
@@ -256,7 +283,9 @@ class ThreadStore:
         if d is None:
             return []
         entries = d.get("open")
-        if not isinstance(entries, list) or not all(isinstance(e, str) and e.startswith("threads/") for e in entries):
+        if not isinstance(entries, list) or not all(
+            isinstance(e, str) and e.startswith("threads/") for e in entries
+        ):
             raise ACEError("storage_failed", f"{key}: invalid open-thread index")
         return entries
 
@@ -291,5 +320,7 @@ class ThreadStore:
             if rec.pending is not None or snap.history[-1].timestamp >= cutoff:
                 continue
             # terminal, or non-terminal with no local entry (no local obligation exists)
-            if snap.state in TERMINAL_STATES or all(h.from_id != self.local_ace_id for h in snap.history):
-                self.delete(snap)
+            if snap.state in TERMINAL_STATES or all(
+                h.from_id != self.local_ace_id for h in snap.history
+            ):
+                self._delete(snap)

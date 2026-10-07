@@ -45,12 +45,27 @@ _SCHEMAS: dict[str, tuple[tuple[str, str], ...]] = {
     "offer": (("price", _STR), ("currency", _STR), ("terms", _OPT_STR), ("ttl", _OPT_TTL)),
     "accept": (("offerId", _STR),),
     "reject": (("reason", _OPT_STR),),
-    "invoice": (("offerId", _STR), ("amount", _STR), ("currency", _STR), ("settlementMethod", _STR),
-                ("settlementDetails", _OPT_OBJ)),
-    "receipt": (("referenceId", _STR), ("amount", _STR), ("currency", _STR), ("settlementMethod", _STR),
-                ("proof", _OBJ)),
-    "deliver": (("type", _STR), ("content", _OPT_STR), ("contentType", _OPT_STR), ("uri", _OPT_STR),
-                ("metadata", _OPT_OBJ)),
+    "invoice": (
+        ("offerId", _STR),
+        ("amount", _STR),
+        ("currency", _STR),
+        ("settlementMethod", _STR),
+        ("settlementDetails", _OPT_OBJ),
+    ),
+    "receipt": (
+        ("referenceId", _STR),
+        ("amount", _STR),
+        ("currency", _STR),
+        ("settlementMethod", _STR),
+        ("proof", _OBJ),
+    ),
+    "deliver": (
+        ("type", _STR),
+        ("content", _OPT_STR),
+        ("contentType", _OPT_STR),
+        ("uri", _OPT_STR),
+        ("metadata", _OPT_OBJ),
+    ),
     "confirm": (("deliverId", _STR), ("message", _OPT_STR)),
     "info": (("message", _STR),),
     "text": (("message", _STR),),
@@ -73,8 +88,10 @@ def validate_body(type_: MessageType, body: dict) -> None:
                 raise ACEError("invalid_body", f"{type_}.{name} is required")
             continue
         ok = (
-            isinstance(v, str) if kind in (_STR, _OPT_STR)
-            else type(v) is dict if kind in (_OBJ, _OPT_OBJ)
+            isinstance(v, str)
+            if kind in (_STR, _OPT_STR)
+            else type(v) is dict
+            if kind in (_OBJ, _OPT_OBJ)
             else wire_int(v) is not None
         )
         if not ok:
@@ -97,12 +114,21 @@ def decode_body(type_: MessageType, raw: bytes) -> dict:
 
 # --- helpers ----------------------------------------------------------------------
 
+
 def _event(env: ACEMessage) -> ThreadEvent:
-    return ThreadEvent(env.conversation_id, env.thread_id, env.type, env.message_id, env.timestamp,
-                       env.from_id, env.to_id)
+    return ThreadEvent(
+        env.conversation_id,
+        env.thread_id,
+        env.type,
+        env.message_id,
+        env.timestamp,
+        env.from_id,
+        env.to_id,
+    )
 
 
 # --- create -----------------------------------------------------------------------
+
 
 def create_message(
     sender: ACEIdentity,
@@ -114,7 +140,7 @@ def create_message(
     thread_id: str | None = None,
     timestamp: int | None = None,
 ) -> ACEMessage:
-    """Encrypt, sign and record an outbound message (design §2.5 order)."""
+    """Encrypt, sign and record an outbound message."""
     if not isinstance(recipient, VerifiedPeer):
         raise ACEError("invalid_argument", "recipient must be a VerifiedPeer")
     if not isinstance(threads, ThreadStateMachine):
@@ -123,7 +149,9 @@ def create_message(
     if not is_message_type(type_):
         raise ACEError("invalid_argument", "unknown message type")
     if thread_id is not None and not is_thread_id(thread_id):
-        raise ACEError("invalid_argument", "thread_id must be 1..256 code points without control characters")
+        raise ACEError(
+            "invalid_argument", "thread_id must be 1..256 code points without control characters"
+        )
     if thread_id is None and is_economic_type(type_):
         raise ACEError("invalid_argument", "economic messages require thread_id")
     from_id = sender.get_ace_id()
@@ -137,9 +165,13 @@ def create_message(
     check_json_value(body)
     validate_body(type_, body)
     # 3. conversation
-    conversation_id = compute_conversation_id(sender.get_encryption_public_key(), recipient.encryption_public_key)
+    conversation_id = compute_conversation_id(
+        sender.get_encryption_public_key(), recipient.encryption_public_key
+    )
     message_id = str(uuid.uuid4())
-    event = ThreadEvent(conversation_id, thread_id, type_, message_id, ts, from_id, recipient.ace_id)
+    event = ThreadEvent(
+        conversation_id, thread_id, type_, message_id, ts, from_id, recipient.ace_id
+    )
     # 4. state machine pre-check
     threads.check(event, body)
     # 5. serialize
@@ -150,10 +182,16 @@ def create_message(
     kem_ciphertext, payload = encrypt(plaintext, recipient.encryption_public_key, conversation_id)
     scheme = sender.get_signing_scheme()
     env = ACEMessage(
-        ace="1.0", message_id=message_id, from_id=from_id, to_id=recipient.ace_id,
-        conversation_id=conversation_id, type=type_, timestamp=ts,
+        ace="1.0",
+        message_id=message_id,
+        from_id=from_id,
+        to_id=recipient.ace_id,
+        conversation_id=conversation_id,
+        type=type_,
+        timestamp=ts,
         encryption=EncryptionEnvelope(to_base64(kem_ciphertext), to_base64(payload)),
-        signature=SignatureEnvelope(scheme, ""), thread_id=thread_id,
+        signature=SignatureEnvelope(scheme, ""),
+        thread_id=thread_id,
     )
     # 7. sign
     env.signature.value = encode_signature(sender.sign(message_sign_data(env)), scheme)
@@ -163,6 +201,7 @@ def create_message(
 
 
 # --- parse ------------------------------------------------------------------------
+
 
 def parse_message(
     env: ACEMessage,
@@ -196,7 +235,9 @@ def parse_message(
         raise ACEError("invalid_envelope", "from does not match the sender")
     if env.signature.scheme != sender.scheme:
         raise ACEError("scheme_mismatch", "signature scheme differs from the sender's scheme")
-    if env.conversation_id != compute_conversation_id(sender.encryption_public_key, receiver.get_encryption_public_key()):
+    if env.conversation_id != compute_conversation_id(
+        sender.encryption_public_key, receiver.get_encryption_public_key()
+    ):
         raise ACEError("invalid_envelope", "conversationId does not match the verified keys")
     # 6
     now = unix_now(clock)
@@ -219,20 +260,28 @@ def parse_message(
     # 10
     try:
         plaintext = receiver.decrypt(
-            decode_kem_ciphertext(env.encryption.kem_ciphertext), decode_payload(env.encryption.payload),
+            decode_kem_ciphertext(env.encryption.kem_ciphertext),
+            decode_payload(env.encryption.payload),
             env.conversation_id,
         )
     except ACEError:
         raise
     except Exception as exc:
-        raise ACEError("identity_unavailable", f"identity decrypt failed: {type(exc).__name__}") from exc
+        raise ACEError(
+            "identity_unavailable", f"identity decrypt failed: {type(exc).__name__}"
+        ) from exc
     # 11-12
     body = decode_body(env.type, plaintext)
     # 13
     if is_economic_type(env.type):
         threads.apply(_event(env), body)
     return ParsedMessage(
-        message_id=env.message_id, from_id=env.from_id, to_id=env.to_id,
-        conversation_id=env.conversation_id, type=env.type, thread_id=env.thread_id,
-        timestamp=env.timestamp, body=body,
+        message_id=env.message_id,
+        from_id=env.from_id,
+        to_id=env.to_id,
+        conversation_id=env.conversation_id,
+        type=env.type,
+        thread_id=env.thread_id,
+        timestamp=env.timestamp,
+        body=body,
     )

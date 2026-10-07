@@ -30,6 +30,10 @@ def test_argument_validation():
     with raises("invalid_argument"):
         det.accepts(mid(1), "", 1)
     with raises("invalid_argument"):
+        det.commit("", A, 1)
+    with raises("invalid_argument"):
+        det.accepts("", A, 1)
+    with raises("invalid_argument"):
         det.commit(mid(1), A, True)  # type: ignore[arg-type]
     with raises("invalid_argument"):
         det.commit(mid(1), A, 5, floor=-1)
@@ -59,11 +63,25 @@ def test_quota_protects_honest_senders():
 
 
 def test_from_state_validation():
-    good = {"version": 1, "horizon": 10, "senderHorizons": {A: 20}, "entries": [[mid(1), A, 21], [mid(2), B, 11]]}
+    good = {
+        "version": 1,
+        "horizon": 10,
+        "senderHorizons": {A: 20},
+        "entries": [[mid(1), A, 21], [mid(2), B, 11]],
+    }
     det = ReplayDetector.from_state(good)
     assert canonical_state_bytes(det.export_state()) == (
-        b'{"entries":[["' + mid(2).encode() + b'","' + B.encode() + b'",11],["' + mid(1).encode() + b'","'
-        + A.encode() + b'",21]],"horizon":10,"senderHorizons":{"' + A.encode() + b'":20},"version":1}'
+        b'{"entries":[["'
+        + mid(2).encode()
+        + b'","'
+        + B.encode()
+        + b'",11],["'
+        + mid(1).encode()
+        + b'","'
+        + A.encode()
+        + b'",21]],"horizon":10,"senderHorizons":{"'
+        + A.encode()
+        + b'":20},"version":1}'
     )
     bad = [
         {**good, "version": 2},
@@ -72,8 +90,8 @@ def test_from_state_validation():
         {**good, "horizon": "10"},
         {**good, "senderHorizons": {"": 5}},
         {**good, "senderHorizons": {A: -1}},
-        {**good, "entries": [[mid(1), A, 20]]},           # covered by SH[A]
-        {**good, "entries": [[mid(1), B, 10]]},           # covered by H
+        {**good, "entries": [[mid(1), A, 20]]},  # covered by SH[A]
+        {**good, "entries": [[mid(1), B, 10]]},  # covered by H
         {**good, "entries": [[mid(1), B, 11], [mid(1), B, 12]]},  # duplicate
         {**good, "entries": [["X", B, 11]]},
         {**good, "entries": [[mid(1), "", 11]]},

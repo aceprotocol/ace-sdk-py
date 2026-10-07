@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +7,7 @@ name = "ace-sdk"
 version = "0.2.0"
 description = "ACE Protocol SDK — Agent Commerce Engine"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 readme = "README.md"
 classifiers = [
@@ -25,6 +26,11 @@ dependencies = [
     "pycryptodome>=3.21",
 ]
 
+[project.urls]
+Homepage = "https://aceprotocol.org"
+Repository = "https://github.com/aceprotocol/ace-sdk-py"
+Issues = "https://github.com/aceprotocol/ace-sdk-py/issues"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0.3",
@@ -42,6 +48,6 @@ target-version = "py310"
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
-# E501: the codebase predates the formatter gate; ~45 lines exceed 100 columns and
-# rewrapping them is unrelated churn. Flagged rule set is pyflakes + import order.
-ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true

@@ -121,13 +121,20 @@ def revalidate(env: object) -> ACEMessage:
 
 def message_sign_data(env: ACEMessage) -> bytes:
     payload = encode_payload(
-        env.type, env.to_id, env.conversation_id, env.message_id, env.thread_id or "",
-        decode_kem_ciphertext(env.encryption.kem_ciphertext), decode_payload(env.encryption.payload),
+        env.type,
+        env.to_id,
+        env.conversation_id,
+        env.message_id,
+        env.thread_id or "",
+        decode_kem_ciphertext(env.encryption.kem_ciphertext),
+        decode_payload(env.encryption.payload),
     )
     return build_sign_data("message", env.from_id, env.timestamp, payload)
 
 
-def verify_envelope_signature(env: ACEMessage, *, scheme: SigningScheme, signing_public_key: bytes) -> None:
+def verify_envelope_signature(
+    env: ACEMessage, *, scheme: SigningScheme, signing_public_key: bytes
+) -> None:
     """Signature-only check against a known signer.
 
     ``scheme_mismatch`` if the envelope scheme differs; ``invalid_signature`` otherwise.

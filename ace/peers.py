@@ -56,18 +56,35 @@ def _peer_from_record(d: dict, key: str) -> tuple[VerifiedPeer, int]:
         if fetched_at is None:
             raise ACEError("invalid_peer", "fetchedAt must be an integer")
         if source == "relay":
-            record = {k: d.get(k) for k in (
-                "aceId", "scheme", "encryptionPublicKey", "signingPublicKey", "registrationSignature",
-                "registeredAt", "profile")}
+            record = {
+                k: d.get(k)
+                for k in (
+                    "aceId",
+                    "scheme",
+                    "encryptionPublicKey",
+                    "signingPublicKey",
+                    "registrationSignature",
+                    "registeredAt",
+                    "profile",
+                )
+            }
             peer = verify_peer_record(record)
         elif source == "registration":
             ace_id, scheme, signing_key, enc_key, registered_at = decode_peer_binding(d)
             if d.get("registrationSignature") is not None:
-                raise ACEError("invalid_peer", "a registration-file pin has no registrationSignature")
+                raise ACEError(
+                    "invalid_peer", "a registration-file pin has no registrationSignature"
+                )
             profile = None if d.get("profile") is None else validate_profile(d["profile"])
             peer = _make_peer(
-                ace_id=ace_id, scheme=scheme, signing_public_key=signing_key, encryption_public_key=enc_key,
-                registered_at=registered_at, registration_signature=None, source="registration", profile=profile,
+                ace_id=ace_id,
+                scheme=scheme,
+                signing_public_key=signing_key,
+                encryption_public_key=enc_key,
+                registered_at=registered_at,
+                registration_signature=None,
+                source="registration",
+                profile=profile,
             )
         else:
             raise ACEError("invalid_peer", "unknown source")
@@ -138,7 +155,9 @@ class PeerStore:
                 write_record(self._store, _peer_key(peer.ace_id), _peer_to_record(result, now))
             return PeerAdoption(result, outcome)
 
-    def pin_registration_file(self, reg: RegistrationFile | dict, *, pinned_at: int | None = None) -> VerifiedPeer:
+    def pin_registration_file(
+        self, reg: RegistrationFile | dict, *, pinned_at: int | None = None
+    ) -> VerifiedPeer:
         peer = verify_registration_file(reg, pinned_at=pinned_at, clock=self._clock)
         return self.adopt(peer).peer
 
@@ -163,7 +182,7 @@ class PeerStore:
         try:
             candidate = self._relay.lookup_peer(ace_id)
         except ACEError as exc:
-            if (exc.category == "transient" or exc.code == "unknown_peer") and fallback:
+            if (exc.is_transient or exc.code == "unknown_peer") and fallback:
                 return rec[0]  # type: ignore[index]
             raise
         try:

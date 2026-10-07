@@ -1,4 +1,4 @@
-"""Strict wire encodings shared by every module (design §0). Internal."""
+"""Strict wire encodings shared by every module. Internal."""
 
 from __future__ import annotations
 
@@ -108,7 +108,9 @@ def unix_now(clock: Callable[[], int] | None) -> int:
     return int(clock()) if clock is not None else int(time.time())
 
 
-def check_fresh(timestamp: int, clock: Callable[[], int] | None, window_seconds: int, what: str) -> None:
+def check_fresh(
+    timestamp: int, clock: Callable[[], int] | None, window_seconds: int, what: str
+) -> None:
     """``stale_timestamp`` unless ``|now - timestamp| <= window_seconds``."""
     if abs(unix_now(clock) - timestamp) > window_seconds:
         raise ACEError("stale_timestamp", f"{what} is outside the freshness window")
@@ -120,12 +122,15 @@ def decimal(n: int) -> str:
 
 # --- base64 / hex -----------------------------------------------------------
 
+
 def to_base64(data: bytes) -> str:
     """Padded standard Base64."""
     return base64.b64encode(bytes(data)).decode("ascii")
 
 
-def decode_b64(text: object, code: ACEErrorCode, what: str, *, max_bytes: int | None = None) -> bytes:
+def decode_b64(
+    text: object, code: ACEErrorCode, what: str, *, max_bytes: int | None = None
+) -> bytes:
     """Canonical padded standard Base64, or ``ACEError(code)``."""
     if not isinstance(text, str):
         raise ACEError(code, f"{what} must be a Base64 string")
@@ -174,6 +179,7 @@ def decode_signature(text: object, scheme: str, code: ACEErrorCode) -> bytes:
 
 # --- hashing / addresses ----------------------------------------------------
 
+
 def keccak256(data: bytes) -> bytes:
     k = _keccak.new(digest_bits=256)
     k.update(data)
@@ -187,6 +193,7 @@ def eip55(address_hex40: str) -> str:
 
 
 # --- JSON values ------------------------------------------------------------
+
 
 def check_json_value(value: object, code: ACEErrorCode = "invalid_body") -> None:
     """Sender-side JSON-value rules: plain JSON types, finite numbers, depth <= 32."""
@@ -226,7 +233,9 @@ def _check_finite_int(v: int, code: ACEErrorCode) -> None:
 def dumps_body(body: dict) -> bytes:
     """Compact UTF-8 JSON of a validated body, or ``invalid_body``."""
     try:
-        return json.dumps(body, allow_nan=False, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        return json.dumps(body, allow_nan=False, separators=(",", ":"), ensure_ascii=False).encode(
+            "utf-8"
+        )
     except (TypeError, ValueError, UnicodeEncodeError, RecursionError) as exc:
         raise ACEError("invalid_body", f"body is not serializable: {exc}") from None
 
@@ -251,6 +260,18 @@ def _parse_int(text: str) -> int:
     return n
 
 
+def _reject_json_constant(name: str) -> Any:
+    raise ValueError(f"non-finite number literal {name}")
+
+
+def loads_json(raw: bytes) -> object:
+    """Strict JSON from wire bytes: fatal UTF-8, no NaN/Infinity; ``ValueError`` otherwise."""
+    try:
+        return json.loads(bytes(raw).decode("utf-8"), parse_constant=_reject_json_constant)
+    except RecursionError:
+        raise ValueError("JSON nesting too deep") from None
+
+
 def loads_body(raw: bytes) -> dict:
     """Decode a decrypted body: fatal UTF-8, no non-finite numbers, depth, object."""
     try:
@@ -259,7 +280,10 @@ def loads_body(raw: bytes) -> dict:
         raise ACEError("invalid_body", "body is not valid UTF-8") from None
     try:
         body = json.loads(
-            text, parse_constant=_reject_constant, parse_float=_parse_float, parse_int=_parse_int,
+            text,
+            parse_constant=_reject_constant,
+            parse_float=_parse_float,
+            parse_int=_parse_int,
         )
     except ACEError:
         raise
@@ -276,9 +300,11 @@ def loads_body(raw: bytes) -> dict:
 def canonical_json(value: object) -> str:
     """Minimal RFC 8785 serializer for ASCII-keyed objects of strings/ints/objects."""
     if isinstance(value, dict):
-        return "{" + ",".join(
-            _jcs_string(k) + ":" + canonical_json(value[k]) for k in sorted(value)
-        ) + "}"
+        return (
+            "{"
+            + ",".join(_jcs_string(k) + ":" + canonical_json(value[k]) for k in sorted(value))
+            + "}"
+        )
     if isinstance(value, str):
         return _jcs_string(value)
     if isinstance(value, bool) or not isinstance(value, int):
@@ -286,7 +312,15 @@ def canonical_json(value: object) -> str:
     return str(value)
 
 
-_JCS_ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r", "\t": "\\t"}
+_JCS_ESCAPES = {
+    '"': '\\"',
+    "\\": "\\\\",
+    "\b": "\\b",
+    "\f": "\\f",
+    "\n": "\\n",
+    "\r": "\\r",
+    "\t": "\\t",
+}
 
 
 def _jcs_string(s: str) -> str:
@@ -305,4 +339,6 @@ def _jcs_string(s: str) -> str:
 
 def canonical_state_bytes(obj: object) -> bytes:
     """Persisted-JSON writer: sorted keys, compact, UTF-8, '/' unescaped."""
-    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )

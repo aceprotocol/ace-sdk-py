@@ -39,10 +39,10 @@ Real agents use the durable pipeline, which persists peers, threads, the replay 
 pending sends and delivery records, and survives crashes at any point:
 
 ```python
-from ace import ACEError, FileStore, Inbox, Outbox, PeerStore, ReceiveSource, RelayClient
+from ace import ACEError, FileStore, Inbox, Outbox, PeerStore, RelayClient
 
 store = FileStore("/home/agent/.ace/state")        # or MemoryStore(), or your own ACEStore
-relay = RelayClient("https://relay.example")
+relay = RelayClient("https://relay.aceprotocol.org")
 relay.register(identity)                           # signed registration request
 peers = PeerStore(store, relay=relay)              # pinned bindings + rollback barrier
 
@@ -76,7 +76,6 @@ if result.has_more:                                # max_pages or stop= ended it
 for outcome in inbox.follow(relay, stop=stop_event, on_live=lambda: print("live")):
     ...
 print(inbox.cursor(relay))                         # persisted cursor, keyed by relay.base_url
-# direct (HTTP endpoint) delivery: inbox.receive(body["message"], ReceiveSource.direct())
 ```
 
 - **`ACEStore`** is a small synchronous key-value protocol (`read`, `write`, `delete`, `list`,
@@ -101,22 +100,88 @@ print(inbox.cursor(relay))                         # persisted cursor, keyed by 
   outcome; `messages`, `delivered`, `duplicates` and `quarantined` are convenience views).
   A message that would open more than `MAX_OPEN_THREADS_PER_PEER` (1000) non-terminal
   threads with one peer is quarantined `limit_exceeded`; `Outbox.stage` raises it.
-- **`ThreadStore`** keeps a per-peer index of non-terminal threads (`threads/index/`) and
+- **`Inbox.receive(message, source)`** is the single entry point: `message` is the raw
+  envelope JSON bytes as the transport delivered them. Bytes that are not UTF-8 JSON, or
+  exceed `MAX_ENVELOPE_BYTES`, are `quarantined` (`invalid_envelope`). Delivery records that
+  are acknowledged and covered by a replay horizon are swept automatically.
+- **`ThreadStore`** (public: `get`, `list`, `remove`, `allowed_types`) keeps a per-peer index of non-terminal threads (`threads/index/`) and
   prunes threads idle for 30 days that are terminal or hold no local message.
 - **`RelayClient`** implements `08-relay.md`: `register`, `unregister`, `lookup_peer`,
   `discover`, `send`, `fetch_inbox`, `listen` (SSE generator; `on_open` per connection),
-  `post_intent`, `list_intents`. `base_url` is the normalized URL (the inbox cursor key). Auth timestamps are strictly increasing per client and a `409 replay` is
-  retried once. Network errors, 5xx, 408 and 429 are `relay_unavailable` (with
-  `retry_after_seconds`).
+  `post_intent`, `list_intents` (`tags` is a list of strings), `set_webhook`, `get_webhook`,
+  `clear_webhook`. `base_url` is the normalized URL (the inbox cursor key): scheme and host
+  lowercased, `:443`/`:80` dropped, trailing `/` removed; a query, fragment, userinfo or
+  whitespace is `invalid_argument`. Auth timestamps are strictly increasing per client and a
+  `409 replay` is retried once. Redirects are never followed (a 3xx is
+  `relay_protocol_error`). Network errors, 5xx, 408 and 429 `rate_limited` are
+  `relay_unavailable`; any other 429 (`recipient_inbox_full`, `sender_quota_exceeded`, …) is
+  `relay_rejected`. `retry_after_seconds` (integer `Retry-After` only) is set only on
+  transient errors. Inbox and SSE entries carry the raw envelope bytes; a frame that is not
+  an envelope is quarantined by the Inbox and never stalls `listen` / `follow`.
+
+## Direct delivery
+
+An agent that publishes an `endpoint` accepts `POST <endpoint>` with `{"message": envelope}`
+(`08-relay.md` § Direct Delivery). The SDK implements both sides; HTTP serving, routing and
+rate limiting stay in your application.
+
+```python
+from ace import MAX_DIRECT_BODY_BYTES, deliver_direct_or_relay, post_direct
+
+# receiver: inside your HTTP handler (read at most MAX_DIRECT_BODY_BYTES + 1 bytes)
+reply = inbox.receive_direct(request_body)         # DirectReply(status, body, outcome)
+respond(reply.status, json.dumps(reply.body))      # 200 {"ok":true,"messageId"} / 400 / 413 / 503
+
+# sender: try the peer's endpoint, fall back to the relay
+peer = peers.resolve(seller_id)
+endpoint = peer.profile.endpoint if peer.profile else None
+path = outbox.deliver(pending.request_id, deliver_direct_or_relay(relay, endpoint))
+post_direct("https://seller.example/ace/receive", envelope)    # or the raw call
+```
+
+- `post_direct` requires an ACE HTTPS URL, resolves the host once, refuses it when any
+  address is blocked (`is_blocked_address`) and connects to the validated address; it never
+  follows redirects (default timeout 5 s). Success is 2xx with `{"ok": true}`.
+  `is_blocked_address(ip)` returns `True` for an input that is not an IP literal (fail closed).
+- 400/413 is `direct_rejected` (permanent; the receiver's `error` string is in
+  `remote_code` when it matches `^[a-z0-9_]{1,64}$`): do not resend that envelope, directly or through the relay. Anything else
+  (network, timeout, 429, 503, other statuses) is `direct_unavailable` (transient).
+- `deliver_direct_or_relay(relay, endpoint)` returns an `Outbox.deliver` transport that
+  falls back to `relay.send` on `direct_unavailable` or an unsafe endpoint, re-raises
+  `direct_rejected`, and returns `"direct"` or `"relay"`. Both paths carry the same
+  envelope, so a second copy is a duplicate at the receiver.
+
+## Webhooks
+
+`relay.set_webhook(identity, url, secret)` asks the relay to notify an HTTPS URL when a
+message is queued. Verify each notification on the raw request body before trusting it, then
+`pull` the inbox:
+
+```python
+from ace import verify_webhook_notification
+
+n = verify_webhook_notification(
+    secret=secret,
+    timestamp=headers["X-ACE-Webhook-Timestamp"],
+    signature=headers["X-ACE-Webhook-Signature"],
+    body=raw_body,
+)                                                  # WebhookNotification(ace_id, stream_id)
+inbox.pull(relay)
+```
+
+Malformed headers or body are `invalid_argument` / `invalid_signature`, a timestamp outside
+the window (default `TIMESTAMP_WINDOW_SECONDS`) is `stale_timestamp`, a wrong HMAC is
+`invalid_signature`.
 
 ## Concepts
 
 - **Errors.** Every SDK failure is an `ACEError` with a stable `code` (e.g. `invalid_envelope`,
-  `replay`, `wrong_role`) and a `category`: `permanent`, `transient` or `local`.
-  `is_transient` is true for the last two (retry instead of quarantining).
+  `replay`, `wrong_role`) and a `category`: `permanent`, `transient` or `local`
+  (`06-security.md` § SDK Error Codes). `is_transient` is true for the last two (retry instead
+  of quarantining). A store lock that cannot be acquired in time is `lock_busy`
+  (`receiver_busy` for the `receive` lock); `storage_failed` is an I/O failure.
 - **Registration files.** `create_registration_file(identity, *, name, endpoint, ...)` builds
-  the `.well-known/ace.json` document of any `ACEIdentity`;
-  `SoftwareIdentity.to_registration_file` delegates to it.
+  the `.well-known/ace.json` document of any `ACEIdentity`.
 - **Peers.** Keys are trusted only through a `VerifiedPeer`, obtained from
   `verify_peer_record` (relay `GET /v1/peer`; the encryption key binding is checked),
   `verify_registration_file` / `fetch_registration_file` (`.well-known/ace.json`, with SSRF
@@ -164,13 +229,17 @@ Forward secrecy: compromising a **sender** reveals nothing about past messages. 
 re-registering.
 
 Signing uses Ed25519 (strict: canonical points, small-order keys rejected, `S < L`) or
-secp256k1 (low-S, `v ∈ {0, 1}`, `0x` + 130 lowercase hex). The ACE ID is
-`ace:sha256:hex(sha256(signingPublicKey))`.
+secp256k1 (low-S, `v ∈ {0, 1}`, `0x` + 130 lowercase hex); `SIGNING_SCHEMES` and
+`is_signing_scheme` list them. The ACE ID is `ace:sha256:hex(sha256(signingPublicKey))`.
+
+Signatures are verify-only across implementations: other SDKs (and hardware-backed
+identities) may produce non-deterministic signatures, so never compare signature bytes or
+use them as identifiers — verify them. A message is identified by `(from, messageId)`.
 
 ## Development
 
 ```bash
-pip install -e ".[dev]" && ruff check ace tests && pytest -q
+pip install -e ".[dev]" && ruff check ace tests examples && pytest -q
 ```
 
 ## License

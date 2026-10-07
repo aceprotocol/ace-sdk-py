@@ -20,11 +20,6 @@ from .errors import ACEError
 from .limits import KEM_SEED_SIZE
 from .types import (
     SIGNING_SCHEMES,
-    Capability,
-    ChainInfo,
-    HardwareBacking,
-    IdentityTier,
-    RegistrationFile,
     SigningScheme,
     SoftwareIdentityExport,
 )
@@ -48,12 +43,20 @@ def signing_address(scheme: str, signing_public_key: bytes) -> str:
 class SoftwareIdentity:
     """Software ACE identity. Caches its expanded X-Wing key in memory (never persisted)."""
 
-    def __init__(self, scheme: SigningScheme, signing_private_key: bytes, encryption_seed: bytes) -> None:
+    def __init__(
+        self, scheme: SigningScheme, signing_private_key: bytes, encryption_seed: bytes
+    ) -> None:
         if scheme not in SIGNING_SCHEMES:
             raise ACEError("invalid_argument", f"unsupported signing scheme {str(scheme)[:32]!r}")
-        if not isinstance(signing_private_key, (bytes, bytearray)) or len(signing_private_key) != 32:
+        if (
+            not isinstance(signing_private_key, (bytes, bytearray))
+            or len(signing_private_key) != 32
+        ):
             raise ACEError("invalid_key", "signing private key must be 32 bytes")
-        if not isinstance(encryption_seed, (bytes, bytearray)) or len(encryption_seed) != KEM_SEED_SIZE:
+        if (
+            not isinstance(encryption_seed, (bytes, bytearray))
+            or len(encryption_seed) != KEM_SEED_SIZE
+        ):
             raise ACEError("invalid_key", f"encryption seed must be {KEM_SEED_SIZE} bytes")
         self._scheme: SigningScheme = scheme
         self._signing_private_key = bytes(signing_private_key)
@@ -126,24 +129,4 @@ class SoftwareIdentity:
             data.get("scheme"),  # type: ignore[arg-type]
             decode_b64(data.get("signingPrivateKey"), "invalid_key", "signingPrivateKey"),
             decode_b64(data.get("encryptionPrivateKey"), "invalid_key", "encryptionPrivateKey"),
-        )
-
-    def to_registration_file(
-        self,
-        *,
-        name: str,
-        endpoint: str,
-        description: str | None = None,
-        tier: IdentityTier = 0,
-        hardware_backing: HardwareBacking | None = None,
-        capabilities: list[Capability] | None = None,
-        settlement: list[str] | None = None,
-        chains: list[ChainInfo] | None = None,
-    ) -> RegistrationFile:
-        """Build this identity's registration file (``create_registration_file(self, ...)``)."""
-        from .registration import create_registration_file
-
-        return create_registration_file(
-            self, name=name, endpoint=endpoint, description=description, tier=tier,
-            hardware_backing=hardware_backing, capabilities=capabilities, settlement=settlement, chains=chains,
         )

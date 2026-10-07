@@ -10,6 +10,7 @@ from contextlib import contextmanager
 import pytest
 
 from ace import ACEError, SoftwareIdentity, verify_registration_file
+from ace.registration import create_registration_file
 
 VECTORS = json.loads((pathlib.Path(__file__).parent / "fixtures" / "test-vectors.json").read_text())
 
@@ -23,9 +24,19 @@ def raises(code: str):
 
 def agent(name: str) -> SoftwareIdentity:
     a = VECTORS["agents"][name]
-    return SoftwareIdentity(a["scheme"], base64.b64decode(a["signingPrivateKey"]), base64.b64decode(a["encryptionPrivateKey"]))
+    return SoftwareIdentity(
+        a["scheme"],
+        base64.b64decode(a["signingPrivateKey"]),
+        base64.b64decode(a["encryptionPrivateKey"]),
+    )
 
 
 def peer_of(identity: SoftwareIdentity, pinned_at: int = 0):
-    reg = identity.to_registration_file(name="Peer", endpoint="https://peer.example/ace")
+    reg = create_registration_file(identity, name="Peer", endpoint="https://peer.example/ace")
     return verify_registration_file(reg, pinned_at=pinned_at)
+
+
+def wire(message) -> bytes:
+    """The raw JSON bytes of an envelope (``ACEMessage`` or dict), as a transport delivers it."""
+    obj = message.to_dict() if hasattr(message, "to_dict") else message
+    return json.dumps(obj, separators=(",", ":")).encode()

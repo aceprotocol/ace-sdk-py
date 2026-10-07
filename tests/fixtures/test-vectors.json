@@ -3792,6 +3792,1261 @@
           }
         ]
       }
-    ]
+    ],
+    "webhooks": {
+      "rules": "verifyWebhookNotification(secret, timestamp header, signature header, raw body as UTF-8 bytes) with the clock fixed at 'now' and the default window (TIMESTAMP_WINDOW_SECONDS). Check order: timestamp format (invalid_argument), signature format (invalid_signature), freshness (stale_timestamp), HMAC (invalid_signature), body shape (invalid_argument). 'result' is the returned {aceId, streamId}; 'error' is the ACEError code. A relay-side signer is checked against the 'result' cases: signWebhookNotification(secret, timestamp, body) == signature.",
+      "cases": [
+        {
+          "name": "valid",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "sha256=a495eec7effb444d349ded94cf1ffa75717f2130a101be7bafb524df155206bd",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000000,
+          "result": {
+            "aceId": "ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "streamId": "1741000000000-0"
+          }
+        },
+        {
+          "name": "valid at now - window",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "sha256=a495eec7effb444d349ded94cf1ffa75717f2130a101be7bafb524df155206bd",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000300,
+          "result": {
+            "aceId": "ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "streamId": "1741000000000-0"
+          }
+        },
+        {
+          "name": "valid at now + window",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "sha256=a495eec7effb444d349ded94cf1ffa75717f2130a101be7bafb524df155206bd",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1740999700,
+          "result": {
+            "aceId": "ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "streamId": "1741000000000-0"
+          }
+        },
+        {
+          "name": "unknown body member ignored",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "sha256=c3f1edc520aa4433df05430595758cbe09276827af2a108a1ce4422b7fdb1658",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\",\"extra\":1}",
+          "now": 1741000000,
+          "result": {
+            "aceId": "ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "streamId": "1741000000000-0"
+          }
+        },
+        {
+          "name": "stale timestamp",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "sha256=a495eec7effb444d349ded94cf1ffa75717f2130a101be7bafb524df155206bd",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000301,
+          "error": "stale_timestamp"
+        },
+        {
+          "name": "future timestamp",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "sha256=a495eec7effb444d349ded94cf1ffa75717f2130a101be7bafb524df155206bd",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1740999699,
+          "error": "stale_timestamp"
+        },
+        {
+          "name": "wrong secret",
+          "secret": "whsec-0123456789abcdefx",
+          "timestamp": "1741000000",
+          "signature": "sha256=a495eec7effb444d349ded94cf1ffa75717f2130a101be7bafb524df155206bd",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000000,
+          "error": "invalid_signature"
+        },
+        {
+          "name": "tampered body",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "sha256=a495eec7effb444d349ded94cf1ffa75717f2130a101be7bafb524df155206bd",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-1\"}",
+          "now": 1741000000,
+          "error": "invalid_signature"
+        },
+        {
+          "name": "signature over a different timestamp",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "sha256=06d879793bbd57d21998d3a7c1dac2917d11dacdc7820fa76b91a75d38a91183",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000000,
+          "error": "invalid_signature"
+        },
+        {
+          "name": "malformed signature: uppercase hex",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "sha256=A495EEC7EFFB444D349DED94CF1FFA75717F2130A101BE7BAFB524DF155206BD",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000000,
+          "error": "invalid_signature"
+        },
+        {
+          "name": "malformed signature: no prefix",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "a495eec7effb444d349ded94cf1ffa75717f2130a101be7bafb524df155206bd",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000000,
+          "error": "invalid_signature"
+        },
+        {
+          "name": "malformed signature: sha1 prefix",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "sha1=a495eec7effb444d349ded94cf1ffa75717f2130a101be7bafb524df155206bd",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000000,
+          "error": "invalid_signature"
+        },
+        {
+          "name": "malformed signature: 63 hex digits",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "sha256=a495eec7effb444d349ded94cf1ffa75717f2130a101be7bafb524df155206b",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000000,
+          "error": "invalid_signature"
+        },
+        {
+          "name": "malformed signature: empty",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000000,
+          "error": "invalid_signature"
+        },
+        {
+          "name": "malformed timestamp: leading zero",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "01741000000",
+          "signature": "sha256=a495eec7effb444d349ded94cf1ffa75717f2130a101be7bafb524df155206bd",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000000,
+          "error": "invalid_argument"
+        },
+        {
+          "name": "malformed timestamp: decimal point",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000.0",
+          "signature": "sha256=a495eec7effb444d349ded94cf1ffa75717f2130a101be7bafb524df155206bd",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000000,
+          "error": "invalid_argument"
+        },
+        {
+          "name": "malformed timestamp: empty",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "",
+          "signature": "sha256=a495eec7effb444d349ded94cf1ffa75717f2130a101be7bafb524df155206bd",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000000,
+          "error": "invalid_argument"
+        },
+        {
+          "name": "malformed timestamp: above 2^53-1",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "9007199254740992",
+          "signature": "sha256=a495eec7effb444d349ded94cf1ffa75717f2130a101be7bafb524df155206bd",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000000,
+          "error": "invalid_argument"
+        },
+        {
+          "name": "authentic body with wrong event",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "sha256=be1991919c974512a673df165ad45d428053e53494ffc29d894e20d96e3f0b8d",
+          "body": "{\"event\":\"ping\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"1741000000000-0\"}",
+          "now": 1741000000,
+          "error": "invalid_argument"
+        },
+        {
+          "name": "authentic body with malformed streamId",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "sha256=ebd3ef84c460b88b3e4025435b7c64ecbfe7283992ce680ea0efd27a0f1e805b",
+          "body": "{\"event\":\"message\",\"aceId\":\"ace:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"streamId\":\"latest\"}",
+          "now": 1741000000,
+          "error": "invalid_argument"
+        },
+        {
+          "name": "authentic body that is not JSON",
+          "secret": "whsec-0123456789abcdef",
+          "timestamp": "1741000000",
+          "signature": "sha256=fb9c5e8675a4c340a2e0460ce3a8736a5b3fd834f1fcf543d4f8d96584e1603f",
+          "body": "not json",
+          "now": 1741000000,
+          "error": "invalid_argument"
+        }
+      ]
+    },
+    "relayUrls": {
+      "rules": "normalizeRelayUrl(input) returns 'normalized', or throws ACEError 'error'.",
+      "cases": [
+        {
+          "input": "https://relay.aceprotocol.org",
+          "normalized": "https://relay.aceprotocol.org"
+        },
+        {
+          "input": "https://relay.aceprotocol.org/",
+          "normalized": "https://relay.aceprotocol.org"
+        },
+        {
+          "input": "https://relay.aceprotocol.org//",
+          "normalized": "https://relay.aceprotocol.org"
+        },
+        {
+          "input": "HTTPS://Relay.AceProtocol.ORG/",
+          "normalized": "https://relay.aceprotocol.org"
+        },
+        {
+          "input": "https://relay.aceprotocol.org:443/",
+          "normalized": "https://relay.aceprotocol.org"
+        },
+        {
+          "input": "http://relay.example.com:80",
+          "normalized": "http://relay.example.com"
+        },
+        {
+          "input": "https://relay.example.com:80",
+          "normalized": "https://relay.example.com:80"
+        },
+        {
+          "input": "http://relay.example.com:443/",
+          "normalized": "http://relay.example.com:443"
+        },
+        {
+          "input": "https://relay.example.com:8443/",
+          "normalized": "https://relay.example.com:8443"
+        },
+        {
+          "input": "https://relay.example.com/ace/",
+          "normalized": "https://relay.example.com/ace"
+        },
+        {
+          "input": "https://relay.example.com/Ace/V1",
+          "normalized": "https://relay.example.com/Ace/V1"
+        },
+        {
+          "input": "http://127.0.0.1:3000/",
+          "normalized": "http://127.0.0.1:3000"
+        },
+        {
+          "input": "http://[::1]:3000/",
+          "normalized": "http://[::1]:3000"
+        },
+        {
+          "input": "ftp://relay.example.com",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "wss://relay.example.com",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "relay.example.com",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://user@relay.example.com",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://user:pass@relay.example.com",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://relay.example.com?x=1",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://relay.example.com/?",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://relay.example.com/#",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://relay.example.com/#frag",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://relay.example.com:65536",
+          "error": "invalid_argument"
+        },
+        {
+          "input": " https://relay.example.com",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://relay.example.com/ ",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://relay.example.com/a\tb",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "http://relay.example.com:80:80",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://relay.example.com:",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://relay.example.com:0",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://relay.example.com:0443",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://relay.example.com:000443",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://relay.example.com:123456",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://r\u00e9lay.example.com",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://relay%2Eexample.com",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://relay_1.example.com",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "https://xn--rlay-bpa.Example.com/",
+          "normalized": "https://xn--rlay-bpa.example.com"
+        },
+        {
+          "input": "http://[FE80::1]:8080/",
+          "normalized": "http://[fe80::1]:8080"
+        },
+        {
+          "input": "http://[::g]",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "http://[1.2.3.4]",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "http://[::1",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "http://[::1]x",
+          "error": "invalid_argument"
+        },
+        {
+          "input": "http://[fe80::1%25en0]/",
+          "error": "invalid_argument"
+        }
+      ]
+    },
+    "blockedAddresses": {
+      "rules": "isBlockedAddress(address) returns 'blocked'. An IPv6 %zone suffix is ignored; any other input that is not an IP literal is blocked (fail closed).",
+      "cases": [
+        {
+          "address": "1.1.1.1",
+          "blocked": false
+        },
+        {
+          "address": "8.8.8.8",
+          "blocked": false
+        },
+        {
+          "address": "0.0.0.0",
+          "blocked": true
+        },
+        {
+          "address": "0.255.255.255",
+          "blocked": true
+        },
+        {
+          "address": "9.255.255.255",
+          "blocked": false
+        },
+        {
+          "address": "10.0.0.0",
+          "blocked": true
+        },
+        {
+          "address": "10.255.255.255",
+          "blocked": true
+        },
+        {
+          "address": "11.0.0.0",
+          "blocked": false
+        },
+        {
+          "address": "100.63.255.255",
+          "blocked": false
+        },
+        {
+          "address": "100.64.0.0",
+          "blocked": true
+        },
+        {
+          "address": "100.127.255.255",
+          "blocked": true
+        },
+        {
+          "address": "100.128.0.0",
+          "blocked": false
+        },
+        {
+          "address": "126.255.255.255",
+          "blocked": false
+        },
+        {
+          "address": "127.0.0.1",
+          "blocked": true
+        },
+        {
+          "address": "127.255.255.255",
+          "blocked": true
+        },
+        {
+          "address": "128.0.0.0",
+          "blocked": false
+        },
+        {
+          "address": "169.253.255.255",
+          "blocked": false
+        },
+        {
+          "address": "169.254.0.0",
+          "blocked": true
+        },
+        {
+          "address": "169.254.169.254",
+          "blocked": true
+        },
+        {
+          "address": "169.255.0.0",
+          "blocked": false
+        },
+        {
+          "address": "172.15.255.255",
+          "blocked": false
+        },
+        {
+          "address": "172.16.0.0",
+          "blocked": true
+        },
+        {
+          "address": "172.31.255.255",
+          "blocked": true
+        },
+        {
+          "address": "172.32.0.0",
+          "blocked": false
+        },
+        {
+          "address": "192.0.0.1",
+          "blocked": true
+        },
+        {
+          "address": "192.0.1.1",
+          "blocked": false
+        },
+        {
+          "address": "192.0.2.1",
+          "blocked": true
+        },
+        {
+          "address": "192.0.3.1",
+          "blocked": false
+        },
+        {
+          "address": "192.167.255.255",
+          "blocked": false
+        },
+        {
+          "address": "192.168.0.1",
+          "blocked": true
+        },
+        {
+          "address": "192.169.0.0",
+          "blocked": false
+        },
+        {
+          "address": "198.17.255.255",
+          "blocked": false
+        },
+        {
+          "address": "198.18.0.0",
+          "blocked": true
+        },
+        {
+          "address": "198.19.255.255",
+          "blocked": true
+        },
+        {
+          "address": "198.20.0.0",
+          "blocked": false
+        },
+        {
+          "address": "198.51.100.7",
+          "blocked": true
+        },
+        {
+          "address": "203.0.113.7",
+          "blocked": true
+        },
+        {
+          "address": "203.0.114.0",
+          "blocked": false
+        },
+        {
+          "address": "223.255.255.255",
+          "blocked": false
+        },
+        {
+          "address": "224.0.0.1",
+          "blocked": true
+        },
+        {
+          "address": "239.255.255.255",
+          "blocked": true
+        },
+        {
+          "address": "240.0.0.1",
+          "blocked": true
+        },
+        {
+          "address": "255.255.255.255",
+          "blocked": true
+        },
+        {
+          "address": "::",
+          "blocked": true
+        },
+        {
+          "address": "::1",
+          "blocked": true
+        },
+        {
+          "address": "2606:4700:4700::1111",
+          "blocked": false
+        },
+        {
+          "address": "2001:4860:4860::8888",
+          "blocked": false
+        },
+        {
+          "address": "100::1",
+          "blocked": true
+        },
+        {
+          "address": "100:0:0:1::1",
+          "blocked": false
+        },
+        {
+          "address": "2001:db8::1",
+          "blocked": true
+        },
+        {
+          "address": "2001:db9::1",
+          "blocked": false
+        },
+        {
+          "address": "fc00::1",
+          "blocked": true
+        },
+        {
+          "address": "fd12:3456::1",
+          "blocked": true
+        },
+        {
+          "address": "FD12:3456::1",
+          "blocked": true
+        },
+        {
+          "address": "fe80::1",
+          "blocked": true
+        },
+        {
+          "address": "febf::1",
+          "blocked": true
+        },
+        {
+          "address": "ff02::1",
+          "blocked": true
+        },
+        {
+          "address": "::ffff:127.0.0.1",
+          "blocked": true
+        },
+        {
+          "address": "::ffff:10.0.0.1",
+          "blocked": true
+        },
+        {
+          "address": "::ffff:a00:1",
+          "blocked": true
+        },
+        {
+          "address": "::ffff:8.8.8.8",
+          "blocked": false
+        },
+        {
+          "address": "::ffff:808:808",
+          "blocked": false
+        },
+        {
+          "address": "64:ff9b::7f00:1",
+          "blocked": true
+        },
+        {
+          "address": "64:ff9b::192.168.0.1",
+          "blocked": true
+        },
+        {
+          "address": "64:ff9b::808:808",
+          "blocked": false
+        },
+        {
+          "address": "example.com",
+          "blocked": true
+        },
+        {
+          "address": "",
+          "blocked": true
+        },
+        {
+          "address": "1.2.3",
+          "blocked": true
+        },
+        {
+          "address": "1.2.3.4.5",
+          "blocked": true
+        },
+        {
+          "address": "256.0.0.1",
+          "blocked": true
+        },
+        {
+          "address": " 8.8.8.8",
+          "blocked": true
+        },
+        {
+          "address": "8.8.8.8/32",
+          "blocked": true
+        },
+        {
+          "address": "::g",
+          "blocked": true
+        },
+        {
+          "address": "[::1]",
+          "blocked": true
+        },
+        {
+          "address": "8.8.8.8%x",
+          "blocked": true
+        },
+        {
+          "address": "fe80::1%en0",
+          "blocked": true
+        },
+        {
+          "address": "2606:4700:4700::1111%eth0",
+          "blocked": false
+        }
+      ]
+    },
+    "relayErrors": {
+      "rules": "Map one relay response that is not the call's expected success (status, headers, raw body; a 2xx here is one the call did not expect, e.g. 204 where a JSON body is expected) to an ACEError: 'code', its 'category', the relay error code ('relayCode', null when absent) and 'retryAfterSeconds' (null when not attached). The error's HTTP status equals 'status'. Header names are case-insensitive. The single 409 replay retry is not part of the mapping.",
+      "cases": [
+        {
+          "name": "301 redirect",
+          "status": 301,
+          "headers": {
+            "Location": "https://elsewhere.example.com/"
+          },
+          "body": "",
+          "code": "relay_protocol_error",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "302 redirect",
+          "status": 302,
+          "headers": {
+            "Location": "https://elsewhere.example.com/"
+          },
+          "body": "",
+          "code": "relay_protocol_error",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "307 redirect",
+          "status": 307,
+          "headers": {
+            "Location": "https://elsewhere.example.com/"
+          },
+          "body": "",
+          "code": "relay_protocol_error",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "308 redirect",
+          "status": 308,
+          "headers": {
+            "Location": "https://elsewhere.example.com/"
+          },
+          "body": "",
+          "code": "relay_protocol_error",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "303 redirect with Retry-After",
+          "status": 303,
+          "headers": {
+            "Location": "https://elsewhere.example.com/",
+            "Retry-After": "5"
+          },
+          "body": "",
+          "code": "relay_protocol_error",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": 5
+        },
+        {
+          "name": "204 where a JSON body was expected",
+          "status": 204,
+          "headers": {},
+          "body": "",
+          "code": "relay_protocol_error",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "200 where another status was expected",
+          "status": 200,
+          "headers": {},
+          "body": "{\"error\":\"internal_error\"}",
+          "code": "relay_protocol_error",
+          "category": "transient",
+          "relayCode": "internal_error",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "400 invalid_argument",
+          "status": 400,
+          "headers": {},
+          "body": "{\"error\":\"invalid_argument\",\"message\":\"bad since\"}",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": "invalid_argument",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "400 envelope_expired",
+          "status": 400,
+          "headers": {},
+          "body": "{\"error\":\"envelope_expired\"}",
+          "code": "envelope_expired",
+          "category": "permanent",
+          "relayCode": "envelope_expired",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "400 error member not a string",
+          "status": 400,
+          "headers": {},
+          "body": "{\"error\":5}",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "400 body not JSON",
+          "status": 400,
+          "headers": {},
+          "body": "Bad Request",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "400 with Retry-After",
+          "status": 400,
+          "headers": {
+            "Retry-After": "5"
+          },
+          "body": "{\"error\":\"invalid_argument\"}",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": "invalid_argument",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "401 invalid_signature",
+          "status": 401,
+          "headers": {},
+          "body": "{\"error\":\"invalid_signature\"}",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": "invalid_signature",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "403 not_registered",
+          "status": 403,
+          "headers": {},
+          "body": "{\"error\":\"not_registered\"}",
+          "code": "not_registered",
+          "category": "permanent",
+          "relayCode": "not_registered",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "403 other code",
+          "status": 403,
+          "headers": {},
+          "body": "{\"error\":\"forbidden\"}",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": "forbidden",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "404 unknown_peer",
+          "status": 404,
+          "headers": {},
+          "body": "{\"error\":\"unknown_peer\"}",
+          "code": "unknown_peer",
+          "category": "permanent",
+          "relayCode": "unknown_peer",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "404 without body",
+          "status": 404,
+          "headers": {},
+          "body": "",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "408 request timeout",
+          "status": 408,
+          "headers": {},
+          "body": "",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "408 with Retry-After",
+          "status": 408,
+          "headers": {
+            "Retry-After": "3"
+          },
+          "body": "",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": 3
+        },
+        {
+          "name": "409 replay after the retry",
+          "status": 409,
+          "headers": {},
+          "body": "{\"error\":\"replay\"}",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": "replay",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "409 identity_conflict",
+          "status": 409,
+          "headers": {},
+          "body": "{\"error\":\"identity_conflict\"}",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": "identity_conflict",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "409 envelope_expired (wrong status)",
+          "status": 409,
+          "headers": {},
+          "body": "{\"error\":\"envelope_expired\"}",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": "envelope_expired",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "413 payload too large",
+          "status": 413,
+          "headers": {},
+          "body": "{\"error\":\"invalid_argument\"}",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": "invalid_argument",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "418 unexpected 4xx",
+          "status": 418,
+          "headers": {},
+          "body": "",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "429 rate_limited",
+          "status": 429,
+          "headers": {
+            "Retry-After": "7"
+          },
+          "body": "{\"error\":\"rate_limited\"}",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": "rate_limited",
+          "retryAfterSeconds": 7
+        },
+        {
+          "name": "429 rate_limited without Retry-After",
+          "status": 429,
+          "headers": {},
+          "body": "{\"error\":\"rate_limited\"}",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": "rate_limited",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "429 without code",
+          "status": 429,
+          "headers": {
+            "Retry-After": "2"
+          },
+          "body": "",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": 2
+        },
+        {
+          "name": "429 non-JSON body",
+          "status": 429,
+          "headers": {},
+          "body": "Too Many Requests",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "429 recipient_inbox_full",
+          "status": 429,
+          "headers": {
+            "Retry-After": "7"
+          },
+          "body": "{\"error\":\"recipient_inbox_full\"}",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": "recipient_inbox_full",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "429 sender_quota_exceeded",
+          "status": 429,
+          "headers": {},
+          "body": "{\"error\":\"sender_quota_exceeded\"}",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": "sender_quota_exceeded",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "429 max_open_intents",
+          "status": 429,
+          "headers": {},
+          "body": "{\"error\":\"max_open_intents\"}",
+          "code": "relay_rejected",
+          "category": "permanent",
+          "relayCode": "max_open_intents",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "500 internal_error",
+          "status": 500,
+          "headers": {},
+          "body": "{\"error\":\"internal_error\"}",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": "internal_error",
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "502 HTML body",
+          "status": 502,
+          "headers": {},
+          "body": "<html>Bad Gateway</html>",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "503 Retry-After seconds",
+          "status": 503,
+          "headers": {
+            "Retry-After": "120"
+          },
+          "body": "",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": 120
+        },
+        {
+          "name": "503 Retry-After zero",
+          "status": 503,
+          "headers": {
+            "Retry-After": "0"
+          },
+          "body": "",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": 0
+        },
+        {
+          "name": "503 Retry-After HTTP-date ignored",
+          "status": 503,
+          "headers": {
+            "Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"
+          },
+          "body": "",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "503 Retry-After fraction ignored",
+          "status": 503,
+          "headers": {
+            "Retry-After": "1.5"
+          },
+          "body": "",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "503 Retry-After negative ignored",
+          "status": 503,
+          "headers": {
+            "Retry-After": "-1"
+          },
+          "body": "",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "504 gateway timeout",
+          "status": 504,
+          "headers": {},
+          "body": "",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "599 last 5xx",
+          "status": 599,
+          "headers": {},
+          "body": "",
+          "code": "relay_unavailable",
+          "category": "transient",
+          "relayCode": null,
+          "retryAfterSeconds": null
+        },
+        {
+          "name": "600 out-of-range status",
+          "status": 600,
+          "headers": {
+            "Retry-After": "2"
+          },
+          "body": "{\"error\":\"internal_error\"}",
+          "code": "relay_protocol_error",
+          "category": "transient",
+          "relayCode": "internal_error",
+          "retryAfterSeconds": 2
+        }
+      ]
+    },
+    "directReceive": {
+      "rules": "Request bytes are UTF-8('body') or hex-decoded 'bodyHex', then right-padded with ASCII spaces (0x20) to 'padTo' bytes when given. Pass them to inbox.receiveDirect on an open Inbox of any identity. The reply has HTTP status 'status' and body {ok: false, error: 'error'}.",
+      "maxDirectBodyBytes": 132096,
+      "cases": [
+        {
+          "name": "empty body",
+          "body": "",
+          "status": 400,
+          "error": "invalid_argument"
+        },
+        {
+          "name": "not JSON",
+          "body": "{",
+          "status": 400,
+          "error": "invalid_argument"
+        },
+        {
+          "name": "message string with invalid UTF-8",
+          "bodyHex": "7b226d657373616765223a22ff227d",
+          "status": 400,
+          "error": "invalid_argument"
+        },
+        {
+          "name": "top-level array",
+          "body": "[]",
+          "status": 400,
+          "error": "invalid_argument"
+        },
+        {
+          "name": "top-level string",
+          "body": "\"message\"",
+          "status": 400,
+          "error": "invalid_argument"
+        },
+        {
+          "name": "top-level null",
+          "body": "null",
+          "status": 400,
+          "error": "invalid_argument"
+        },
+        {
+          "name": "object without message",
+          "body": "{\"msg\":{}}",
+          "status": 400,
+          "error": "invalid_argument"
+        },
+        {
+          "name": "message null",
+          "body": "{\"message\":null}",
+          "status": 400,
+          "error": "invalid_envelope"
+        },
+        {
+          "name": "message number",
+          "body": "{\"message\":5}",
+          "status": 400,
+          "error": "invalid_envelope"
+        },
+        {
+          "name": "message string",
+          "body": "{\"message\":\"x\"}",
+          "status": 400,
+          "error": "invalid_envelope"
+        },
+        {
+          "name": "message array",
+          "body": "{\"message\":[]}",
+          "status": 400,
+          "error": "invalid_envelope"
+        },
+        {
+          "name": "message empty object",
+          "body": "{\"message\":{}}",
+          "status": 400,
+          "error": "invalid_envelope"
+        },
+        {
+          "name": "message missing envelope fields",
+          "body": "{\"message\":{\"ace\":\"1.0\"}}",
+          "status": 400,
+          "error": "invalid_envelope"
+        },
+        {
+          "name": "unknown request member ignored",
+          "body": "{\"message\":{},\"extra\":1}",
+          "status": 400,
+          "error": "invalid_envelope"
+        },
+        {
+          "name": "body of exactly MAX_DIRECT_BODY_BYTES",
+          "body": "{\"message\":5}",
+          "padTo": 132096,
+          "status": 400,
+          "error": "invalid_envelope"
+        },
+        {
+          "name": "body of MAX_DIRECT_BODY_BYTES + 1",
+          "body": "{\"message\":5}",
+          "padTo": 132097,
+          "status": 413,
+          "error": "payload_too_large"
+        },
+        {
+          "name": "non-JSON body of MAX_DIRECT_BODY_BYTES + 1",
+          "body": "x",
+          "padTo": 132097,
+          "status": 413,
+          "error": "payload_too_large"
+        }
+      ]
+    }
   }
 }

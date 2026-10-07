@@ -1,9 +1,10 @@
+import json
+
 from ace import (
     Inbox,
     MemoryStore,
     Outbox,
     PeerStore,
-    ReceiveSource,
     ReplayDetector,
     SoftwareIdentity,
     ThreadStateMachine,
@@ -40,7 +41,11 @@ envelope = create_message(
 # On the wire the envelope is JSON; the receiver decodes it strictly first.
 bob_threads = ThreadStateMachine(bob.get_ace_id())
 parsed = parse_message(
-    decode_envelope(envelope.to_dict()), bob, alice_peer, threads=bob_threads, replay=ReplayDetector()
+    decode_envelope(envelope.to_dict()),
+    bob,
+    alice_peer,
+    threads=bob_threads,
+    replay=ReplayDetector(),
 )
 print(parsed.type, parsed.body)
 print(bob_threads.allowed_types(parsed.conversation_id, "translation-1", bob.get_ace_id()))
@@ -48,7 +53,7 @@ print(bob_threads.allowed_types(parsed.conversation_id, "translation-1", bob.get
 # --- 2. Durable pipeline: Outbox -> transport -> Inbox ------------------------------------
 
 # Use FileStore("~/.ace/state") for real agents. With a relay:
-#   relay = RelayClient("https://relay.example"); relay.register(identity)
+#   relay = RelayClient("https://relay.aceprotocol.org"); relay.register(identity)
 #   peers = PeerStore(store, relay=relay); outbox.deliver(id, relay.send)
 #   result = inbox.pull(relay)  # result.outcomes (ReceiveOutcome list), result.blocked
 #   for outcome in inbox.follow(relay, stop=stop, on_live=lambda: print("live")): ...
@@ -70,10 +75,17 @@ outbox = Outbox.open(alice, alice_store)
 pending = outbox.stage(
     alice_peers.resolve(bob.get_ace_id()), "rfq", {"need": "Summarize a PDF"}, thread_id="deal-1"
 )
-# The transport here hands the envelope straight to Bob's inbox (direct delivery).
-outbox.deliver(
-    pending.request_id, lambda env: print(inbox.receive(env.to_dict(), ReceiveSource.direct()).kind)
-)
+
+
+# The transport here hands the envelope straight to Bob's direct endpoint handler: the HTTP
+# request body is {"message": envelope}, answered with receive_direct's status and body.
+# Across the network, use post_direct / deliver_direct_or_relay instead.
+def transport(env):
+    reply = inbox.receive_direct(json.dumps({"message": env.to_dict()}).encode())
+    print(reply.outcome.kind if reply.outcome else reply.body)
+
+
+outbox.deliver(pending.request_id, transport)
 
 (message,) = received.values()
 print(message.type, message.body)

@@ -61,7 +61,9 @@ class RelayAuthRequest:
         if a == "intent":
             if not isinstance(self.need, str):
                 raise _bad("need must be a string")
-            if not isinstance(self.tags, tuple) or not all(isinstance(t, str) and "," not in t for t in self.tags):
+            if not isinstance(self.tags, tuple) or not all(
+                isinstance(t, str) and "," not in t for t in self.tags
+            ):
                 raise _bad("tags must be strings without ','")
             for v in (self.max_price, self.currency):
                 if v is not None and not isinstance(v, str):
@@ -76,7 +78,10 @@ class RelayAuthRequest:
             if self.method == "PUT":
                 if not is_https_url(self.url):
                     raise _bad("url must match the ACE HTTPS URL grammar")
-                if not 16 <= len(self.secret) <= 128 or CONTROL_CHAR_RE.search(self.secret) is not None:
+                if (
+                    not 16 <= len(self.secret) <= 128
+                    or CONTROL_CHAR_RE.search(self.secret) is not None
+                ):
                     raise _bad("secret must be 16..128 characters without control characters")
             elif self.url != "" or self.secret != "":
                 raise _bad(f"{self.method} takes no url or secret")
@@ -97,12 +102,18 @@ class RelayAuthRequest:
 
     @classmethod
     def intent(
-        cls, need: str, tags: Sequence[str] = (), max_price: str | None = None,
-        currency: str | None = None, ttl: int = 0,
+        cls,
+        need: str,
+        tags: Sequence[str] = (),
+        max_price: str | None = None,
+        currency: str | None = None,
+        ttl: int = 0,
     ) -> "RelayAuthRequest":
         if isinstance(tags, str):
             raise _bad("tags must be a sequence of strings")
-        return cls("intent", need=need, tags=tuple(tags), max_price=max_price, currency=currency, ttl=ttl)
+        return cls(
+            "intent", need=need, tags=tuple(tags), max_price=max_price, currency=currency, ttl=ttl
+        )
 
     @classmethod
     def webhook(cls, method: str, url: str = "", secret: str = "") -> "RelayAuthRequest":
@@ -118,7 +129,11 @@ class RelayAuthRequest:
         if self.action == "webhook":
             return encode_payload(self.method, self.url, self.secret)  # type: ignore[arg-type]
         return encode_payload(
-            self.need, ",".join(self.tags), self.max_price or "", self.currency or "", decimal(self.ttl),  # type: ignore[arg-type]
+            self.need,
+            ",".join(self.tags),
+            self.max_price or "",
+            self.currency or "",
+            decimal(self.ttl),  # type: ignore[arg-type]
         )
 
 
@@ -126,7 +141,9 @@ def _sign_data(req: RelayAuthRequest, ace_id: str, timestamp: int) -> bytes:
     return build_sign_data(req.action, ace_id, timestamp, req.payload())
 
 
-def create_auth_headers(identity: ACEIdentity, req: RelayAuthRequest, timestamp: int) -> dict[str, str]:
+def create_auth_headers(
+    identity: ACEIdentity, req: RelayAuthRequest, timestamp: int
+) -> dict[str, str]:
     """``X-ACE-Id`` / ``X-ACE-Timestamp`` / ``X-ACE-Signature`` for one relay call."""
     if not isinstance(req, RelayAuthRequest):
         raise _bad("expected a RelayAuthRequest")
@@ -157,7 +174,11 @@ def parse_auth_headers(headers: Mapping[str, str | Sequence[str] | None]) -> Rel
             v = v[0] if v else None
         if isinstance(v, str):
             found[key] = v
-    ace_id, ts, sig = found.get("x-ace-id"), found.get("x-ace-timestamp"), found.get("x-ace-signature")
+    ace_id, ts, sig = (
+        found.get("x-ace-id"),
+        found.get("x-ace-timestamp"),
+        found.get("x-ace-signature"),
+    )
     if not is_ace_id(ace_id):
         raise _bad("X-ACE-Id is missing or not an ACE ID")
     timestamp = parse_timestamp(ts)
@@ -184,12 +205,18 @@ def verify_auth_headers(
     Stateless: it does not detect replays. The relay MUST additionally accept each
     ``(action, ace_id, signature)`` at most once while its timestamp is inside the window
     (409 ``replay``)."""
-    if not isinstance(auth, RelayAuth) or not isinstance(req, RelayAuthRequest) or scheme not in SIGNING_SCHEMES:
+    if (
+        not isinstance(auth, RelayAuth)
+        or not isinstance(req, RelayAuthRequest)
+        or scheme not in SIGNING_SCHEMES
+    ):
         raise _bad("expected RelayAuth, RelayAuthRequest and a signing scheme")
     check_wire_int(window_seconds, "window_seconds")
     if auth.ace_id != ace_id:
         raise _bad("X-ACE-Id does not match the signer")
     check_fresh(auth.timestamp, clock, window_seconds, "X-ACE-Timestamp")
     sig = decode_signature(auth.signature, scheme, "invalid_signature")
-    if not verify_signature(_sign_data(req, auth.ace_id, auth.timestamp), sig, scheme, signing_public_key):
+    if not verify_signature(
+        _sign_data(req, auth.ace_id, auth.timestamp), sig, scheme, signing_public_key
+    ):
         raise ACEError("invalid_signature", "X-ACE-Signature does not verify")

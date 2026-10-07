@@ -50,7 +50,9 @@ def test_allowed_types_and_snapshot():
     assert sm.allowed_types(CONV, "new", THIRD) == ["rfq"]
     snap = sm.get_snapshot(CONV, "t")
     assert snap.local_ace_id == BUYER and snap.peer_ace_id == SELLER and snap.state == "offered"
-    assert snap.history[1] == ThreadHistoryEntry("offer", "00000000-0000-4000-8000-000000000002", 1002, SELLER)
+    assert snap.history[1] == ThreadHistoryEntry(
+        "offer", "00000000-0000-4000-8000-000000000002", 1002, SELLER
+    )
     assert sm.get_snapshot(CONV, "missing") is None
     assert ThreadSnapshot.from_dict(snap.to_dict()) == snap
     assert sm.remove(CONV, "t") and not sm.remove(CONV, "t")
@@ -87,9 +89,15 @@ def test_from_state_round_trip_and_violations():
         dataclasses.replace(s, peer_ace_id=SELLER),
         dataclasses.replace(s, history=()),
         dataclasses.replace(s, history=(s.history[1], s.history[0])),
-        dataclasses.replace(s, history=(s.history[0], dataclasses.replace(s.history[1], from_id=BUYER))),
-        dataclasses.replace(s, history=(s.history[0], dataclasses.replace(s.history[1], from_id=THIRD))),
-        dataclasses.replace(s, history=(s.history[0], dataclasses.replace(s.history[1], message_id="x"))),
+        dataclasses.replace(
+            s, history=(s.history[0], dataclasses.replace(s.history[1], from_id=BUYER))
+        ),
+        dataclasses.replace(
+            s, history=(s.history[0], dataclasses.replace(s.history[1], from_id=THIRD))
+        ),
+        dataclasses.replace(
+            s, history=(s.history[0], dataclasses.replace(s.history[1], message_id="x"))
+        ),
         dataclasses.replace(s, conversation_id="C" * 64),
         dataclasses.replace(s, thread_id=""),
     ]

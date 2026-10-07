@@ -1,4 +1,4 @@
-"""The single ACE SDK exception type."""
+"""The single ACE SDK exception type (06-security § SDK Error Codes)."""
 
 from __future__ import annotations
 
@@ -14,14 +14,19 @@ ACEErrorCode = Literal[
     "wrong_party", "bad_reference", "limit_exceeded", "invalid_key", "invalid_registration",
     "invalid_profile", "invalid_peer", "stale_peer_binding", "unknown_peer", "not_registered",
     "relay_rejected", "envelope_expired", "pending_send_conflict", "blocked_address",
+    "direct_rejected",
     # transient
-    "relay_unavailable", "relay_protocol_error", "fetch_failed",
+    "relay_unavailable", "relay_protocol_error", "fetch_failed", "direct_unavailable",
     # local
-    "storage_failed", "identity_unavailable", "handler_failed", "receiver_busy",
+    "storage_failed", "identity_unavailable", "handler_failed", "receiver_busy", "lock_busy",
 ]
 
-_TRANSIENT = frozenset({"relay_unavailable", "relay_protocol_error", "fetch_failed"})
-_LOCAL = frozenset({"storage_failed", "identity_unavailable", "handler_failed", "receiver_busy"})
+_TRANSIENT = frozenset(
+    {"relay_unavailable", "relay_protocol_error", "fetch_failed", "direct_unavailable"}
+)
+_LOCAL = frozenset(
+    {"storage_failed", "identity_unavailable", "handler_failed", "receiver_busy", "lock_busy"}
+)
 _ALL_CODES = frozenset(get_args(ACEErrorCode))
 
 
@@ -43,6 +48,7 @@ class ACEError(Exception):
         *,
         status: int | None = None,
         relay_code: str | None = None,
+        remote_code: str | None = None,
         retry_after_seconds: int | None = None,
     ) -> None:
         if code not in _ALL_CODES:
@@ -52,6 +58,8 @@ class ACEError(Exception):
         self.message = message or code
         self.status = status
         self.relay_code = relay_code
+        #: ``direct_rejected``: the receiver's ``error`` string (08-relay § Direct Delivery).
+        self.remote_code = remote_code
         self.retry_after_seconds = retry_after_seconds
 
     @property

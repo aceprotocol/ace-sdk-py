@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ace import ACEError, Inbox, MemoryStore, Outbox, PeerStore, SoftwareIdentity
+from ace.registration import create_registration_file
 
 
 class Clock:
@@ -74,12 +75,20 @@ class Agent:
         self.inbox: Inbox | None = None
 
     def open(self, store=None, **kw) -> Inbox:
-        self.inbox = Inbox.open(self.identity, store or self.store, PeerStore(store or self.store, relay=self.peers._relay,
-                                clock=self.clock), self.host, clock=self.clock, **kw)
+        self.inbox = Inbox.open(
+            self.identity,
+            store or self.store,
+            PeerStore(store or self.store, relay=self.peers._relay, clock=self.clock),
+            self.host,
+            clock=self.clock,
+            **kw,
+        )
         return self.inbox
 
     def registration(self):
-        return self.identity.to_registration_file(name=self.name, endpoint=f"https://{self.name}.example/ace")
+        return create_registration_file(
+            self.identity, name=self.name, endpoint=f"https://{self.name}.example/ace"
+        )
 
     def pin(self, other: "Agent"):
         return self.peers.pin_registration_file(other.registration(), pinned_at=0)

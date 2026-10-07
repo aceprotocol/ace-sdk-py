@@ -32,7 +32,12 @@ TRANSITIONS: dict[tuple[str, str], tuple[str, str]] = {
 TERMINAL_STATES: frozenset[str] = frozenset({"rejected", "confirmed"})
 
 # type -> body field holding the reference
-_REFERENCE_FIELDS = {"accept": "offerId", "invoice": "offerId", "receipt": "referenceId", "confirm": "deliverId"}
+_REFERENCE_FIELDS = {
+    "accept": "offerId",
+    "invoice": "offerId",
+    "receipt": "referenceId",
+    "confirm": "deliverId",
+}
 
 DEFAULT_MAX_THREADS = 100_000
 DEFAULT_MAX_HISTORY_PER_THREAD = 1_000
@@ -57,7 +62,12 @@ class ThreadHistoryEntry:
     from_id: str
 
     def to_dict(self) -> dict[str, Any]:
-        return {"type": self.type, "messageId": self.message_id, "timestamp": self.timestamp, "from": self.from_id}
+        return {
+            "type": self.type,
+            "messageId": self.message_id,
+            "timestamp": self.timestamp,
+            "from": self.from_id,
+        }
 
 
 @dataclass(frozen=True)
@@ -94,8 +104,12 @@ class ThreadSnapshot:
                 raise bad
             history.append(ThreadHistoryEntry(h.get("type"), h.get("messageId"), ts, h.get("from")))  # type: ignore[arg-type]
         return ThreadSnapshot(
-            d.get("conversationId"), d.get("threadId"), d.get("localAceId"),  # type: ignore[arg-type]
-            d.get("peerAceId"), d.get("state"), tuple(history),  # type: ignore[arg-type]
+            d.get("conversationId"),
+            d.get("threadId"),
+            d.get("localAceId"),  # type: ignore[arg-type]
+            d.get("peerAceId"),
+            d.get("state"),
+            tuple(history),  # type: ignore[arg-type]
         )
 
 
@@ -135,26 +149,34 @@ class ThreadStateMachine:
 
     # --- core rules ---
 
-    def _decide(self, e: ThreadEvent, body: object, *, check_refs: bool = True) -> tuple[str, _Thread | None]:
+    def _decide(
+        self, e: ThreadEvent, body: object, *, check_refs: bool = True
+    ) -> tuple[str, _Thread | None]:
         """Run check order 1-7 and return (next_state, existing thread). Caller holds the lock."""
         if not is_thread_id(e.thread_id):
             raise ACEError("invalid_envelope", "economic messages require a valid threadId")
         local = self.local_ace_id
         if local not in (e.from_id, e.to_id) or e.from_id == e.to_id:
-            raise ACEError("wrong_party", "the local identity is not exactly one party of this message")
+            raise ACEError(
+                "wrong_party", "the local identity is not exactly one party of this message"
+            )
         thread = self._threads.get((e.conversation_id, e.thread_id))  # type: ignore[arg-type]
         if thread is not None and {local, thread.peer} != {e.from_id, e.to_id}:
             raise ACEError("wrong_party", "message is not between the thread's two parties")
         state = thread.state if thread else "idle"
         rule = None if state in TERMINAL_STATES else TRANSITIONS.get((state, e.type))
         if rule is None:
-            raise ACEError("transition_not_allowed", f"{e.type!r} is not allowed in state {state!r}")
+            raise ACEError(
+                "transition_not_allowed", f"{e.type!r} is not allowed in state {state!r}"
+            )
         next_state, role = rule
         if thread is not None:
             buyer = thread.history[0].from_id
             sender_role = "buyer" if e.from_id == buyer else "seller"
             if sender_role != role:
-                raise ACEError("wrong_role", f"{e.type!r} in state {state!r} must come from the {role}")
+                raise ACEError(
+                    "wrong_role", f"{e.type!r} in state {state!r} must come from the {role}"
+                )
         if check_refs and e.type in _REFERENCE_FIELDS:
             field = _REFERENCE_FIELDS[e.type]
             ref = body.get(field) if isinstance(body, dict) else None
@@ -163,7 +185,9 @@ class ThreadStateMachine:
             assert thread is not None
             expected = thread.history[-2 if e.type == "invoice" else -1].message_id
             if ref != expected:
-                raise ACEError("bad_reference", f"{e.type}.{field} does not reference the required message")
+                raise ACEError(
+                    "bad_reference", f"{e.type}.{field} does not reference the required message"
+                )
         if thread is None:
             if len(self._threads) >= self._max_threads:
                 raise ACEError("limit_exceeded", f"thread limit {self._max_threads} reached")
@@ -218,7 +242,9 @@ class ThreadStateMachine:
             t = self._threads.get((conversation_id, thread_id))
             if t is None:
                 return None
-            return ThreadSnapshot(conversation_id, thread_id, self.local_ace_id, t.peer, t.state, tuple(t.history))
+            return ThreadSnapshot(
+                conversation_id, thread_id, self.local_ace_id, t.peer, t.state, tuple(t.history)
+            )
 
     def allowed_types(self, conversation_id: str, thread_id: str, sender_ace_id: str) -> list[str]:
         """Economic types ``sender_ace_id`` may send next (table order)."""
@@ -229,7 +255,11 @@ class ThreadStateMachine:
             if sender_ace_id not in (self.local_ace_id, t.peer) or t.state in TERMINAL_STATES:
                 return []
             role = "buyer" if sender_ace_id == t.history[0].from_id else "seller"
-            return [typ for (state, typ), (_, r) in TRANSITIONS.items() if state == t.state and r == role]
+            return [
+                typ
+                for (state, typ), (_, r) in TRANSITIONS.items()
+                if state == t.state and r == role
+            ]
 
     def is_terminal(self, conversation_id: str, thread_id: str) -> bool:
         return self.get_state(conversation_id, thread_id) in TERMINAL_STATES
@@ -254,11 +284,14 @@ class ThreadStateMachine:
         max_threads: int = DEFAULT_MAX_THREADS,
         max_history_per_thread: int = DEFAULT_MAX_HISTORY_PER_THREAD,
     ) -> "ThreadStateMachine":
-        """Replay every snapshot's history under the party/role rules; any violation is ``invalid_argument``.
+        """Replay every snapshot's history under the party/role rules; any violation is
+        ``invalid_argument``.
 
         Reference positions cannot be re-checked (bodies are not stored).
         """
-        sm = cls(local_ace_id, max_threads=max_threads, max_history_per_thread=max_history_per_thread)
+        sm = cls(
+            local_ace_id, max_threads=max_threads, max_history_per_thread=max_history_per_thread
+        )
 
         def bad(msg: str) -> ACEError:
             return ACEError("invalid_argument", f"from_state: {msg}")
@@ -280,13 +313,24 @@ class ThreadStateMachine:
                 raise bad("history must not be empty")
             for h in snap.history:
                 if (
-                    not isinstance(h, ThreadHistoryEntry) or h.type not in ECONOMIC_TYPES
-                    or not is_message_id(h.message_id) or wire_int(h.timestamp) is None
-                    or isinstance(h.timestamp, float) or h.from_id not in (local_ace_id, snap.peer_ace_id)
+                    not isinstance(h, ThreadHistoryEntry)
+                    or h.type not in ECONOMIC_TYPES
+                    or not is_message_id(h.message_id)
+                    or wire_int(h.timestamp) is None
+                    or isinstance(h.timestamp, float)
+                    or h.from_id not in (local_ace_id, snap.peer_ace_id)
                 ):
                     raise bad("invalid history entry")
                 to_id = snap.peer_ace_id if h.from_id == local_ace_id else local_ace_id
-                e = ThreadEvent(snap.conversation_id, snap.thread_id, h.type, h.message_id, h.timestamp, h.from_id, to_id)
+                e = ThreadEvent(
+                    snap.conversation_id,
+                    snap.thread_id,
+                    h.type,
+                    h.message_id,
+                    h.timestamp,
+                    h.from_id,
+                    to_id,
+                )
                 try:
                     next_state, thread = sm._decide(e, None, check_refs=False)
                 except ACEError as exc:

@@ -26,6 +26,10 @@ JSONValue = Union[None, bool, int, float, str, List["JSONValue"], Dict[str, "JSO
 JSONObject = Dict[str, JSONValue]
 
 
+def is_signing_scheme(s: object) -> bool:
+    return isinstance(s, str) and s in SIGNING_SCHEMES
+
+
 def is_message_type(t: object) -> bool:
     return isinstance(t, str) and t in MESSAGE_TYPES
 
@@ -305,7 +309,7 @@ class DiscoverQuery:
     """Query parameters for GET /v1/discover."""
 
     q: str | None = None
-    tags: str | None = None
+    tags: list[str] | tuple[str, ...] | None = None  # sent comma-joined
     chain: str | None = None
     scheme: str | None = None
     online: bool | None = None
@@ -391,7 +395,10 @@ class ACEMessage:
             "conversationId": self.conversation_id,
             "type": self.type,
             "timestamp": self.timestamp,
-            "encryption": {"kemCiphertext": self.encryption.kem_ciphertext, "payload": self.encryption.payload},
+            "encryption": {
+                "kemCiphertext": self.encryption.kem_ciphertext,
+                "payload": self.encryption.payload,
+            },
             "signature": {"scheme": self.signature.scheme, "value": self.signature.value},
         }
         if self.thread_id is not None:
@@ -412,6 +419,7 @@ class ParsedMessage:
 
 
 # --- bodies -------------------------------------------------------------------------
+
 
 class _RfqRequired(TypedDict):
     need: str

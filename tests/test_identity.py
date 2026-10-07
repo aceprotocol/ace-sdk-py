@@ -43,20 +43,29 @@ def test_invalid_constructor_inputs():
     with raises("invalid_key"):
         SoftwareIdentity("ed25519", b"\x01" * 32, b"\x02" * 31)
     with raises("invalid_key"):
-        SoftwareIdentity.from_export({"scheme": "ed25519", "signingPrivateKey": "QR==", "encryptionPrivateKey": ""})
+        SoftwareIdentity.from_export(
+            {"scheme": "ed25519", "signingPrivateKey": "QR==", "encryptionPrivateKey": ""}
+        )
     with raises("invalid_argument"):
         SoftwareIdentity.generate("ed25519").sign(b"short")
 
 
 def test_registration_file_tier_and_validation():
     ident = SoftwareIdentity.generate("secp256k1")
-    reg = ident.to_registration_file(name="Agent", endpoint="https://agent.example/ace", tier=1)
+    reg = create_registration_file(
+        ident, name="Agent", endpoint="https://agent.example/ace", tier=1
+    )
     assert reg.tier == 1 and reg.signing.signing_public_key is not None
-    assert SoftwareIdentity.generate("ed25519").to_registration_file(name="A", endpoint="https://a.example").tier == 0
+    assert (
+        create_registration_file(
+            SoftwareIdentity.generate("ed25519"), name="A", endpoint="https://a.example"
+        ).tier
+        == 0
+    )
     with raises("invalid_registration"):
-        ident.to_registration_file(name="Agent", endpoint="http://agent.example")
+        create_registration_file(ident, name="Agent", endpoint="http://agent.example")
     with raises("invalid_registration"):
-        ident.to_registration_file(name="", endpoint="https://agent.example")
+        create_registration_file(ident, name="", endpoint="https://agent.example")
 
 
 def test_seed_helpers_and_decrypt_errors():
@@ -132,9 +141,15 @@ class _WrappedIdentity:
 def test_create_registration_file_for_any_identity(scheme):
     sw = SoftwareIdentity.generate(scheme)
     hw = _WrappedIdentity(sw)
-    opts = dict(name="HW", endpoint="https://hw.example/ace", tier=1, hardware_backing="secure-enclave", settlement=["x402"])
+    opts = dict(
+        name="HW",
+        endpoint="https://hw.example/ace",
+        tier=1,
+        hardware_backing="secure-enclave",
+        settlement=["x402"],
+    )
     reg = create_registration_file(hw, **opts)
-    assert reg == sw.to_registration_file(**opts)
+    assert reg == create_registration_file(sw, **opts)
     assert reg.signing.address == sw.get_address()
     assert verify_registration_file(reg, pinned_at=1).ace_id == sw.get_ace_id()
     with raises("invalid_registration"):

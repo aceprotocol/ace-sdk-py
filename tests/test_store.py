@@ -45,7 +45,9 @@ def test_read_write_delete_list(store):
     assert store.list("threads/") == ["threads/y.json"]
 
 
-@pytest.mark.parametrize("key", ["", "/a", "a/", "A", "a//b", ".tmp", "a/.b", "x" * 201, "a b", None, "ä"])
+@pytest.mark.parametrize(
+    "key", ["", "/a", "a/", "A", "a//b", ".tmp", "a/.b", "x" * 201, "a b", None, "ä"]
+)
 def test_key_grammar(store, key):
     with raises("invalid_argument"):
         store.write(key, b"x")
@@ -53,11 +55,31 @@ def test_key_grammar(store, key):
         store.read(key)
 
 
+@pytest.mark.parametrize("name", ["", "a/b", "a.b", "A", "-a", "x" * 65, None, "é"])
+def test_lock_name_grammar(store, name):
+    with raises("invalid_argument"):
+        store.lock(name, timeout=0)
+
+
+def test_lock_name_longest(store):
+    with store.lock("a" * 64, timeout=0):
+        pass
+
+
+def test_write_rejects_oversized_value(store, monkeypatch):
+    import ace.store as st
+
+    monkeypatch.setattr(st, "MAX_VALUE_BYTES", 10)
+    with raises("invalid_argument"):
+        store.write("big.json", b"x" * 11)
+    assert store.read("big.json") is None
+
+
 def test_lock_exclusive_and_timeout(store):
     with store.lock("threads"):
-        with raises("storage_failed"):
+        with raises("lock_busy"):
             store.lock("threads", timeout=0.1)
-        with raises("storage_failed"):
+        with raises("lock_busy"):
             store.lock("threads", timeout=0)  # non-reentrant
         with store.lock("peers", timeout=0):
             pass
@@ -93,6 +115,7 @@ def test_lock_across_threads(store):
 
 
 # --- FileStore specifics ------------------------------------------------------------------
+
 
 def test_file_permissions_and_layout(tmp_path):
     fs = FileStore(tmp_path / "s")
@@ -151,7 +174,8 @@ def test_stale_lock_dead_pid(tmp_path):
     p.join()
     (tmp_path / "s" / "locks").mkdir(mode=0o700)
     (tmp_path / "s" / "locks" / "peers.lock").write_text(
-        json.dumps({"createdAt": 1, "host": socket.gethostname(), "pid": p.pid}))
+        json.dumps({"createdAt": 1, "host": socket.gethostname(), "pid": p.pid})
+    )
     with fs.lock("peers", timeout=0):
         pass
 
@@ -161,10 +185,10 @@ def test_stale_lock_other_host_or_live_pid_is_respected(tmp_path):
     (tmp_path / "s" / "locks").mkdir(mode=0o700)
     lock = tmp_path / "s" / "locks" / "peers.lock"
     lock.write_text(json.dumps({"createdAt": 1, "host": "elsewhere", "pid": 999999}))
-    with raises("storage_failed"):
+    with raises("lock_busy"):
         fs.lock("peers", timeout=0.1)
     lock.write_text(json.dumps({"createdAt": 1, "host": socket.gethostname(), "pid": os.getppid()}))
-    with raises("storage_failed"):
+    with raises("lock_busy"):
         fs.lock("peers", timeout=0.1)
 
 
@@ -173,7 +197,7 @@ def test_unparseable_lock(tmp_path):
     (tmp_path / "s" / "locks").mkdir(mode=0o700)
     lock = tmp_path / "s" / "locks" / "threads.lock"
     lock.write_text("garbage")
-    with raises("storage_failed"):
+    with raises("lock_busy"):
         fs.lock("threads", timeout=0.1)  # fresh: respected
     old = time.time() - 120
     os.utime(lock, (old, old))
@@ -191,6 +215,7 @@ def test_release_only_own_content(tmp_path):
 
 
 # --- two processes -------------------------------------------------------------------------
+
 
 def _noop():
     pass
@@ -217,7 +242,7 @@ def test_lock_contention_two_processes(tmp_path):
     ctx = multiprocessing.get_context("spawn")
     root = str(tmp_path / "s")
     FileStore(root)
-    for name, busy in (("receive", "receiver_busy"), ("threads", "storage_failed")):
+    for name, busy in (("receive", "receiver_busy"), ("threads", "lock_busy")):
         ready, release, result = ctx.Event(), ctx.Event(), ctx.Queue()
         holder = ctx.Process(target=_hold_lock, args=(root, name, ready, release))
         holder.start()
