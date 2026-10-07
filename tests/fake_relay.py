@@ -30,6 +30,8 @@ class FakeRelay:
         self.stored: dict[tuple[str, str], str] = {}  # (from, messageId) -> fingerprint
         self.seen_auth: set[tuple[str, str, str]] = set()
         self.intents: list[dict] = []
+        self.webhooks: dict[str, dict] = {}  # aceId -> {url, secret, ...}
+        self.auth_actions: list[str] = []
         self.extra_agents: list[dict] = []
         self.inject: list[tuple[str, int, str, dict]] = []  # (path, status, code, headers)
         self.drain_after: int | None = None
@@ -52,6 +54,12 @@ class FakeRelay:
 
             def do_POST(self):
                 relay._dispatch(self, "POST")
+
+            def do_PUT(self):
+                relay._dispatch(self, "PUT")
+
+            def do_DELETE(self):
+                relay._dispatch(self, "DELETE")
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
@@ -97,6 +105,7 @@ class FakeRelay:
         if key in self.seen_auth:
             raise _HTTPError(409, "replay")
         self.seen_auth.add(key)
+        self.auth_actions.append(req.action)
         return auth.ace_id
 
     def _next_id(self) -> str:
@@ -298,6 +307,22 @@ class FakeRelay:
 
     def _get_v1_intents(self, h, query, body):
         self._reply(h, 200, {"intents": self.intents, "cursor": None})
+
+    def _put_v1_webhook(self, h, query, body):
+        ace_id = self._auth(h, RelayAuthRequest.webhook("PUT", body["url"], body["secret"]))
+        self.webhooks[ace_id] = {"url": body["url"], "secret": body["secret"], "updatedAt": self.clock()}
+        self._reply(h, 200, {"ok": True})
+
+    def _get_v1_webhook(self, h, query, body):
+        ace_id = self._auth(h, RelayAuthRequest.webhook("GET"))
+        w = self.webhooks.get(ace_id)
+        out = None if w is None else {"url": w["url"], "status": "active", "failures": 0, "updatedAt": w["updatedAt"]}
+        self._reply(h, 200, {"webhook": out})
+
+    def _delete_v1_webhook(self, h, query, body):
+        ace_id = self._auth(h, RelayAuthRequest.webhook("DELETE"))
+        self.webhooks.pop(ace_id, None)
+        self._reply(h, 200, {"ok": True})
 
 
 class _HTTPError(Exception):

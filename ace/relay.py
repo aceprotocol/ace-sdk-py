@@ -391,11 +391,19 @@ class RelayClient:
         w = obj.get("webhook")
         if w is None:
             return None
-        if not isinstance(w, dict) or not isinstance(w.get("url"), str) or w.get("status") not in ("active", "disabled") \
-                or wire_int(w.get("failures")) is None or wire_int(w.get("updatedAt")) is None:
+        if not isinstance(w, dict):
+            raise _protocol("webhook must be an object or null")
+        failures, updated_at = wire_int(w.get("failures")), wire_int(w.get("updatedAt"))
+        delivered, last_error = w.get("lastDeliveredAt"), w.get("lastError")
+        delivered_at = None if delivered is None else wire_int(delivered)
+        if (
+            not isinstance(w.get("url"), str) or w.get("status") not in ("active", "disabled")
+            or failures is None or updated_at is None
+            or (delivered is not None and delivered_at is None)
+            or not (last_error is None or isinstance(last_error, str))
+        ):
             raise _protocol("webhook response must be {url, status, failures, updatedAt, …}")
-        return Webhook(w["url"], w["status"], w["failures"], w["updatedAt"], wire_int(w.get("lastDeliveredAt")),
-                       w.get("lastError") if isinstance(w.get("lastError"), str) else None)
+        return Webhook(w["url"], w["status"], failures, updated_at, delivered_at, last_error)
 
     def clear_webhook(self, identity: ACEIdentity) -> None:
         self._call("DELETE", "/v1/webhook", identity=identity, auth=RelayAuthRequest.webhook("DELETE"))

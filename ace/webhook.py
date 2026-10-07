@@ -33,9 +33,10 @@ def verify_webhook_notification(
 ) -> WebhookNotification:
     """Verify ``X-ACE-Webhook-Timestamp`` / ``X-ACE-Webhook-Signature`` over the raw ``body``.
 
-    Check order: malformed inputs -> ``invalid_argument``; freshness -> ``stale_timestamp``;
-    HMAC -> ``invalid_signature``; then the body must be ``{"event":"message","aceId","streamId"}``
-    (``invalid_argument``)."""
+    Check order: non-string inputs or a malformed timestamp -> ``invalid_argument``; a signature
+    not shaped ``sha256=<64 lowercase hex>`` -> ``invalid_signature``; freshness ->
+    ``stale_timestamp``; HMAC (constant-time) -> ``invalid_signature``; then the body must be
+    ``{"event":"message","aceId","streamId"}`` (``invalid_argument``)."""
     if not isinstance(secret, str) or not isinstance(timestamp, str) or not isinstance(signature, str):
         raise ACEError("invalid_argument", "secret, timestamp and signature must be strings")
     if _TS_RE.fullmatch(timestamp) is None:

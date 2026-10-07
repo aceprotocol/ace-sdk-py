@@ -4,10 +4,13 @@ import json
 
 import pytest
 
-from ace import ACEError
+from ace import ACEError, RelayClient, SoftwareIdentity
 from ace._signing import build_sign_data, encode_payload
 from ace.auth import RelayAuthRequest
+from ace.relay import Webhook
 from ace.webhook import verify_webhook_notification
+
+from .fake_relay import FakeRelay
 
 SECRET = "0123456789abcdef0123456789abcdef"
 TS = 1741000000
@@ -73,3 +76,79 @@ def test_verify_notification_rejects(kwargs, code):
     with pytest.raises(ACEError) as info:
         verify_webhook_notification(**args)
     assert info.value.code == code
+
+
+def test_verify_notification_stale_checked_before_hmac():
+    with pytest.raises(ACEError) as info:
+        verify_webhook_notification(secret=SECRET, timestamp=str(TS), signature=sig(secret="wrong-secret-wrong-secret"),
+                                    body=BODY, clock=lambda: TS + 301)
+    assert info.value.code == "stale_timestamp"
+
+
+# --- RelayClient webhook endpoints against the fake relay ---
+
+@pytest.fixture
+def relay():
+    r = FakeRelay()
+    yield r
+    r.close()
+
+
+def test_relay_webhook_round_trip(relay):
+    alice = SoftwareIdentity.generate("ed25519")
+    client = RelayClient(relay.url)
+    client.register(alice)
+    assert client.get_webhook(alice) is None
+    client.set_webhook(alice, "https://example.com/hook", SECRET)
+    assert relay.webhooks[alice.get_ace_id()]["url"] == "https://example.com/hook"
+    assert relay.webhooks[alice.get_ace_id()]["secret"] == SECRET
+    w = client.get_webhook(alice)
+    assert isinstance(w, Webhook)
+    assert (w.url, w.status, w.failures, w.last_delivered_at, w.last_error) == \
+        ("https://example.com/hook", "active", 0, None, None)
+    client.clear_webhook(alice)
+    assert client.get_webhook(alice) is None
+    assert relay.auth_actions == ["webhook"] * 5
+    assert [r for r in relay.requests if r[1] == "/v1/webhook"] == [
+        ("GET", "/v1/webhook"), ("PUT", "/v1/webhook"), ("GET", "/v1/webhook"),
+        ("DELETE", "/v1/webhook"), ("GET", "/v1/webhook"),
+    ]
+
+
+def test_relay_set_webhook_validates_locally(relay):
+    alice = SoftwareIdentity.generate("ed25519")
+    with pytest.raises(ACEError) as info:
+        RelayClient(relay.url).set_webhook(alice, "http://example.com/hook", SECRET)
+    assert info.value.code == "invalid_argument"
+    assert relay.requests == []
+
+
+GOOD = {"url": "https://example.com/hook", "status": "disabled", "failures": 3, "updatedAt": TS}
+
+
+@pytest.mark.parametrize("webhook", [
+    "nope",
+    {k: v for k, v in GOOD.items() if k != "updatedAt"},
+    {**GOOD, "status": "paused"},
+    {**GOOD, "failures": "x"},
+    {**GOOD, "failures": -1},
+    {**GOOD, "url": 5},
+    {**GOOD, "lastDeliveredAt": "yesterday"},
+    {**GOOD, "lastDeliveredAt": 1.5},
+    {**GOOD, "lastError": 42},
+])
+def test_relay_get_webhook_rejects_malformed(relay, webhook):
+    alice = SoftwareIdentity.generate("ed25519")
+    relay.raw_responses["/v1/webhook"] = (200, json.dumps({"webhook": webhook}).encode(), "application/json")
+    with pytest.raises(ACEError) as info:
+        RelayClient(relay.url).get_webhook(alice)
+    assert info.value.code == "relay_protocol_error"
+
+
+def test_relay_get_webhook_coerces_wire_ints(relay):
+    alice = SoftwareIdentity.generate("ed25519")
+    raw = {**GOOD, "failures": 3.0, "updatedAt": float(TS), "lastDeliveredAt": float(TS - 5), "lastError": "HTTP 500"}
+    relay.raw_responses["/v1/webhook"] = (200, json.dumps({"webhook": raw}).encode(), "application/json")
+    w = RelayClient(relay.url).get_webhook(alice)
+    assert w == Webhook("https://example.com/hook", "disabled", 3, TS, TS - 5, "HTTP 500")
+    assert type(w.failures) is int and type(w.updated_at) is int and type(w.last_delivered_at) is int
