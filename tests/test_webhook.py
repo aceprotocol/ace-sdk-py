@@ -78,6 +78,29 @@ def test_verify_notification_rejects(kwargs, code):
     assert info.value.code == code
 
 
+@pytest.mark.parametrize("kwargs", [
+    dict(window_seconds=-1),
+    dict(window_seconds=1.5),
+    dict(window_seconds="300"),
+    dict(window_seconds=True),
+    dict(window_seconds=None),
+    dict(body="\ud800"),  # lone surrogate: not UTF-8 encodable
+    dict(secret="0123456789abcdef\udfff"),
+])
+def test_verify_notification_rejects_bad_arguments(kwargs):
+    args = dict(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY, clock=lambda: TS)
+    args.update(kwargs)
+    with pytest.raises(ACEError) as info:
+        verify_webhook_notification(**args)
+    assert info.value.code == "invalid_argument"
+
+
+def test_verify_notification_window_zero_is_allowed():
+    n = verify_webhook_notification(secret=SECRET, timestamp=str(TS), signature=sig(), body=BODY, clock=lambda: TS,
+                                    window_seconds=0)
+    assert n.stream_id == "1741000000000-0"
+
+
 def test_verify_notification_stale_checked_before_hmac():
     with pytest.raises(ACEError) as info:
         verify_webhook_notification(secret=SECRET, timestamp=str(TS), signature=sig(secret="wrong-secret-wrong-secret"),

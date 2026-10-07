@@ -34,7 +34,8 @@ def verify_webhook_notification(
     """Verify ``X-ACE-Webhook-Timestamp`` / ``X-ACE-Webhook-Signature`` over the raw ``body``.
 
     Check order: non-string inputs or a malformed timestamp -> ``invalid_argument``; a signature
-    not shaped ``sha256=<64 lowercase hex>`` -> ``invalid_signature``; freshness ->
+    not shaped ``sha256=<64 lowercase hex>`` -> ``invalid_signature``; ``window_seconds`` not an
+    int >= 0, or a secret / str body that is not UTF-8 encodable -> ``invalid_argument``; freshness ->
     ``stale_timestamp``; HMAC (constant-time) -> ``invalid_signature``; then the body must be
     ``{"event":"message","aceId","streamId"}`` (``invalid_argument``)."""
     if not isinstance(secret, str) or not isinstance(timestamp, str) or not isinstance(signature, str):
@@ -43,10 +44,16 @@ def verify_webhook_notification(
         raise ACEError("invalid_argument", "X-ACE-Webhook-Timestamp is malformed")
     if _SIG_RE.fullmatch(signature) is None:
         raise ACEError("invalid_signature", "X-ACE-Webhook-Signature is malformed")
-    raw = body.encode("utf-8") if isinstance(body, str) else bytes(body)
+    if type(window_seconds) is not int or window_seconds < 0:
+        raise ACEError("invalid_argument", "window_seconds must be a non-negative integer")
+    try:
+        raw = body.encode("utf-8") if isinstance(body, str) else bytes(body)
+        key = secret.encode("utf-8")
+    except UnicodeEncodeError:  # e.g. lone surrogates in a str
+        raise ACEError("invalid_argument", "secret and body must be encodable as UTF-8") from None
     ts = int(timestamp)
     check_fresh(ts, clock, window_seconds, "X-ACE-Webhook-Timestamp")
-    expected = hmac.new(secret.encode("utf-8"), f"{ts}.".encode() + raw, hashlib.sha256).hexdigest()
+    expected = hmac.new(key, f"{ts}.".encode() + raw, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, signature[len("sha256="):]):
         raise ACEError("invalid_signature", "X-ACE-Webhook-Signature does not verify")
     try:
