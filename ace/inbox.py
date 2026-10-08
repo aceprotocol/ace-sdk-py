@@ -782,9 +782,14 @@ class Inbox:
             try:
                 peer = self._refresh_principal_sender(env, peer, now)
             except ACEError as exc:
-                return ReceiveOutcome(
-                    "retryable", error=exc, from_id=env.from_id, message_id=env.message_id
-                )
+                if exc.is_transient:
+                    return ReceiveOutcome(
+                        "retryable", error=exc, from_id=env.from_id, message_id=env.message_id
+                    )
+                try:
+                    return self._quarantine(exc, env, source)
+                except ACEError as store_exc:
+                    return ReceiveOutcome("retryable", error=store_exc)
         # 5-7: economic types under ``threads``; a decision under ``requests`` from the open-
         # request check through the requests/ fill (R-P25)
         economic = is_economic_type(env.type)

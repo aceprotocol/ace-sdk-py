@@ -202,6 +202,22 @@ the window (default `TIMESTAMP_WINDOW_SECONDS`) is `stale_timestamp`, a wrong HM
 - **Relay auth.** `create_auth_headers(identity, RelayAuthRequest.inbox("-", 100), ts)` builds
   `X-ACE-Id` / `X-ACE-Timestamp` / `X-ACE-Signature`; relays use `parse_auth_headers` +
   `verify_auth_headers`.
+- **Principal (0.3.0).** `create_principal_record(PrincipalSigner(...), subject_signing_public_key=...,
+  account=..., roles=[...])` signs a 09-principal record with any key source;
+  `validate_principal_record(record, subject_signing_public_key, now)` runs 09 rules 1-10 (every
+  failure is `invalid_principal`). Put the record in `AgentProfile(principal=...)` or
+  `create_registration_file(..., principal=...)`; peers carrying one are verified on resolution.
+  `Inbox.open(..., principal={"account": "<CAIP-10>", "selfSigner": {...}, "trustedSigners": [...]})`
+  enables the `request` / `decision` / `report` messages (same-account rules, `wrong_principal`,
+  `bad_reference`). The default is fail-closed: `selfSigner` defaults to None and `trustedSigners`
+  to empty, so only an `eip155` account whose address is the signer's own passes 09 step 4; without
+  `principal` every principal message is `wrong_principal`. The Outbox keeps a `requests/` ledger of
+  open requests, which a `decision` is matched against under the `requests` lock. When a sender's
+  pinned principal fails 09 steps 2-5, the Inbox refreshes the peer from the relay once (only for
+  envelopes authenticated by the pinned signing key); a transient refresh failure yields a
+  `retryable` outcome (the cursor stays), a permanent one is quarantined. The shared
+  `test-vectors.json` v4 lands in Task 8, so the two `test_registrations` vector tests still fail
+  until then.
 - **Limits.** `MAX_PLAINTEXT_BYTES`, `MAX_PAYLOAD_BYTES`, `MAX_ENVELOPE_BYTES`, … mirror the
   04 "Size Limits" table.
 

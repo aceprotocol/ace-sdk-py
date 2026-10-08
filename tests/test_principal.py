@@ -785,6 +785,21 @@ def test_transient_refresh_failure_is_retryable_then_accepted():
     assert r.kind == "delivered" and relay.calls == 3 and ia._cursors[RELAY] == "1-0"
 
 
+def test_permanent_error_in_principal_sender_refresh_is_quarantined_not_retried(monkeypatch):
+    relay = _FakeRelay()
+    clock, owner, a, b, pb = _pair_with_principals(relay=relay, pin_b_principal=False)
+    ia = _open(a, owner)
+
+    def boom(env, peer, now):
+        raise ACEError("invalid_principal", "unusable")
+
+    monkeypatch.setattr(ia, "_refresh_principal_sender", boom)
+    p = b.outbox.stage(b.peers.get(a.id), "request", {"action": "pay", "summary": "s"})
+    r = ia.receive(wire(p.message), ReceiveSource.relay(RELAY, "1-0"))
+    assert r.kind == "quarantined" and r.error.code == "invalid_principal"
+    assert ia._cursors[RELAY] == "1-0" and not ia._failed
+
+
 def test_wrong_principal_after_permanent_or_useless_refresh():
     relay = _FakeRelay(error=ACEError("unknown_peer", "gone"))
     clock, owner, a, b, pb = _pair_with_principals(relay=relay, pin_b_principal=False)

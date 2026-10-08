@@ -1,6 +1,6 @@
 """ACE Protocol SDK — Agent Commerce Engine."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from ._encoding import (
     from_base64,

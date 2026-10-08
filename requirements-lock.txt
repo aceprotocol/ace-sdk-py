@@ -1,4 +1,4 @@
-# Pinned dependency versions for ace-sdk v0.2.0
+# Pinned dependency versions for ace-sdk v0.3.0
 # Generated: 2026-10-06
 # Python: 3.13
 #
