@@ -191,7 +191,7 @@ def test_limits():
 
 
 def test_error_categories():
-    assert len(_ALL_CODES) == 37
+    assert len(_ALL_CODES) == 39
     for code in ("relay_unavailable", "relay_protocol_error", "fetch_failed", "direct_unavailable"):
         e = ACEError(code)
         assert e.category == "transient" and e.is_transient

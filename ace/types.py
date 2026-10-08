@@ -13,12 +13,15 @@ HardwareBacking = Literal["secure-enclave", "tpm", "hsm", "tee"]
 
 MessageType = Literal[
     "rfq", "offer", "accept", "reject", "invoice", "receipt", "deliver", "confirm", "info", "text",
+    "request", "decision", "report",
 ]
 
 MESSAGE_TYPES: tuple[str, ...] = (
     "rfq", "offer", "accept", "reject", "invoice", "receipt", "deliver", "confirm", "info", "text",
+    "request", "decision", "report",
 )
 ECONOMIC_TYPES: tuple[str, ...] = MESSAGE_TYPES[:8]
+PRINCIPAL_TYPES: tuple[str, ...] = MESSAGE_TYPES[10:]
 
 SIGNING_SCHEMES: tuple[str, ...] = ("ed25519", "secp256k1")
 
@@ -36,6 +39,10 @@ def is_message_type(t: object) -> bool:
 
 def is_economic_type(t: object) -> bool:
     return isinstance(t, str) and t in ECONOMIC_TYPES
+
+
+def is_principal_type(t: object) -> bool:
+    return isinstance(t, str) and t in PRINCIPAL_TYPES
 
 
 class ACEIdentity(Protocol):
@@ -493,3 +500,44 @@ class InfoBody(TypedDict):
 
 class TextBody(TypedDict):
     message: str
+
+
+class MessageRef(TypedDict, total=False):
+    conversationId: str
+    threadId: str
+    messageId: str
+
+
+class _RequestRequired(TypedDict):
+    action: str
+    summary: str
+
+
+class RequestBody(_RequestRequired, total=False):
+    ref: MessageRef
+    amount: str
+    currency: str
+    details: dict
+    ttl: int
+
+
+class _DecisionRequired(TypedDict):
+    requestId: str
+    outcome: Literal["approve", "deny"]
+
+
+class DecisionBody(_DecisionRequired, total=False):
+    reason: str
+    result: dict
+
+
+class _ReportRequired(TypedDict):
+    action: str
+    summary: str
+    outcome: Literal["ok", "failed", "skipped"]
+
+
+class ReportBody(_ReportRequired, total=False):
+    ref: MessageRef
+    requestId: str
+    proof: dict

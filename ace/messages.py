@@ -11,6 +11,8 @@ from ._encoding import (
     decode_signature,
     dumps_body,
     encode_signature,
+    is_conversation_id,
+    is_message_id,
     is_thread_id,
     loads_body,
     to_base64,
@@ -69,7 +71,45 @@ _SCHEMAS: dict[str, tuple[tuple[str, str], ...]] = {
     "confirm": (("deliverId", _STR), ("message", _OPT_STR)),
     "info": (("message", _STR),),
     "text": (("message", _STR),),
+    "request": (
+        ("action", _STR),
+        ("summary", _STR),
+        ("ref", _OPT_OBJ),
+        ("amount", _OPT_STR),
+        ("currency", _OPT_STR),
+        ("details", _OPT_OBJ),
+        ("ttl", _OPT_TTL),
+    ),
+    "decision": (
+        ("requestId", _STR),
+        ("outcome", _STR),
+        ("reason", _OPT_STR),
+        ("result", _OPT_OBJ),
+    ),
+    "report": (
+        ("action", _STR),
+        ("summary", _STR),
+        ("outcome", _STR),
+        ("ref", _OPT_OBJ),
+        ("requestId", _OPT_STR),
+        ("proof", _OPT_OBJ),
+    ),
 }
+
+_OUTCOMES: dict[str, tuple[str, ...]] = {
+    "decision": ("approve", "deny"),
+    "report": ("ok", "failed", "skipped"),
+}
+
+
+def _check_ref(type_: str, ref: dict) -> None:
+    if not is_conversation_id(ref.get("conversationId")):
+        raise ACEError("invalid_body", f"{type_}.ref.conversationId must be 64 lowercase hex")
+    if not is_message_id(ref.get("messageId")):
+        raise ACEError("invalid_body", f"{type_}.ref.messageId must be a lowercase UUID v4")
+    thread_id = ref.get("threadId")
+    if thread_id is not None and not is_thread_id(thread_id):
+        raise ACEError("invalid_body", f"{type_}.ref.threadId must be a valid thread ID")
 
 
 def validate_body(type_: MessageType, body: dict) -> None:
@@ -103,6 +143,10 @@ def validate_body(type_: MessageType, body: dict) -> None:
             raise ACEError("invalid_body", "deliver.type must be 'inline' or 'reference'")
         if not isinstance(body.get(required), str):
             raise ACEError("invalid_body", f"deliver ({kind}) requires {required}")
+    if type_ in _OUTCOMES and body["outcome"] not in _OUTCOMES[type_]:
+        raise ACEError("invalid_body", f"{type_}.outcome must be one of {list(_OUTCOMES[type_])}")
+    if type_ in ("request", "report") and body.get("ref") is not None:
+        _check_ref(type_, body["ref"])
 
 
 def decode_body(type_: MessageType, raw: bytes) -> dict:

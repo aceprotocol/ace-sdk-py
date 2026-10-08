@@ -12,7 +12,8 @@ ACEErrorCode = Literal[
     "invalid_signature", "invalid_authorization", "scheme_mismatch", "stale_timestamp",
     "replay", "decryption_failed", "invalid_body", "transition_not_allowed", "wrong_role",
     "wrong_party", "bad_reference", "limit_exceeded", "invalid_key", "invalid_registration",
-    "invalid_profile", "invalid_peer", "stale_peer_binding", "unknown_peer", "not_registered",
+    "invalid_profile", "invalid_principal", "wrong_principal", "invalid_peer",
+    "stale_peer_binding", "unknown_peer", "not_registered",
     "relay_rejected", "envelope_expired", "pending_send_conflict", "blocked_address",
     "direct_rejected",
     # transient
