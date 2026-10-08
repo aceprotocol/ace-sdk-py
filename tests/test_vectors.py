@@ -1,4 +1,4 @@
-"""Shared cross-language vectors (ace-spec/test-vectors.json, version 2)."""
+"""Shared cross-language vectors (ace-spec/test-vectors.json, version 4)."""
 
 from __future__ import annotations
 
@@ -37,7 +37,16 @@ from ace.auth import RelayAuthRequest, create_auth_headers, parse_auth_headers, 
 from ace.discovery import adopt_decision, is_blocked_address
 from ace.encryption import ACE_KEM_SALT
 from ace.messages import decode_body
+from ace.principal import (
+    PrincipalSigner,
+    check_principal_rules,
+    create_principal_record,
+    principal_payload,
+    principal_sign_data,
+    validate_principal_record,
+)
 from ace.relay import _map_relay_response, normalize_relay_url
+from ace.types import PrincipalKey
 
 from .helpers import VECTORS, agent, peer_of
 
@@ -45,10 +54,11 @@ V = VECTORS["vectors"]
 
 
 def test_version_and_sections():
-    assert VECTORS["version"] == "3"
+    assert VECTORS["version"] == "4"
     assert {"envelopes", "bodies", "transitions", "replay", "signatures", "auth", "registrations",
             "registrationErrors", "urls", "base64", "peerBinding", "webhooks", "relayUrls",
-            "blockedAddresses", "relayErrors", "directReceive"} <= set(V)
+            "blockedAddresses", "relayErrors", "directReceive", "principal",
+            "principalRules"} <= set(V)
     counts = {
         k: len(V[k]["cases"])
         for k in ("webhooks", "relayUrls", "blockedAddresses", "relayErrors", "directReceive")
@@ -270,12 +280,15 @@ def _auth_request(r: dict) -> RelayAuthRequest:
 
 
 def test_auth_vector_count():
-    assert len(V["auth"]) == 18
+    assert len(V["auth"]) == 22
+    assert sum(1 for v in V["auth"] if v["action"] == "principal") == 4
     assert sum(1 for v in V["auth"] if v["action"] == "webhook") == 6
 
 
 @pytest.mark.parametrize(
-    "v", V["auth"], ids=lambda v: f"{v['agent']}-{v['action']}-{v['payloadHex'][:12]}"
+    "v",
+    [v for v in V["auth"] if v["action"] != "principal"],
+    ids=lambda v: f"{v['agent']}-{v['action']}-{v['payloadHex'][:12]}",
 )
 def test_auth(v):
     ident = agent(v["agent"])
@@ -431,3 +444,100 @@ def test_direct_receive(v, direct_inbox):
         raw = raw.ljust(v["padTo"], b" ")
     reply = direct_inbox.receive_direct(raw)
     assert (reply.status, reply.body) == (v["status"], {"ok": False, "error": v["error"]})
+
+
+# --- principal ------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "v",
+    [v for v in V["auth"] if v["action"] == "principal"],
+    ids=lambda v: f"{v['agent']}-{v['payloadHex'][-8:]}",
+)
+def test_auth_principal(v):
+    r = v["request"]
+    spk = base64.b64decode(v["subjectSigningPublicKey"])
+    assert r["subjectSigningPublicKey"] == v["subjectSigningPublicKey"]
+    payload = encode_payload(
+        r["account"],
+        ",".join(r["roles"]),
+        r["signerScheme"],
+        r["signerPublicKey"],
+        r["subjectSigningPublicKey"],
+        r["scope"] or "",
+        str(r["expiresAt"]),
+    )
+    assert payload.hex() == v["payloadHex"]
+    assert (
+        build_sign_data("principal", r["subjectAceId"], v["timestamp"], payload).hex()
+        == v["signDataHex"]
+    )
+    rec = validate_principal_record(v["record"], spk, v["now"])
+    assert rec.signature == v["signature"]
+    assert principal_sign_data(rec, spk).hex() == v["signDataHex"]
+    if not v.get("verifyOnly"):
+        mine = create_principal_record(
+            PrincipalSigner.from_identity(agent(v["agent"])),
+            subject_signing_public_key=spk,
+            account=r["account"],
+            roles=r["roles"],
+            scope=r["scope"],
+            expires_at=r["expiresAt"],
+            issued_at=v["timestamp"],
+        )
+        assert mine.to_dict() == v["record"]
+
+
+@pytest.mark.parametrize("v", V["principal"]["valid"], ids=lambda v: v["name"])
+def test_principal_valid(v):
+    spk = base64.b64decode(v["subjectSigningPublicKey"])
+    rec = validate_principal_record(v["record"], spk, V["principal"]["now"])
+    assert principal_payload(rec, spk).hex() == v["payloadHex"]
+    assert principal_sign_data(rec, spk).hex() == v["signDataHex"]
+
+
+@pytest.mark.parametrize("v", V["principal"]["invalid"], ids=lambda v: v["name"])
+def test_principal_invalid(v):
+    with pytest.raises(ACEError) as info:
+        spk = base64.b64decode(v["subjectSigningPublicKey"])
+        validate_principal_record(v["record"], spk, v["now"])
+    assert info.value.code == v["error"]
+
+
+def _key(d):
+    return None if d is None else PrincipalKey(d["scheme"], d["publicKey"])
+
+
+@pytest.mark.parametrize("case", V["principalRules"]["cases"], ids=lambda c: c["name"])
+def test_principal_rules(case):
+    pr = V["principalRules"]
+    now = case.get("now", pr["now"])
+    open_ = dict(case["openRequests"])
+
+    def open_request_to(conv, rid, at):
+        e = open_.get(rid)
+        if conv != pr["conversationId"] or e is None:
+            return None
+        return e["to"] if e["expiresAt"] is None or at <= e["expiresAt"] else None
+
+    for step in case["steps"]:
+        s = pr["senders"][step["sender"]]
+        try:
+            check_principal_rules(
+                step["type"],
+                step["body"],
+                conversation_id=pr["conversationId"],
+                sender_principal=s["principal"],
+                sender_signing_public_key=base64.b64decode(s["signingPublicKey"]),
+                self_account=case["selfAccount"],
+                open_request_to=open_request_to,
+                now=now,
+                self_signer=_key(case["selfSigner"]),
+                trusted_signers=frozenset(_key(k) for k in case["trustedSigners"]),
+            )
+            got = "ok"
+        except ACEError as exc:
+            got = "error:" + exc.code
+        assert got == step["expect"], (case["name"], step)
+        if got == "ok" and step["type"] == "decision":
+            open_.pop(step["body"]["requestId"], None)
