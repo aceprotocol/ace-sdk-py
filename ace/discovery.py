@@ -324,6 +324,42 @@ def verify_registration_file(
 AdoptOutcome = Literal["adopted", "unchanged", "rotated"]
 
 
+def _live_principal(profile: AgentProfile | None, now: int):
+    """The cached principal unless it has expired by ``now`` (expiry is revocation; R-P35)."""
+    p = None if profile is None else profile.principal
+    return None if p is not None and p.expires_at <= now else p
+
+
+def _supersedes(new, old) -> bool:
+    """Monotonic principal replacement (R-P36): strictly newer issuedAt, or the same record."""
+    if new.issued_at != old.issued_at:
+        return new.issued_at > old.issued_at
+    return json.dumps(new.to_dict(), sort_keys=True, separators=(",", ":")) == json.dumps(
+        old.to_dict(), sort_keys=True, separators=(",", ":")
+    )
+
+
+def _none_if_empty(profile: AgentProfile) -> AgentProfile | None:
+    return None if profile == AgentProfile() else profile
+
+
+def _relay_profile(
+    cached: AgentProfile | None, cand: AgentProfile | None, newer: bool, now: int
+) -> AgentProfile | None:
+    """A kept relay candidate replaces the cached profile only when its registeredAt is not
+    older (R-P36); a profile without a principal then withdraws it, any other principal must
+    supersede the cached one. An older candidate leaves the cached profile unchanged."""
+    live = _live_principal(cached, now)
+    if not newer:
+        if cached is None or live is cached.principal:
+            return cached
+        return _none_if_empty(dataclasses.replace(cached, principal=None))
+    new = None if cand is None else cand.principal
+    if new is None or live is None or _supersedes(new, live):
+        return cand
+    return dataclasses.replace(cand, principal=live)
+
+
 def _file_profile(
     cached: AgentProfile | None, cand: AgentProfile | None, now: int
 ) -> AgentProfile | None:
@@ -332,11 +368,9 @@ def _file_profile(
     one whose issuedAt is not older (R-P26). A cached principal that has expired by ``now`` is
     dropped, not carried (expiry is revocation; R-P35): the refreshed ``fetchedAt`` would
     otherwise make the stored record fail re-verification on load."""
-    old = None if cached is None else cached.principal
-    if old is not None and old.expires_at <= now:
-        old = None
+    old = _live_principal(cached, now)
     new = None if cand is None else cand.principal
-    keep = new if old is None or (new is not None and new.issued_at >= old.issued_at) else old
+    keep = new if old is None or (new is not None and _supersedes(new, old)) else old
     supplied = {} if cand is None else {
         f.name: getattr(cand, f.name)
         for f in dataclasses.fields(AgentProfile)
@@ -385,6 +419,9 @@ def adopt_decision(
             profile = _file_profile(pin.profile, candidate.profile, now)
             return _with_profile(pin, profile), "unchanged"
         newer = candidate if candidate.registered_at > pin.registered_at else pin
+        profile = _relay_profile(
+            pin.profile, candidate.profile, candidate.registered_at >= pin.registered_at, now
+        )
         merged = _make_peer(
             ace_id=pin.ace_id,
             scheme=pin.scheme,
@@ -393,7 +430,7 @@ def adopt_decision(
             registered_at=newer.registered_at,
             registration_signature=newer.registration_signature,
             source=newer.source,
-            profile=candidate.profile,
+            profile=profile,
         )
         return merged, "unchanged"
     if unsigned:

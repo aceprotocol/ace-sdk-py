@@ -221,3 +221,54 @@ def test_file_refresh_carries_unexpired_cached_principal():
     out = peers.adopt(_file_candidate(me, None)).peer
     assert out.principal == pin.principal
     assert peers.get(me.get_ace_id()).principal == pin.principal
+
+
+def _relay_peer(me, profile, ts):
+    from ace import verify_peer_record
+
+    from .test_principal import _peer_record
+
+    return verify_peer_record(_peer_record(me, profile, ts=ts), clock=lambda: ts)
+
+
+def test_older_relay_record_leaves_cached_profile_but_refreshes_fetched_at():
+    from .test_principal import NOW, _owner, _rec
+
+    owner, me = _owner(), SoftwareIdentity.generate("ed25519")
+    clock = [NOW]
+    store = MemoryStore()
+    peers = PeerStore(store, clock=lambda: clock[0])
+    old_prin = _rec(owner, me, issued_at=NOW - 10).to_dict()
+    pin = peers.adopt(_relay_peer(me, {"name": "Old", "principal": old_prin}, NOW)).peer
+    clock[0] = NOW + 100
+    other = _rec(owner, me, issued_at=NOW - 5, scope="x").to_dict()
+    older = _relay_peer(me, {"name": "Other", "principal": other}, NOW - 50)
+    out = peers.adopt(older).peer
+    assert out.profile == pin.profile and out.registered_at == pin.registered_at
+    assert peers.get(me.get_ace_id()).profile == pin.profile
+    assert json.loads(store.read(_peer_key(me.get_ace_id())))["fetchedAt"] == NOW + 100
+
+
+def test_equal_issued_at_different_principal_keeps_cached():
+    from .test_principal import NOW, _owner, _pin_with_principal, _rec
+
+    owner, me = _owner(), SoftwareIdentity.generate("ed25519")
+    clock = [NOW]
+    peers, pin = _pin_with_principal(owner, me, clock, issued_at=NOW - 10, scope="a")
+    clock[0] = NOW + 20
+    rival = {"name": "N", "principal": _rec(owner, me, issued_at=NOW - 10, scope="b").to_dict()}
+    out = peers.adopt(_relay_peer(me, rival, NOW + 10)).peer
+    assert out.principal == pin.principal and out.profile.name == "N"
+    same = {"name": "N", "principal": pin.principal.to_dict()}
+    assert peers.adopt(_relay_peer(me, same, NOW + 15)).peer.principal == pin.principal
+
+
+def test_newer_relay_record_without_principal_clears_it():
+    from .test_principal import NOW, _owner, _pin_with_principal
+
+    owner, me = _owner(), SoftwareIdentity.generate("ed25519")
+    clock = [NOW]
+    peers, _ = _pin_with_principal(owner, me, clock)
+    clock[0] = NOW + 20
+    out = peers.adopt(_relay_peer(me, {"name": "New"}, NOW + 10)).peer
+    assert out.principal is None and peers.get(me.get_ace_id()).principal is None
