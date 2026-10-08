@@ -29,7 +29,14 @@ from ._signing import build_sign_data, encode_payload, is_valid_signing_public_k
 from .errors import ACEError, ACEErrorCode
 from .identity import compute_ace_id, signing_address
 from .limits import KEM_PUBLIC_KEY_SIZE, MAX_REGISTRATION_FILE_BYTES, TIMESTAMP_WINDOW_SECONDS
-from .types import SIGNING_SCHEMES, AgentProfile, ProfilePricing, RegistrationFile, SigningScheme
+from .types import (
+    SIGNING_SCHEMES,
+    AgentProfile,
+    PrincipalRecord,
+    ProfilePricing,
+    RegistrationFile,
+    SigningScheme,
+)
 
 _MINTING = threading.local()  # module-private construction token
 _CAIP2_RE = re.compile(r"[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}")
@@ -70,6 +77,11 @@ class VerifiedPeer:
     def address(self) -> str:
         """ed25519: Base58 of the signing key; secp256k1: EIP-55 address."""
         return signing_address(self.scheme, self.signing_public_key)
+
+    @property
+    def principal(self) -> "PrincipalRecord | None":
+        """The peer's principal record (verified when the peer was verified, 09)."""
+        return None if self.profile is None else self.profile.principal
 
 
 def _make_peer(**kw: Any) -> VerifiedPeer:
@@ -146,7 +158,17 @@ def _raw_profile(p: AgentProfile) -> dict:
         if isinstance(pr, ProfilePricing)
         else pr
     )
+    pp = p.principal
+    d["principal"] = pp.to_dict() if isinstance(pp, PrincipalRecord) else pp
     return d
+
+
+def check_profile_principal(profile: AgentProfile | None, subject_key: bytes, now: int) -> None:
+    """09 § Validation of ``profile.principal`` (``invalid_principal``)."""
+    if profile is not None and profile.principal is not None:
+        from .principal import validate_principal_record
+
+        validate_principal_record(profile.principal, subject_key, now)
 
 
 # --- keys / binding -------------------------------------------------------------------
@@ -189,8 +211,9 @@ def decode_peer_binding(record: dict) -> tuple[str, SigningScheme, bytes, bytes,
     return ace_id, scheme, signing_key, enc_key, registered_at  # type: ignore[return-value]
 
 
-def verify_peer_record(record: dict) -> VerifiedPeer:
-    """Verify a relay ``PeerRecord``; every failure is ``invalid_peer``."""
+def verify_peer_record(record: dict, *, clock: Callable[[], int] | None = None) -> VerifiedPeer:
+    """Verify a relay ``PeerRecord``; failures are ``invalid_peer``, except a present
+    ``profile.principal`` that fails 09 validation (``invalid_principal``)."""
     code: ACEErrorCode = "invalid_peer"
     if not isinstance(record, dict):
         raise ACEError(code, "peer record must be an object")
@@ -207,7 +230,10 @@ def verify_peer_record(record: dict) -> VerifiedPeer:
         try:
             profile = validate_profile(record["profile"])
         except ACEError as exc:
+            if exc.code == "invalid_principal":
+                raise
             raise ACEError(code, exc.message) from None
+    check_profile_principal(profile, signing_key, unix_now(clock))
     return _make_peer(
         ace_id=ace_id,
         scheme=scheme,
@@ -274,6 +300,12 @@ def verify_registration_file(
         raise ACEError(code, "id does not match the signing key")
     enc_key = decode_encryption_key(s.encryption_public_key, code)
     now = unix_now(clock)
+    profile = None
+    if reg.principal is not None:
+        from .principal import validate_principal_record
+
+        validated = validate_principal_record(reg.principal, bytes(signing_key), now)
+        profile = AgentProfile(principal=validated)
     return _make_peer(
         ace_id=reg.id,
         scheme=s.scheme,
@@ -282,13 +314,26 @@ def verify_registration_file(
         registered_at=now if pinned_at is None else pinned_at,
         registration_signature=None,
         source="registration",
-        profile=None,
+        profile=profile,
     )
 
 
 # --- peer binding (rollback barrier, 02) -------------------------------------------------
 
 AdoptOutcome = Literal["adopted", "unchanged", "rotated"]
+
+
+def _with_profile(pin: VerifiedPeer, profile: AgentProfile | None) -> VerifiedPeer:
+    return _make_peer(
+        ace_id=pin.ace_id,
+        scheme=pin.scheme,
+        signing_public_key=pin.signing_public_key,
+        encryption_public_key=pin.encryption_public_key,
+        registered_at=pin.registered_at,
+        registration_signature=pin.registration_signature,
+        source=pin.source,
+        profile=profile,
+    )
 
 
 def adopt_decision(
@@ -309,8 +354,9 @@ def adopt_decision(
     unsigned = candidate.registration_signature is None
     if pin.encryption_public_key == candidate.encryption_public_key:
         if unsigned:
-            # An unsigned (registration-file) source never changes the pinned binding.
-            return pin, "unchanged"
+            # An unsigned (registration-file) source never changes the pinned binding, but
+            # a kept candidate replaces the cached profile, including ``principal`` (02).
+            return _with_profile(pin, candidate.profile), "unchanged"
         newer = candidate if candidate.registered_at > pin.registered_at else pin
         merged = _make_peer(
             ace_id=pin.ace_id,
@@ -320,7 +366,7 @@ def adopt_decision(
             registered_at=newer.registered_at,
             registration_signature=newer.registration_signature,
             source=newer.source,
-            profile=candidate.profile if candidate.source == "relay" else pin.profile,
+            profile=candidate.profile,
         )
         return merged, "unchanged"
     if unsigned:

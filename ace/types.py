@@ -153,6 +153,7 @@ class RegistrationFile:
     capabilities: list[Capability] | None = None
     settlement: list[str] | None = None
     chains: list[ChainInfo] | None = None
+    principal: "PrincipalRecord | None" = None
 
     def to_dict(self) -> dict[str, Any]:
         signing: dict[str, Any] = {
@@ -176,6 +177,8 @@ class RegistrationFile:
             d["settlement"] = list(self.settlement)
         if self.chains is not None:
             d["chains"] = [{"network": c.network, "address": c.address} for c in self.chains]
+        if self.principal is not None:
+            d["principal"] = self.principal.to_dict()
         return d
 
     @staticmethod
@@ -235,6 +238,9 @@ class RegistrationFile:
             capabilities=capabilities,
             settlement=_opt_str_list(d, "settlement", code, "registration"),
             chains=chains,
+            principal=None
+            if d.get("principal") is None
+            else PrincipalRecord.from_dict(d["principal"]),
         )
 
 
@@ -333,6 +339,7 @@ class AgentProfile:
     chains: list[str] | None = None
     endpoint: str | None = None
     pricing: ProfilePricing | None = None
+    principal: PrincipalRecord | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {}
@@ -346,6 +353,8 @@ class AgentProfile:
             d["endpoint"] = self.endpoint
         if self.pricing is not None:
             d["pricing"] = self.pricing.to_dict()
+        if self.principal is not None:
+            d["principal"] = self.principal.to_dict()
         return d
 
     @staticmethod
@@ -377,6 +386,9 @@ class AgentProfile:
             chains=_opt_str_list(d, "chains", code, "profile"),
             endpoint=_opt(d, "endpoint", str, code, "profile"),
             pricing=pricing,
+            principal=None
+            if d.get("principal") is None
+            else PrincipalRecord.from_dict(d["principal"]),
         )
 
 
@@ -389,6 +401,7 @@ class DiscoverQuery:
     chain: str | None = None
     scheme: str | None = None
     online: bool | None = None
+    account: str | None = None
     limit: int | None = None
     cursor: str | None = None
 

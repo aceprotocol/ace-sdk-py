@@ -103,7 +103,12 @@ def test_registration_file_never_rotates(store):
     before = store.read(_peer_key(bob.get_ace_id()))
     clock.t += 1000
     assert peers.pin_registration_file(reg, pinned_at=500).registered_at == 100  # kept exactly
-    assert store.read(_peer_key(bob.get_ace_id())) == before  # no write: fetchedAt unchanged
+    # a kept candidate refreshes the cache's fetchedAt and profile (02 § Rollback Barrier);
+    # the binding itself is unchanged
+    after = store.read(_peer_key(bob.get_ace_id()))
+    b_rec, a_rec = json.loads(before), json.loads(after)
+    assert a_rec["fetchedAt"] == b_rec["fetchedAt"] + 1000
+    assert {**a_rec, "fetchedAt": 0} == {**b_rec, "fetchedAt": 0}
     reg2 = create_registration_file(rotated(bob), name="Bob", endpoint="https://bob.example/ace")
     with raises("stale_peer_binding"):
         peers.pin_registration_file(reg2, pinned_at=10**9)

@@ -22,6 +22,7 @@ from .discovery import (
     VerifiedPeer,
     _make_peer,
     binding_sign_data,
+    check_profile_principal,
     decode_signing_key,
     validate_profile,
 )
@@ -36,6 +37,7 @@ from .types import (
     ChainInfo,
     HardwareBacking,
     IdentityTier,
+    PrincipalRecord,
     RegistrationFile,
     RegistrationRequest,
     SigningConfig,
@@ -53,6 +55,7 @@ def create_registration_file(
     capabilities: list[Capability] | None = None,
     settlement: list[str] | None = None,
     chains: list[ChainInfo] | None = None,
+    principal: "PrincipalRecord | dict | None" = None,
 ) -> RegistrationFile:
     """Build the registration file (02) of any identity, software or hardware-backed;
     raises ``invalid_registration`` if the inputs are invalid."""
@@ -77,6 +80,7 @@ def create_registration_file(
         capabilities=capabilities,
         settlement=settlement,
         chains=chains,
+        principal=None if principal is None else PrincipalRecord.from_dict(principal),
     )
     verify_registration_file(reg, pinned_at=0)
     return reg
@@ -95,7 +99,7 @@ def registration_payload(enc_b64: str, sig_b64: str, scheme: str, profile: objec
     if profile is None:
         return encode_payload(*fields, "remove")
     assert isinstance(profile, AgentProfile)
-    pr = profile.pricing
+    pr, pp = profile.pricing, profile.principal
     return encode_payload(
         *fields,
         "replace",
@@ -109,6 +113,15 @@ def registration_payload(enc_b64: str, sig_b64: str, scheme: str, profile: objec
         "present" if pr else "absent",
         pr.currency if pr else "",
         (pr.max_amount or "") if pr else "",
+        "present" if pp else "absent",
+        pp.account if pp else "",
+        ",".join(pp.roles) if pp else "",
+        pp.signer.scheme if pp else "",
+        pp.signer.public_key if pp else "",
+        str(pp.issued_at) if pp else "",
+        str(pp.expires_at if pp.expires_at is not None else 0) if pp else "",
+        (pp.scope or "") if pp else "",
+        pp.signature if pp else "",
     )
 
 
@@ -128,6 +141,8 @@ def create_registration_request(
     snapshot = (
         profile if profile is _KEEP or profile is None else validate_profile(copy.deepcopy(profile))
     )  # type: ignore[arg-type]
+    if isinstance(snapshot, AgentProfile):
+        check_profile_principal(snapshot, bytes(identity.get_signing_public_key()), ts)
     epk, spk = to_base64(enc), to_base64(identity.get_signing_public_key())
     ace_id, scheme = identity.get_ace_id(), identity.get_signing_scheme()
     signature = identity.sign(binding_sign_data(ace_id, ts, epk, spk))
@@ -166,8 +181,8 @@ def verify_registration_request(
 
     schema -> ``invalid_registration``; freshness -> ``stale_timestamp``; ID hash ->
     ``invalid_registration``; signing/encryption key -> ``invalid_key``; profile ->
-    ``invalid_profile``; binding -> ``invalid_signature``; authorization ->
-    ``invalid_authorization``.
+    ``invalid_profile``; principal -> ``invalid_principal``; binding -> ``invalid_signature``;
+    authorization -> ``invalid_authorization``.
     ``request_digest`` is hex SHA-256 of the ``register-request`` signData.
     """
     check_wire_int(window_seconds, "window_seconds")
@@ -197,6 +212,7 @@ def verify_registration_request(
     if len(enc_key) != KEM_PUBLIC_KEY_SIZE:
         raise ACEError("invalid_key", f"encryptionPublicKey must be {KEM_PUBLIC_KEY_SIZE} bytes")
     profile = None if raw_profile is None else validate_profile(raw_profile)
+    check_profile_principal(profile, signing_key, unix_now(clock))
     if not verify_signature(binding_sign_data(ace_id, ts, epk, spk), sig, scheme, signing_key):  # type: ignore[arg-type]
         raise ACEError("invalid_signature", "registration binding signature does not verify")
     snapshot = profile if has_profile else _KEEP

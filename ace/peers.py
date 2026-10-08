@@ -10,6 +10,7 @@ from .discovery import (
     VerifiedPeer,
     _make_peer,
     adopt_decision,
+    check_profile_principal,
     decode_peer_binding,
     validate_profile,
     verify_peer_record,
@@ -68,7 +69,7 @@ def _peer_from_record(d: dict, key: str) -> tuple[VerifiedPeer, int]:
                     "profile",
                 )
             }
-            peer = verify_peer_record(record)
+            peer = verify_peer_record(record, clock=lambda: fetched_at)
         elif source == "registration":
             ace_id, scheme, signing_key, enc_key, registered_at = decode_peer_binding(d)
             if d.get("registrationSignature") is not None:
@@ -76,6 +77,7 @@ def _peer_from_record(d: dict, key: str) -> tuple[VerifiedPeer, int]:
                     "invalid_peer", "a registration-file pin has no registrationSignature"
                 )
             profile = None if d.get("profile") is None else validate_profile(d["profile"])
+            check_profile_principal(profile, signing_key, fetched_at)
             peer = _make_peer(
                 ace_id=ace_id,
                 scheme=scheme,

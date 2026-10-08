@@ -447,3 +447,105 @@ def test_load_request_record_rejects_corrupt(patch):
     store.write(request_key(CONV, MID), json.dumps(d).encode())
     with raises("storage_failed"):
         load_request_record(store, CONV, MID)
+
+
+# --- profile / registration file / registration request / peer record -----------------
+
+import json as _json  # noqa: E402
+
+from ace import (  # noqa: E402
+    AgentProfile,
+    PeerStore,
+    create_registration_file,
+    create_registration_request,
+    verify_peer_record,
+    verify_registration_file,
+    verify_registration_request,
+)
+from ace.registration import registration_payload  # noqa: E402
+
+
+def _peer_record(ident, profile, ts=NOW):
+    req = create_registration_request(ident, profile, timestamp=ts)
+    return {"aceId": req["aceId"], "scheme": req["scheme"], "encryptionPublicKey": req["encryptionPublicKey"],
+            "signingPublicKey": req["signingPublicKey"], "registrationSignature": req["signature"],
+            "registeredAt": ts, "profile": req["profile"]}
+
+
+def test_registration_payload_principal_group():
+    owner, me = _owner(), SoftwareIdentity.generate("ed25519")
+    rec = _rec(owner, me, scope="s", expires_at=NOW + 99)
+    prof = AgentProfile(name="A", principal=rec)
+    p = registration_payload("E", "S", "ed25519", prof)
+    tail = encode_payload("present", ACC, "controller,agent", "ed25519", rec.signer.public_key,
+                          str(NOW - 10), str(NOW + 99), "s", rec.signature)
+    assert p.endswith(tail)
+    assert registration_payload("E", "S", "ed25519", AgentProfile(name="A")).endswith(
+        encode_payload("absent", "", "", "", "", "", "", "", ""))
+
+
+def test_registration_request_round_trip_and_rejection():
+    owner, me, other = _owner(), SoftwareIdentity.generate("secp256k1"), SoftwareIdentity.generate("ed25519")
+    good = _rec(owner, me).to_dict()
+    req = create_registration_request(me, {"name": "A", "principal": good}, timestamp=NOW)
+    v = verify_registration_request(_json.loads(_json.dumps(req)), clock=lambda: NOW)
+    assert v.peer.principal is not None and v.peer.principal.account == ACC
+    with raises("invalid_principal"):
+        create_registration_request(me, {"name": "A", "principal": _rec(owner, other).to_dict()}, timestamp=NOW)
+    bad = dict(req)
+    bad["profile"] = {"name": "A", "principal": {**good, "roles": ["agent", "controller"]}}
+    with raises("invalid_principal"):
+        verify_registration_request(bad, clock=lambda: NOW)
+
+
+def test_peer_record_principal_verified():
+    owner, me, other = _owner(), SoftwareIdentity.generate("ed25519"), SoftwareIdentity.generate("ed25519")
+    rec = _peer_record(me, {"name": "A", "principal": _rec(owner, me, expires_at=NOW + 50).to_dict()})
+    assert verify_peer_record(rec, clock=lambda: NOW).principal.roles == ("controller", "agent")
+    with raises("invalid_principal"):
+        verify_peer_record(rec, clock=lambda: NOW + 50)
+    rec["profile"]["principal"] = _rec(owner, other).to_dict()
+    with raises("invalid_principal"):
+        verify_peer_record(rec, clock=lambda: NOW)
+
+
+def test_registration_file_principal():
+    # create_registration_file validates against the wall clock, so issue relative to it.
+    import time
+
+    t = int(time.time())
+    owner, me, other = _owner(), SoftwareIdentity.generate("secp256k1"), SoftwareIdentity.generate("ed25519")
+    rec = _rec(owner, me, issued_at=t - 10, expires_at=t + 3600)
+    reg = create_registration_file(me, name="M", endpoint="https://m.example/ace", principal=rec)
+    assert reg.to_dict()["principal"]["account"] == ACC
+    peer = verify_registration_file(reg.to_dict(), pinned_at=t, clock=lambda: t)
+    assert peer.principal.account == ACC and peer.profile.to_dict() == {"principal": reg.principal.to_dict()}
+    assert verify_registration_file(create_registration_file(me, name="M", endpoint="https://m.example/ace"),
+                                    pinned_at=0).profile is None
+    d = reg.to_dict()
+    d["principal"] = _rec(owner, other, issued_at=t - 10, expires_at=t + 3600).to_dict()
+    with raises("invalid_principal"):
+        verify_registration_file(d, clock=lambda: t)
+    with raises("invalid_principal"):
+        verify_registration_file(reg.to_dict(), clock=lambda: t + 3600)
+
+
+def test_expired_pin_still_loads():
+    owner, me = _owner(), SoftwareIdentity.generate("ed25519")
+    clock = [NOW]
+    store = MemoryStore()
+    peers = PeerStore(store, clock=lambda: clock[0])
+    peers.adopt(verify_peer_record(_peer_record(me, {"principal": _rec(owner, me, expires_at=NOW + 5).to_dict()}),
+                                   clock=lambda: NOW))
+    clock[0] = NOW + 10_000
+    assert PeerStore(store, clock=lambda: clock[0]).get(me.get_ace_id()).principal is not None
+
+
+def test_kept_registration_file_candidate_replaces_cached_principal():
+    owner, me = _owner(), SoftwareIdentity.generate("ed25519")
+    clock = [NOW]
+    peers = PeerStore(MemoryStore(), clock=lambda: clock[0])
+    peers.adopt(verify_peer_record(_peer_record(me, {"principal": _rec(owner, me).to_dict()}), clock=lambda: NOW))
+    reg = create_registration_file(me, name="M", endpoint="https://m.example/ace")
+    assert peers.pin_registration_file(reg, pinned_at=NOW).principal is None
+    assert peers.get(me.get_ace_id()).principal is None

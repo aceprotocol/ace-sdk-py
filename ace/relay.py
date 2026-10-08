@@ -394,6 +394,7 @@ class RelayClient:
             "chain": q.chain,
             "scheme": q.scheme,
             "online": None if q.online is None else ("true" if q.online else "false"),
+            "account": q.account,
             "limit": q.limit,
             "cursor": q.cursor,
         }
