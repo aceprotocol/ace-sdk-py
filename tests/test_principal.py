@@ -504,8 +504,9 @@ def test_peer_record_principal_verified():
     owner, me, other = _owner(), SoftwareIdentity.generate("ed25519"), SoftwareIdentity.generate("ed25519")
     rec = _peer_record(me, {"name": "A", "principal": _rec(owner, me, expires_at=NOW + 50).to_dict()})
     assert verify_peer_record(rec, clock=lambda: NOW).principal.roles == ("controller", "agent")
-    with raises("invalid_principal"):
-        verify_peer_record(rec, clock=lambda: NOW + 50)
+    # Expired-only: treated as absent, the rest of the peer is kept (R-P40).
+    expired = verify_peer_record(rec, clock=lambda: NOW + 50)
+    assert expired.principal is None and expired.profile.name == "A"
     rec["profile"]["principal"] = _rec(owner, other).to_dict()
     with raises("invalid_principal"):
         verify_peer_record(rec, clock=lambda: NOW)
@@ -528,8 +529,43 @@ def test_registration_file_principal():
     d["principal"] = _rec(owner, other, issued_at=t - 10, expires_at=t + 3600).to_dict()
     with raises("invalid_principal"):
         verify_registration_file(d, clock=lambda: t)
+    gone = verify_registration_file(reg.to_dict(), clock=lambda: t + 3600)
+    assert gone.principal is None and gone.profile is None  # expired-only: absent (R-P40)
+
+
+def test_expired_only_principal_is_absent_in_fetched_records():
+    owner, me, other = _owner(), SoftwareIdentity.generate("ed25519"), SoftwareIdentity.generate("ed25519")
+    prof = {"name": "A", "tags": ["x"], "principal": _rec(owner, me, expires_at=NOW + 50).to_dict()}
+    v = verify_peer_record(_peer_record(me, prof), clock=lambda: NOW + 50)
+    assert v.principal is None and v.profile.name == "A" and list(v.profile.tags) == ["x"]
+    # Wrong subject / forged principal that is also expired is still invalid, not merely expired.
+    forged = {"name": "A", "principal": _rec(owner, other, expires_at=NOW + 50).to_dict()}
+    rec = _peer_record(me, {"name": "A"})
+    rec["profile"] = forged
     with raises("invalid_principal"):
-        verify_registration_file(reg.to_dict(), clock=lambda: t + 3600)
+        verify_peer_record(rec, clock=lambda: NOW + 50)
+    # Relay-side registration still rejects an expired principal.
+    req = create_registration_request(me, {"name": "A", "principal": _rec(owner, me, expires_at=NOW + 50).to_dict()},
+                                      timestamp=NOW)
+    with raises("invalid_principal"):
+        verify_registration_request(req, clock=lambda: NOW + 50)
+
+
+def test_pin_expired_at_fetch_is_dropped_on_load():
+    # Loads re-verify with fetchedAt as now: a principal already expired at fetch time is dropped.
+    owner, me = _owner(), SoftwareIdentity.generate("ed25519")
+    store = MemoryStore()
+    peers = PeerStore(store, clock=lambda: NOW)
+    peers.adopt(verify_peer_record(_peer_record(me, {"name": "A", "principal": _rec(owner, me, expires_at=NOW + 5).to_dict()}),
+                                   clock=lambda: NOW))
+    import json as j
+
+    for k in list(store._data):
+        d = j.loads(store.read(k))
+        d["fetchedAt"] = NOW + 100  # rewrite fetchedAt past the expiry
+        store.write(k, j.dumps(d).encode())
+    loaded = PeerStore(store, clock=lambda: NOW + 100).get(me.get_ace_id())
+    assert loaded.principal is None and loaded.profile.name == "A"
 
 
 def test_expired_pin_still_loads():

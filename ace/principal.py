@@ -121,9 +121,15 @@ def _check_fields(r: PrincipalRecord, now: int) -> bytes:
 
 
 def validate_principal_record(
-    record: PrincipalRecord | dict, subject_signing_public_key: bytes, now: int
+    record: PrincipalRecord | dict,
+    subject_signing_public_key: bytes,
+    now: int,
+    *,
+    allow_expired: bool = False,
 ) -> PrincipalRecord:
     """09 § Validation, rules 1-10 in order; every failure is ``invalid_principal``.
+    ``allow_expired`` skips only rule 10 (expiry), so a caller can tell an expired-only record
+    from an invalid one (R-P40).
     ``subject_signing_public_key`` is the key the caller has verified, never the record's."""
     r = PrincipalRecord.from_dict(record)  # 1
     signer_key = _check_fields(r, now)  # 2-7
@@ -131,7 +137,7 @@ def validate_principal_record(
     subject = bytes(subject_signing_public_key)
     if not verify_signature(principal_sign_data(r, subject), sig, r.signer.scheme, signer_key):  # 9
         raise _bad("principal.signature does not verify for this subject")
-    if r.expires_at <= now:  # 10
+    if r.expires_at <= now and not allow_expired:  # 10
         raise _bad("principal record has expired")
     return r
 

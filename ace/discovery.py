@@ -172,6 +172,22 @@ def check_profile_principal(profile: AgentProfile | None, subject_key: bytes, no
         validate_principal_record(profile.principal, subject_key, now)
 
 
+def drop_expired_profile_principal(
+    profile: AgentProfile | None, subject_key: bytes, now: int
+) -> AgentProfile | None:
+    """Fetched-record variant of :func:`check_profile_principal` (R-P40): a principal that fails
+    *only* the expiry step is treated as absent (profile without it, ``None`` if nothing else is
+    left); any other failure still raises ``invalid_principal``."""
+    if profile is None or profile.principal is None:
+        return profile
+    from .principal import validate_principal_record
+
+    r = validate_principal_record(profile.principal, subject_key, now, allow_expired=True)
+    if r.expires_at > now:
+        return profile
+    return _none_if_empty(dataclasses.replace(profile, principal=None))
+
+
 # --- keys / binding -------------------------------------------------------------------
 
 
@@ -234,7 +250,7 @@ def verify_peer_record(record: dict, *, clock: Callable[[], int] | None = None) 
             if exc.code == "invalid_principal":
                 raise
             raise ACEError(code, exc.message) from None
-    check_profile_principal(profile, signing_key, unix_now(clock))
+    profile = drop_expired_profile_principal(profile, signing_key, unix_now(clock))
     return _make_peer(
         ace_id=ace_id,
         scheme=scheme,
@@ -305,8 +321,11 @@ def verify_registration_file(
     if reg.principal is not None:
         from .principal import validate_principal_record
 
-        validated = validate_principal_record(reg.principal, bytes(signing_key), now)
-        profile = AgentProfile(principal=validated)
+        validated = validate_principal_record(
+            reg.principal, bytes(signing_key), now, allow_expired=True
+        )
+        if validated.expires_at > now:  # expired-only: treated as absent (R-P40)
+            profile = AgentProfile(principal=validated)
     return _make_peer(
         ace_id=reg.id,
         scheme=s.scheme,
