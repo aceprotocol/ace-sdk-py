@@ -222,8 +222,9 @@ the window (default `TIMESTAMP_WINDOW_SECONDS`) is `stale_timestamp`, a wrong HM
   `create_registration_file` rejects a principal that is expired or future-dated at the current
   time (`invalid_principal`); `validate_profile` checks every other profile member before the
   principal, so a profile invalid in both ways is `invalid_profile`.
-  `RelayClient.discover(DiscoverQuery(account="<CAIP-10>"))` lists peers whose principal names
-  that account. Also exported: `PRINCIPAL_ROLES`, `is_caip10`, `parse_principal_record`
+  `RelayClient.discover(DiscoverQuery(account="<CAIP-10>"))` lists registrations whose principal
+  *claims* that account (an unauthenticated claim list); apply 09 same-account rule 4 (signer
+  binding) before treating any entry as a delegate. Also exported: `PRINCIPAL_ROLES`, `is_caip10`, `parse_principal_record`
   (wire parse only), `principal_payload`, `load_request_record`.
 - **Limits.** `MAX_PLAINTEXT_BYTES`, `MAX_PAYLOAD_BYTES`, `MAX_ENVELOPE_BYTES`, … mirror the
   04 "Size Limits" table.
