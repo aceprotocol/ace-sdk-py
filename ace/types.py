@@ -238,6 +238,75 @@ class RegistrationFile:
         )
 
 
+# --- principal record (09) ----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PrincipalKey:
+    scheme: str
+    public_key: str  # canonical Base64, as in the record
+
+
+@dataclass(frozen=True)
+class PrincipalRecord:
+    """09-principal § Principal Record. Semantic checks: ``validate_principal_record``."""
+
+    account: str
+    roles: tuple[str, ...]
+    signer: PrincipalKey
+    issued_at: int
+    signature: str
+    expires_at: int
+    scope: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "account": self.account,
+            "roles": list(self.roles),
+            "signer": {"scheme": self.signer.scheme, "publicKey": self.signer.public_key},
+            "issuedAt": self.issued_at,
+            "expiresAt": self.expires_at,
+            "signature": self.signature,
+        }
+        if self.scope is not None:
+            d["scope"] = self.scope
+        return d
+
+    @staticmethod
+    def from_dict(d: object) -> "PrincipalRecord":
+        """Strict wire parse (09 § Validation rule 1); any type error is ``invalid_principal``.
+        A ``null`` optional member is absent; unknown members are ignored."""
+        from ._encoding import wire_int
+
+        code: ACEErrorCode = "invalid_principal"
+        if isinstance(d, PrincipalRecord):
+            d = d.to_dict()
+        if not isinstance(d, dict):
+            raise ACEError(code, "principal must be a JSON object")
+        signer = _req(d, "signer", dict, code, "principal")
+        roles = d.get("roles")
+        if not isinstance(roles, list) or not all(isinstance(r, str) for r in roles):
+            raise ACEError(code, "principal.roles must be an array of strings")
+        issued_at = wire_int(d.get("issuedAt"))
+        if issued_at is None:
+            raise ACEError(code, "principal.issuedAt must be a wire integer")
+        expires_at = wire_int(d.get("expiresAt"))
+        if expires_at is None:
+            raise ACEError(code, "principal.expiresAt must be a wire integer")
+        return PrincipalRecord(
+            account=_req(d, "account", str, code, "principal"),
+            roles=tuple(roles),
+            signer=PrincipalKey(
+                scheme=_req(signer, "scheme", str, code, "principal.signer"),
+                public_key=_req(signer, "publicKey", str, code, "principal.signer"),
+            ),
+            issued_at=issued_at,
+            signature=_req(d, "signature", str, code, "principal"),
+            expires_at=expires_at,
+            scope=_opt(d, "scope", str, code, "principal"),
+        )
+
+
 # --- discovery profile ------------------------------------------------------------
 
 @dataclass
