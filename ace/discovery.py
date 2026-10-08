@@ -325,12 +325,19 @@ AdoptOutcome = Literal["adopted", "unchanged", "rotated"]
 
 
 def _file_profile(cached: AgentProfile | None, cand: AgentProfile | None) -> AgentProfile | None:
+    """A kept registration-file candidate replaces only the profile members it supplies;
+    absent members are carried over from the cache (R-P27). ``principal`` is replaced only by
+    one whose issuedAt is not older (R-P26)."""
     old = None if cached is None else cached.principal
     new = None if cand is None else cand.principal
     keep = new if old is None or (new is not None and new.issued_at >= old.issued_at) else old
-    if keep is None:
-        return cand
-    return dataclasses.replace(cand or AgentProfile(), principal=keep)
+    supplied = {} if cand is None else {
+        f.name: getattr(cand, f.name)
+        for f in dataclasses.fields(AgentProfile)
+        if f.name != "principal" and getattr(cand, f.name) is not None
+    }
+    merged = dataclasses.replace(cached or AgentProfile(), **supplied, principal=keep)
+    return None if merged == AgentProfile() else merged
 
 
 def _with_profile(pin: VerifiedPeer, profile: AgentProfile | None) -> VerifiedPeer:

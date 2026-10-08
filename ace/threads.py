@@ -31,18 +31,25 @@ def sha256_hex(*parts: str) -> str:
 
 @dataclass(frozen=True)
 class PendingSend:
-    """A signed envelope staged by ``Outbox`` and not yet acknowledged."""
+    """A signed envelope staged by ``Outbox`` and not yet acknowledged. ``request_ttl`` is
+    the body ``ttl`` of a principal ``request`` (the body is encrypted to the recipient, so
+    the Outbox keeps it to write the ``requests/`` record after delivery); persisted as
+    ``requestTtl`` only when present."""
 
     request_id: str
     status: Literal["pending", "expired"]
     staged_at: int
     message: ACEMessage
+    request_ttl: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "message": self.message.to_dict(), "requestId": self.request_id,
             "stagedAt": self.staged_at, "status": self.status,
         }
+        if self.request_ttl is not None:
+            d["requestTtl"] = self.request_ttl
+        return d
 
     @staticmethod
     def from_dict(d: object) -> "PendingSend":
@@ -57,11 +64,14 @@ class PendingSend:
             or staged is None
         ):
             raise bad
+        ttl = d.get("requestTtl")
+        if ttl is not None and wire_int(ttl) is None:
+            raise bad
         try:
             message = decode_envelope(d.get("message"))
         except ACEError:
             raise bad from None
-        return PendingSend(rid, status, staged, message)
+        return PendingSend(rid, status, staged, message, ttl)
 
 
 @dataclass(frozen=True)

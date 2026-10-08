@@ -12,6 +12,7 @@ from .encryption import compute_conversation_id
 from .envelope import message_sign_data
 from .errors import ACEError
 from .messages import create_message
+from .principal import record_request
 from .state_machine import ThreadHistoryEntry, ThreadStateMachine
 from .store import ACEStore, load_record, write_record
 from .threads import PendingSend, ThreadRecord, ThreadStore, rebuild_snapshot, sha256_hex
@@ -151,14 +152,17 @@ class Outbox:
                 thread_id=thread_id,
                 timestamp=now,
             )
-            pending = PendingSend(rid, "pending", now, env)
+            ttl = body.get("ttl") if type_ == "request" else None
+            pending = PendingSend(rid, "pending", now, env, ttl)
             self._write_outbox(pending)
             return pending
 
     def deliver(self, request_id: str, transport: Callable[[ACEMessage], T]) -> T:
         """Send the pending send through ``transport`` and return its result. An ``expired``
         one is refused with ``envelope_expired`` before any transport call (``resign`` it
-        first)."""
+        first). After a successful transport, a principal ``request`` is recorded in
+        ``requests/`` (lock ``requests``) before the pending send is cleared; if that write
+        fails the send stays pending and a retry writes it (06 § Durable Delivery, Sender)."""
         rid = _check_request_id(request_id)
         if not callable(transport):
             raise ACEError("invalid_argument", "transport must be callable")
@@ -177,6 +181,9 @@ class Outbox:
                     rid, message.message_id, lambda p: dataclasses.replace(p, status="expired")
                 )
             raise
+        if message.type == "request":
+            with self._store.lock("requests"):
+                record_request(self._store, message, self._now(), found[0].request_ttl)
         self._set_pending(rid, message.message_id, lambda p: None)
         return result
 
@@ -221,7 +228,7 @@ class Outbox:
             env.signature.value = encode_signature(
                 self._identity.sign(message_sign_data(env)), scheme
             )
-            new = PendingSend(rid, "pending", p.staged_at, env)
+            new = PendingSend(rid, "pending", p.staged_at, env, p.request_ttl)
             if rec is None:
                 self._write_outbox(new)
                 return new

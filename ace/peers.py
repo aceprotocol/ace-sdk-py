@@ -168,6 +168,13 @@ class PeerStore:
         with self._store.lock("peers"):
             self._store.delete(key)
 
+    def _refresh(self, ace_id: str) -> VerifiedPeer | None:
+        """Look the peer up on the relay now and adopt it (rollback barrier); None without a
+        relay. Errors propagate."""
+        if self._relay is None:
+            return None
+        return self.adopt(self._relay.lookup_peer(self._check_id(ace_id))).peer
+
     def resolve(self, ace_id: str, *, max_age_seconds: int | None = None) -> VerifiedPeer:
         self._check_id(ace_id)
         max_age = self._ttl if max_age_seconds is None else max_age_seconds

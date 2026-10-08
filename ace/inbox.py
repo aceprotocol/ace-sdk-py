@@ -31,12 +31,21 @@ from .limits import (
 )
 from .messages import parse_message
 from .peers import PeerStore
+from .principal import PrincipalContext, fill_decision, is_caip10, open_request_to
 from .relay import RelayClient, compare_stream_ids, normalize_relay_url
 from .replay import ReplayDetector
 from .state_machine import ThreadSnapshot, ThreadStateMachine
 from .store import ACEStore, load_record, write_record
 from .threads import PendingSend, ThreadRecord, ThreadStore, sha256_hex, snapshot_from_dict
-from .types import ACEIdentity, ACEMessage, ParsedMessage, is_economic_type, is_message_type
+from .types import (
+    SIGNING_SCHEMES,
+    ACEIdentity,
+    ACEMessage,
+    ParsedMessage,
+    PrincipalKey,
+    is_economic_type,
+    is_message_type,
+)
 
 QUARANTINE_CAP = 1000
 QUARANTINE_KEEP = 900
@@ -216,6 +225,45 @@ def _delivery_from_dict(d: dict, key: str, local_ace_id: str) -> _Delivery:
     return _Delivery(key, parsed, d["fingerprint"], received_at, d["source"], d["status"], thread)
 
 
+def _principal_key(value: object, what: str) -> PrincipalKey:
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"scheme", "publicKey"}
+        or value["scheme"] not in SIGNING_SCHEMES
+        or not isinstance(value["publicKey"], str)
+        or not value["publicKey"]
+    ):
+        raise ACEError("invalid_argument", f"{what} must be {{'scheme', 'publicKey'}}")
+    return PrincipalKey(value["scheme"], value["publicKey"])
+
+
+def _principal_option(
+    principal: object,
+) -> tuple[str, PrincipalKey | None, frozenset[PrincipalKey]] | None:
+    """Parse ``Inbox.open(principal=...)``: ``{"account": <CAIP-10>, "selfSigner"?:
+    {"scheme","publicKey"} | None, "trustedSigners"?: [{"scheme","publicKey"}, ...]}``."""
+    if principal is None:
+        return None
+    if (
+        not isinstance(principal, dict)
+        or not set(principal) <= {"account", "selfSigner", "trustedSigners"}
+        or not is_caip10(principal.get("account"))
+    ):
+        raise ACEError(
+            "invalid_argument",
+            "principal must be {'account': <CAIP-10>, 'selfSigner'?, 'trustedSigners'?}",
+        )
+    raw_self = principal.get("selfSigner")
+    self_signer = None if raw_self is None else _principal_key(raw_self, "principal.selfSigner")
+    raw_trusted = principal.get("trustedSigners")
+    if raw_trusted is None:
+        raw_trusted = []
+    if not isinstance(raw_trusted, (list, tuple)):
+        raise ACEError("invalid_argument", "principal.trustedSigners must be a list")
+    trusted = frozenset(_principal_key(k, "principal.trustedSigners[]") for k in raw_trusted)
+    return principal["account"], self_signer, trusted
+
+
 def _history_dicts(snap: ThreadSnapshot | None) -> list[dict]:
     return [] if snap is None else [h.to_dict() for h in snap.history]
 
@@ -280,9 +328,15 @@ class Inbox:
 
     ``on_message(parsed)`` must persist the host effect durably and idempotently, keyed by
     ``(from_id, message_id)``, then return; raising means "retry later". Commit order per
-    message: delivery record, thread state, replay state, ``on_message``, ack, cursor.
-    Open with ``Inbox.open(...)``; the instance holds the store's ``receive`` lock until
-    ``close()``.
+    message: delivery record, ``requests/`` decision fill (``decision`` only), thread state,
+    replay state, ``on_message``, ack, cursor. Open with ``Inbox.open(...)``; the instance
+    holds the store's ``receive`` lock until ``close()``.
+
+    ``principal`` (09) is the receiver's principal: ``{"account": <CAIP-10>, "selfSigner":
+    {"scheme", "publicKey"} | None, "trustedSigners": [{"scheme", "publicKey"}, ...]}``
+    (``selfSigner`` defaults to None and ``trustedSigners`` to empty: then only an ``eip155``
+    account whose address is the signer's passes 09 step 4). Without it every principal
+    message is ``wrong_principal``.
     """
 
     def __init__(self, *_: object, **__: object) -> None:
@@ -301,7 +355,9 @@ class Inbox:
         capacity: int = DEFAULT_REPLAY_CAPACITY,
         offline_window_seconds: int = OFFLINE_WINDOW_SECONDS,
         clock: Callable[[], int] | None = None,
+        principal: dict | None = None,
     ) -> "Inbox":
+        principal_option = _principal_option(principal)
         if not isinstance(peers, PeerStore):
             raise ACEError("invalid_argument", "peers must be a PeerStore")
         if not callable(on_message):
@@ -325,6 +381,7 @@ class Inbox:
         self._capacity = capacity
         self._offline = offline_window_seconds
         self._clock = clock
+        self._principal = principal_option
         self._threads = ThreadStore(store, self._local, clock=clock)
         self._mutex = threading.RLock()
         self._failed = False
@@ -350,6 +407,23 @@ class Inbox:
 
     def _floor(self) -> int:
         return max(0, self._now() - self._offline)
+
+    def _principal_context(self) -> PrincipalContext | None:
+        if self._principal is None:
+            return None
+        account, self_signer, trusted = self._principal
+        store, peers = self._store, self._peers
+
+        def lookup(conversation_id: str, request_id: str, now: int) -> str | None:
+            return open_request_to(store, conversation_id, request_id, now)
+
+        def refresh(ace_id: str) -> Any:
+            try:
+                return peers._refresh(ace_id)
+            except Exception:  # a failed refresh falls through to the rule outcome (R-P20)
+                return None
+
+        return PrincipalContext(account, lookup, self_signer, trusted, refresh)
 
     def _load_replay(self) -> ReplayDetector:
         state = load_record(self._store, "replay.json")
@@ -399,6 +473,11 @@ class Inbox:
                 ):
                     continue  # fully committed long ago; its thread may have been pruned
                 repair_thread(self._threads, rec)
+        decisions = [rec.message for rec in records if rec.message.type == "decision"]
+        if decisions:  # 1a: a decision's requests/ fill (no-op when already filled)
+            with self._store.lock("requests"):
+                for m in decisions:
+                    fill_decision(self._store, m)
         for rec in records:
             m = rec.message
             if self._replay.accepts(m.message_id, m.from_id, m.timestamp):
@@ -646,18 +725,22 @@ class Inbox:
             if stored.status == "pending":
                 return self._hand_over(stored)
             return ReceiveOutcome("duplicate", from_id=env.from_id, message_id=env.message_id)
-        # 5-7
+        # 5-7: economic types under ``threads``; a decision under ``requests`` from the open-
+        # request check through the requests/ fill (R-P25)
         economic = is_economic_type(env.type)
+        decision = env.type == "decision"
         with ExitStack() as held:
-            if economic:
+            if economic or decision:
                 try:
-                    held.enter_context(self._threads._locked())
+                    held.enter_context(
+                        self._threads._locked() if economic else self._store.lock("requests")
+                    )
                 except ACEError as exc:
                     return ReceiveOutcome(
                         "retryable", error=exc, from_id=env.from_id, message_id=env.message_id
                     )
             result = self._parse_and_commit(env, peer, key, source, now, economic)
-            if self._failed and economic:
+            if self._failed and (economic or decision):
                 self._held_threads = (
                     held.pop_all()
                 )  # keep other writers out until close()/open() repairs
@@ -683,8 +766,8 @@ class Inbox:
         now: int,
         economic: bool,
     ) -> "ReceiveOutcome | _Delivery":
-        """Steps 5-7.3 (caller holds ``threads`` for economic types). Returns an outcome,
-        or the committed pending delivery to hand over."""
+        """Steps 5-7.3 (caller holds ``threads`` for economic types, ``requests`` for a
+        decision). Returns an outcome, or the committed pending delivery to hand over."""
         ids = {"from_id": env.from_id, "message_id": env.message_id}
         try:
             if economic:
@@ -705,6 +788,7 @@ class Inbox:
                 replay=tr,
                 floor=floor,
                 clock=self._clock,
+                principal=self._principal_context(),
             )
             # a verified message that opens a thread is bounded per peer (04 § Open-thread bound)
             if economic and rec is None:
@@ -732,6 +816,8 @@ class Inbox:
         except ACEError as exc:
             return ReceiveOutcome("retryable", error=exc, **ids)
         try:
+            if parsed.type == "decision":  # 7.1a: mark the request decided
+                fill_decision(self._store, parsed)
             if snap is not None:  # 7.2
                 self._threads._save(ThreadRecord(snap, _clear_proven_pending(rec, snap)))
             self._write_replay(tr)  # 7.3

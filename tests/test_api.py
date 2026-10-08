@@ -124,6 +124,20 @@ EXPECTED = {
     "is_https_url",
     "SIGNING_SCHEMES",
     "is_signing_scheme",
+    # principal (09)
+    "PRINCIPAL_TYPES",
+    "is_principal_type",
+    "PrincipalRecord",
+    "PrincipalKey",
+    "PrincipalSigner",
+    "PrincipalContext",
+    "create_principal_record",
+    "validate_principal_record",
+    "principal_sign_data",
+    "check_principal_rules",
+    "RequestBody",
+    "DecisionBody",
+    "ReportBody",
     "__version__",
 }
 

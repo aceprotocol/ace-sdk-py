@@ -30,6 +30,7 @@ from .threads import sha256_hex
 from .types import SIGNING_SCHEMES, ACEIdentity, PrincipalKey, PrincipalRecord, is_principal_type
 
 if TYPE_CHECKING:
+    from .discovery import VerifiedPeer
     from .store import ACEStore
     from .types import ACEMessage, ParsedMessage
 
@@ -41,6 +42,9 @@ _ALLOWED_ROLES = {("controller",), ("agent",), ("controller", "agent")}
 #: ``request`` to, if it was sent in that conversation, no ``decision`` for it was accepted and
 #: it is not expired at ``now``; otherwise None.
 OpenRequestTo = Callable[[str, str, int], "str | None"]
+#: ``refresh_sender(ace_id)``: re-fetch the sender's peer binding once (relay lookup through
+#: the Rollback Barrier) and return it, or None when the refresh failed (R-P20).
+RefreshSender = Callable[[str], "VerifiedPeer | None"]
 _WRONG_DECIDER = "decision from a different controller than the request was sent to"
 _EIP155_ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 
@@ -168,13 +172,16 @@ def create_principal_record(
 class PrincipalContext:
     """Step-7 inputs from the receiver: its own principal ``account``; the keys accepted as
     authorities of that account (``self_signer``, the signer of the receiver's own record, and
-    host-provided ``trusted_signers``, e.g. read from chain); and the ledger lookup
-    ``open_request_to`` (see :data:`OpenRequestTo`)."""
+    host-provided ``trusted_signers``, e.g. read from chain); the ledger lookup
+    ``open_request_to`` (see :data:`OpenRequestTo`); and ``refresh_sender`` (see
+    :data:`RefreshSender`), used once per message when the pinned sender principal is missing,
+    invalid, not an authority of the account, or of another account (09 steps 2-5)."""
 
     account: str
     open_request_to: OpenRequestTo | None = None
     self_signer: PrincipalKey | None = None
     trusted_signers: frozenset[PrincipalKey] = frozenset()
+    refresh_sender: RefreshSender | None = None
 
 
 def _is_account_authority(
@@ -182,7 +189,7 @@ def _is_account_authority(
     self_signer: PrincipalKey | None,
     trusted_signers: frozenset[PrincipalKey],
 ) -> bool:
-    """R-P21: ``p.signer`` is an authority of ``p.account`` when it is the receiver's own
+    """09 step 4: ``p.signer`` is an authority of ``p.account`` when it is the receiver's own
     attesting key, a host-trusted key, or (``eip155``) the secp256k1 key whose address is the
     account address. ``p`` has passed ``validate_principal_record``."""
     if p.signer == self_signer or p.signer in trusted_signers:
@@ -210,10 +217,9 @@ def check_principal_rules(
     self_signer: PrincipalKey | None = None,
     trusted_signers: frozenset[PrincipalKey] = frozenset(),
 ) -> None:
-    """09 § Same-Account Rules 1-6 (first failure wins), plus the signer-authority check
-    (R-P21) before rule 4 and the decision-recipient check (R-P22) after rule 6. Pure: no
-    side effects, so a caller may refresh the sender's peer binding and call it again
-    (R-P20). ``body`` has already passed ``validate_body``."""
+    """09 § Same-Account Rules, steps 1-7 in order (first failure wins). Pure: no side
+    effects, so a caller may refresh the sender's peer binding and call it again (R-P20).
+    ``body`` has already passed ``validate_body``."""
     if not is_principal_type(type_):
         raise ACEError("invalid_argument", "not a principal message type")
     if self_account is None:  # 1
@@ -228,23 +234,46 @@ def check_principal_rules(
         raise ACEError(
             "wrong_principal", f"the sender's principal is invalid: {exc.message}"
         ) from None
-    if not _is_account_authority(p, self_signer, trusted_signers):  # R-P21
+    if not _is_account_authority(p, self_signer, trusted_signers):  # 4
         raise ACEError("wrong_principal", "signer is not an authority of the account")
-    if p.account != self_account:  # 4
+    if p.account != self_account:  # 5
         raise ACEError("wrong_principal", "the sender belongs to another account")
     if type_ == "decision":
-        if "controller" not in p.roles:  # 5
+        if "controller" not in p.roles:  # 6
             raise ACEError("wrong_principal", "only a controller may send a decision")
         recipient = (
             None if open_request_to is None
             else open_request_to(conversation_id, body["requestId"], now)
         )
-        if recipient is None:  # 6
+        if recipient is None:  # 7 (unknown, decided or expired request)
             raise ACEError(
                 "bad_reference", "decision.requestId names no open request in this conversation"
             )
-        if recipient != compute_ace_id(bytes(sender_signing_public_key)):  # R-P22
+        if recipient != compute_ace_id(bytes(sender_signing_public_key)):  # 7 (decider)
             raise ACEError("wrong_principal", _WRONG_DECIDER)
+
+
+def sender_principal_usable(
+    sender_principal: PrincipalRecord | dict | None,
+    sender_signing_public_key: bytes,
+    ctx: PrincipalContext,
+    now: int,
+) -> bool:
+    """True when the pinned sender principal passes 09 steps 2-5 for ``ctx`` (present, valid,
+    signed by an authority of the account, same account). False means a peer refresh may
+    help (R-P20)."""
+    if sender_principal is None:
+        return False
+    try:
+        p = validate_principal_record(sender_principal, sender_signing_public_key, now)
+    except ACEError as exc:
+        if exc.code != "invalid_principal":
+            raise
+        return False
+    return (
+        _is_account_authority(p, ctx.self_signer, ctx.trusted_signers)
+        and p.account == ctx.account
+    )
 
 
 # --- requests/ ledger (09 § Persistence, 06 Appendix A) ------------------------------
@@ -285,7 +314,8 @@ def open_request_to(
     store: "ACEStore", conversation_id: str, message_id: str, now: int
 ) -> str | None:
     """The ``to`` of a sent, undecided, unexpired request (expired when ``timestamp + ttl <
-    now``), else None (09 § Same-Account Rules 6). Bind ``store`` to get :data:`OpenRequestTo`."""
+    now``), else None (09 § Same-Account Rules step 7). Bind ``store`` to get
+    :data:`OpenRequestTo`."""
     rec = load_request_record(store, conversation_id, message_id)
     if rec is None or rec["decision"] is not None:
         return None
@@ -319,13 +349,19 @@ def record_request(
 
 
 def fill_decision(store: "ACEStore", m: "ParsedMessage") -> None:
-    """Mark the request of an accepted ``decision`` decided (idempotent; the first accepted
-    decision wins; an unknown request is a no-op). A decision from anyone but the request's
-    ``to`` is ``wrong_principal`` (R-P22). Caller holds lock ``requests``."""
+    """Mark the request of an accepted ``decision`` decided. Replaying the recorded decision
+    (same ``messageId``) is a no-op and an unknown request is a no-op; a second, different
+    decision is ``bad_reference`` (a request has at most one accepted decision); a decision
+    from anyone but the request's ``to`` is ``wrong_principal`` (09 step 7). The record is
+    unchanged on failure. Caller holds lock ``requests``."""
     request_id = m.body["requestId"]
     rec = load_request_record(store, m.conversation_id, request_id)
-    if rec is None or rec["decision"] is not None:
+    if rec is None:
         return
+    if rec["decision"] is not None:
+        if rec["decision"]["messageId"] == m.message_id:
+            return
+        raise ACEError("bad_reference", "the request already has an accepted decision")
     if m.from_id != rec["to"]:
         raise ACEError("wrong_principal", _WRONG_DECIDER)
     out: dict[str, Any] = {k: v for k, v in rec.items() if k != "version"}

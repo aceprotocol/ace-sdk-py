@@ -403,7 +403,9 @@ def test_record_request_and_fill_decision():
     assert rec["decision"] == {"messageId": "00000000-0000-4000-8000-0000000000aa", "outcome": "approve",
                                "timestamp": NOW + 5}
     assert open_request_to(store, CONV, MID, NOW) is None
-    fill_decision(store, _decision(outcome="deny", own="00000000-0000-4000-8000-0000000000bb"))  # first wins
+    with raises("bad_reference"):  # R-P25: a second, different decision; the first wins
+        fill_decision(store, _decision(outcome="deny", own="00000000-0000-4000-8000-0000000000bb"))
+    fill_decision(store, _decision())  # replay of the accepted decision: no-op
     assert load_request_record(store, CONV, MID)["decision"]["outcome"] == "approve"
     fill_decision(store, _decision(mid="00000000-0000-4000-8000-000000000009"))  # unknown: no-op
     store2 = MemoryStore()
@@ -592,3 +594,380 @@ def test_relay_candidate_without_principal_clears_it():
     clock[0] = NOW + 20
     out = peers.adopt(verify_peer_record(rec, clock=lambda: NOW + 10)).peer
     assert out.principal is None and peers.get(me.get_ace_id()).principal is None
+
+
+# --- Task 6: pipeline step 7, Inbox principal context, requests/ ledger ------------------
+
+
+from ace import (  # noqa: E402
+    Outbox,
+    ReceiveSource,
+    ReplayDetector,
+    ThreadStateMachine,
+    create_message,
+    parse_message,
+)
+
+from .helpers import wire  # noqa: E402
+from .pipeline import Agent, Clock, CountingStore  # noqa: E402
+
+RELAY = "https://relay.example"
+RID2 = "00000000-0000-4000-8000-0000000000bb"
+
+
+def _signer_dict(owner):
+    return {"scheme": owner.get_signing_scheme(), "publicKey": to_base64(bytes(owner.get_signing_public_key()))}
+
+
+def _pin_relay(peers, ident, principal=None, name=None, ts=NOW):
+    prof = {} if name is None else {"name": name}
+    if principal is not None:
+        prof["principal"] = principal.to_dict()
+    return peers.adopt(verify_peer_record(_peer_record(ident, prof, ts=ts), clock=lambda: ts)).peer
+
+
+def _pair_with_principals(roles_a=("controller", "agent"), roles_b=("agent",), acc_b=ACC, relay=None, pin_b_principal=True):
+    clock = Clock(NOW)
+    owner = _owner()
+    a, b = Agent("a", "ed25519", clock, relay=relay), Agent("b", "secp256k1", clock)
+    pa = _rec(owner, a.identity, roles=list(roles_a))
+    pb = _rec(owner, b.identity, roles=list(roles_b), account=acc_b)
+    _pin_relay(a.peers, b.identity, pb if pin_b_principal else None, name="b")
+    _pin_relay(b.peers, a.identity, pa, name="a")
+    return clock, owner, a, b, pb
+
+
+def _open(agent, owner=None, account=ACC, **kw):
+    if account is None:
+        return agent.open(**kw)
+    principal = {"account": account}
+    if owner is not None:
+        principal["selfSigner"] = _signer_dict(owner)
+    return agent.open(principal=principal, **kw)
+
+
+def _send(sender, receiver_inbox, recipient, type_, body, n):
+    p = sender.outbox.stage(sender.peers.get(recipient.id), type_, body)
+    out = sender.outbox.deliver(p.request_id, lambda env: receiver_inbox.receive(wire(env), ReceiveSource.relay(RELAY, f"{n}-0")))
+    return out, p
+
+
+def test_parse_message_without_context_is_wrong_principal():
+    clock, owner, a, b, _ = _pair_with_principals()
+    env = create_message(b.identity, b.peers.get(a.id), "request", {"action": "pay", "summary": "s"},
+                         ThreadStateMachine(b.id), timestamp=NOW)
+    with raises("wrong_principal"):
+        parse_message(env, a.identity, a.peers.get(b.id), threads=ThreadStateMachine(a.id),
+                      replay=ReplayDetector(horizon=NOW - 100), clock=clock)
+    ctx = PrincipalContext(ACC, self_signer=PrincipalKey(**{"scheme": "ed25519", "public_key": _signer_dict(owner)["publicKey"]}))
+    parsed = parse_message(env, a.identity, a.peers.get(b.id), threads=ThreadStateMachine(a.id),
+                           replay=ReplayDetector(horizon=NOW - 100), clock=clock, principal=ctx)
+    assert parsed.type == "request"
+
+
+def test_request_decision_round_trip_and_second_decision():
+    clock, owner, a, b, _ = _pair_with_principals()
+    ia, ib = _open(a, owner), _open(b, owner)
+    out, req = _send(b, ia, a, "request", {"action": "pay", "summary": "Pay 1 USDC", "ttl": 600}, 1)
+    assert out.kind == "delivered"
+    rec = load_request_record(b.store, out.message.conversation_id, req.message.message_id)
+    assert rec["decision"] is None and rec["to"] == a.id and rec["expiresAt"] == req.message.timestamp + 600
+    assert b.outbox.pending() == []
+    d1, p1 = _send(a, ib, b, "decision", {"requestId": req.message.message_id, "outcome": "approve", "result": {"tx": "0x1"}}, 1)
+    assert d1.kind == "delivered" and b.host.effects[(a.id, p1.message.message_id)].type == "decision"
+    dec = load_request_record(b.store, out.message.conversation_id, req.message.message_id)["decision"]
+    assert dec == {"messageId": p1.message.message_id, "outcome": "approve", "timestamp": p1.message.timestamp}
+    d2, _ = _send(a, ib, b, "decision", {"requestId": req.message.message_id, "outcome": "deny"}, 2)
+    assert d2.kind == "quarantined" and d2.error.code == "bad_reference"
+    assert load_request_record(b.store, out.message.conversation_id, req.message.message_id)["decision"] == dec
+
+
+def test_decision_for_expired_or_unknown_request_is_bad_reference():
+    clock, owner, a, b, _ = _pair_with_principals()
+    ia, ib = _open(a, owner), _open(b, owner)
+    _, req = _send(b, ia, a, "request", {"action": "pay", "summary": "s", "ttl": 10}, 1)
+    clock.t = NOW + 11
+    d, _ = _send(a, ib, b, "decision", {"requestId": req.message.message_id, "outcome": "approve"}, 1)
+    assert d.kind == "quarantined" and d.error.code == "bad_reference"
+    d, _ = _send(a, ib, b, "decision", {"requestId": RID2, "outcome": "approve"}, 2)
+    assert d.kind == "quarantined" and d.error.code == "bad_reference"
+
+
+def test_decision_from_agent_and_other_account_rejected():
+    clock, owner, a, b, _ = _pair_with_principals(roles_a=("agent",))
+    ia, ib = _open(a, owner), _open(b, owner)
+    _, req = _send(b, ia, a, "request", {"action": "pay", "summary": "s"}, 1)
+    d, _ = _send(a, ib, b, "decision", {"requestId": req.message.message_id, "outcome": "approve"}, 1)
+    assert d.kind == "quarantined" and d.error.code == "wrong_principal"
+    clock2, owner2, c, e, _ = _pair_with_principals(acc_b="eip155:1:0x" + "ab" * 20)
+    ic = _open(c, owner2)
+    r, _ = _send(e, ic, c, "report", {"action": "pay", "summary": "s", "outcome": "ok"}, 1)
+    assert r.kind == "quarantined" and r.error.code == "wrong_principal"
+
+
+def test_inbox_without_principal_rejects_and_open_validates_option():
+    clock, owner, a, b, _ = _pair_with_principals()
+    ia = _open(a, account=None)
+    r, _ = _send(b, ia, a, "report", {"action": "pay", "summary": "s", "outcome": "ok"}, 1)
+    assert r.kind == "quarantined" and r.error.code == "wrong_principal"
+    ia.close()
+    for bad in ({"account": "nope"}, "solana:x:y", {"account": ACC, "selfSigner": {"scheme": "rsa", "publicKey": "AA=="}},
+                {"account": ACC, "selfSigner": "k"}, {"account": ACC, "trustedSigners": {"scheme": "ed25519"}},
+                {"account": ACC, "trustedSigners": [{"scheme": "ed25519", "publicKey": 3}]}, {"account": ACC, "selfsigner": None}):
+        with raises("invalid_argument"):
+            a.open(principal=bad)
+    _open(a, account=ACC, ).close()
+    a.open(principal={"account": ACC, "selfSigner": None, "trustedSigners": []}).close()
+
+
+def test_without_self_signer_fails_closed():
+    clock, owner, a, b, _ = _pair_with_principals()
+    ia = _open(a)  # account only: neither selfSigner nor trustedSigners, solana account
+    r, _ = _send(b, ia, a, "report", {"action": "pay", "summary": "s", "outcome": "ok"}, 1)
+    assert r.kind == "quarantined" and r.error.code == "wrong_principal"
+    ia.close()
+    ia = a.open(principal={"account": ACC, "trustedSigners": [_signer_dict(owner)]})
+    r, _ = _send(b, ia, a, "report", {"action": "pay", "summary": "s2", "outcome": "ok"}, 2)
+    assert r.kind == "delivered"
+
+
+def test_eip155_account_passes_without_self_signer():
+    from ace.identity import signing_address
+
+    clock = Clock(NOW)
+    owner = _owner("secp256k1")
+    acc = "eip155:1:" + signing_address("secp256k1", bytes(owner.get_signing_public_key()))
+    a, b = Agent("a", "ed25519", clock), Agent("b", "ed25519", clock)
+    _pin_relay(a.peers, b.identity, _rec(owner, b.identity, account=acc))
+    _pin_relay(b.peers, a.identity, _rec(owner, a.identity, account=acc))
+    ia = a.open(principal={"account": acc})
+    r, _ = _send(b, ia, a, "report", {"action": "pay", "summary": "s", "outcome": "ok"}, 1)
+    assert r.kind == "delivered"
+
+
+class _FakeRelay:
+    def __init__(self, record=None, error=None):
+        self.record, self.error, self.calls = record, error, 0
+
+    def lookup_peer(self, ace_id):
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return verify_peer_record(self.record, clock=lambda: NOW)
+
+
+def test_wrong_principal_refreshes_peer_once_then_accepts():
+    relay = _FakeRelay()
+    clock, owner, a, b, pb = _pair_with_principals(relay=relay, pin_b_principal=False)
+    relay.record = _peer_record(b.identity, {"name": "b2", "principal": pb.to_dict()}, ts=NOW)
+    ia = _open(a, owner)
+    r, _ = _send(b, ia, a, "request", {"action": "pay", "summary": "s"}, 1)
+    assert r.kind == "delivered" and relay.calls == 1
+    assert a.peers.get(b.id).principal == pb and a.peers.get(b.id).profile.name == "b2"
+    r, _ = _send(b, ia, a, "report", {"action": "pay", "summary": "s", "outcome": "ok"}, 2)
+    assert r.kind == "delivered" and relay.calls == 1  # pin now valid: no refresh
+
+
+def test_wrong_principal_after_failed_or_useless_refresh():
+    relay = _FakeRelay(error=ACEError("relay_unavailable", "down"))
+    clock, owner, a, b, pb = _pair_with_principals(relay=relay, pin_b_principal=False)
+    ia = _open(a, owner)
+    r, _ = _send(b, ia, a, "request", {"action": "pay", "summary": "s"}, 1)
+    assert r.kind == "quarantined" and r.error.code == "wrong_principal" and relay.calls == 1
+    relay.error, relay.record = None, _peer_record(b.identity, {"name": "b"}, ts=NOW)
+    r, _ = _send(b, ia, a, "request", {"action": "pay", "summary": "s2"}, 2)
+    assert r.kind == "quarantined" and r.error.code == "wrong_principal" and relay.calls == 2
+    # another account: refreshed once, still the other account
+    relay2 = _FakeRelay()
+    clock, owner, c, e, pe = _pair_with_principals(acc_b="solana:x:other", relay=relay2)
+    relay2.record = _peer_record(e.identity, {"principal": pe.to_dict()}, ts=NOW)
+    ic = _open(c, owner)
+    r, _ = _send(e, ic, c, "report", {"action": "pay", "summary": "s", "outcome": "ok"}, 1)
+    assert r.error.code == "wrong_principal" and relay2.calls == 1
+
+
+class _LockAudit(CountingStore):
+    """Records whether lock ``requests`` was held on every ``requests/`` access."""
+
+    def __init__(self, inner):
+        super().__init__(inner)
+        self.held = 0
+        self.accesses: list[tuple[str, bool]] = []
+
+    def read(self, key):
+        if key.startswith("requests/"):
+            self.accesses.append(("read", self.held > 0))
+        return super().read(key)
+
+    def write(self, key, value):
+        if key.startswith("requests/"):
+            self.accesses.append(("write", self.held > 0))
+        return super().write(key, value)
+
+    def lock(self, name, timeout=10.0):
+        inner = super().lock(name, timeout)
+        audit = self
+
+        class _Ctx:
+            def __enter__(self):
+                r = inner.__enter__()
+                if name == "requests":
+                    audit.held += 1
+                return r
+
+            def __exit__(self, *exc):
+                if name == "requests":
+                    audit.held -= 1
+                return inner.__exit__(*exc)
+
+        return _Ctx()
+
+
+def test_decision_check_and_fill_under_requests_lock():
+    clock, owner, a, b, _ = _pair_with_principals()
+    ia = _open(a, owner)
+    _, req = _send(b, ia, a, "request", {"action": "pay", "summary": "s"}, 1)
+    audit = _LockAudit(b.store)
+    ib = b.open(store=audit, principal={"account": ACC, "selfSigner": _signer_dict(owner)})
+    d, _ = _send(a, ib, b, "decision", {"requestId": req.message.message_id, "outcome": "approve"}, 1)
+    assert d.kind == "delivered"
+    kinds = [k for k, _ in audit.accesses]
+    assert "read" in kinds and "write" in kinds and all(held for _, held in audit.accesses)
+
+
+def test_fill_decision_second_different_decision_is_bad_reference():
+    store = MemoryStore()
+    record_request(store, _Msg(), NOW)
+    first = _decision()
+    fill_decision(store, first)
+    before = load_request_record(store, CONV, MID)
+    fill_decision(store, first)  # replay of the same decision: no-op
+    assert load_request_record(store, CONV, MID) == before
+    with raises("bad_reference"):
+        fill_decision(store, dataclasses.replace(first, message_id=RID2, body={"requestId": MID, "outcome": "deny"}))
+    assert load_request_record(store, CONV, MID) == before
+
+
+class _OrderStore(CountingStore):
+    def __init__(self, inner, fail_key_prefix=None):
+        super().__init__(inner)
+        self.log: list[tuple[str, str]] = []
+        self.fail_key_prefix = fail_key_prefix
+
+    def write(self, key, value):
+        if self.fail_key_prefix and key.startswith(self.fail_key_prefix):
+            self.fail_key_prefix = None
+            raise ACEError("storage_failed", "injected")
+        self.log.append(("write", key))
+        return super().write(key, value)
+
+    def delete(self, key):
+        self.log.append(("delete", key))
+        return super().delete(key)
+
+
+def test_request_record_written_before_ack():
+    clock, owner, a, b, _ = _pair_with_principals()
+    ia = _open(a, owner)
+    store = _OrderStore(b.store, fail_key_prefix="requests/")
+    outbox = Outbox.open(b.identity, store, clock=clock)
+    p = outbox.stage(b.peers.get(a.id), "request", {"action": "pay", "summary": "s", "ttl": 30})
+    transport = lambda env: ia.receive(wire(env), ReceiveSource.relay(RELAY, "1-0"))  # noqa: E731
+    # Transport succeeds, the requests/ write fails: the send stays pending, no record.
+    with raises("storage_failed"):
+        outbox.deliver(p.request_id, transport)
+    conv = p.message.conversation_id
+    assert load_request_record(b.store, conv, p.message.message_id) is None
+    assert [x.request_id for x in outbox.pending()] == [p.request_id]
+    # A process restart keeps ttl with the pending send; the retry writes the record, then clears.
+    outbox = Outbox.open(b.identity, store, clock=clock)
+    assert outbox.pending()[0].request_ttl == 30
+    res = outbox.deliver(p.request_id, transport)
+    assert res.kind == "duplicate"
+    rec = load_request_record(b.store, conv, p.message.message_id)
+    assert rec["to"] == a.id and rec["expiresAt"] == p.message.timestamp + 30 and rec["sentAt"] == NOW
+    i_req = store.log.index(("write", request_key(conv, p.message.message_id)))
+    i_del = [i for i, (op, k) in enumerate(store.log) if op == "delete" and k.startswith("outbox/")]
+    assert i_del and i_req < i_del[0] and outbox.pending() == []
+
+
+def test_request_ttl_survives_resign():
+    clock, owner, a, b, _ = _pair_with_principals()
+    p = b.outbox.stage(b.peers.get(a.id), "request", {"action": "pay", "summary": "s", "ttl": 30})
+    with raises("envelope_expired"):
+        b.outbox.deliver(p.request_id, lambda env: (_ for _ in ()).throw(ACEError("envelope_expired", "x")))
+    clock.t = NOW + 50
+    q = b.outbox.resign(p.request_id)
+    assert q.request_ttl == 30 and q.to_dict()["requestTtl"] == 30
+    assert "requestTtl" not in b.outbox.stage(b.peers.get(a.id), "text", {"message": "hi"}).to_dict()
+    b.outbox.deliver(p.request_id, lambda env: None)
+    rec = load_request_record(b.store, p.message.conversation_id, p.message.message_id)
+    assert rec["expiresAt"] == NOW + 50 + 30
+
+
+def test_decision_fill_recovered_after_crash():
+    clock, owner, a, b, _ = _pair_with_principals()
+    ia = _open(a, owner)
+    out, req = _send(b, ia, a, "request", {"action": "pay", "summary": "s"}, 1)
+    conv = out.message.conversation_id
+    principal = {"account": ACC, "selfSigner": _signer_dict(owner)}
+    b.open(principal=principal).close()  # replay.json exists
+    store = CountingStore(b.store)
+    ib = b.open(store=store, principal=principal)
+    # Crash: the decision's delivery record is written, the requests/ fill fails.
+    store.fail_at = len(store.writes) + 2
+    p = a.outbox.stage(a.peers.get(b.id), "decision", {"requestId": req.message.message_id, "outcome": "approve"})
+    res = ib.receive(wire(p.message), ReceiveSource.relay(RELAY, "1-0"))
+    assert res.kind == "retryable"
+    assert store.writes[-2].startswith("deliveries/") and store.writes[-1].startswith("requests/")
+    ib.close()
+    assert load_request_record(b.store, conv, req.message.message_id)["decision"] is None
+    assert b.host.effects == {}
+    ib2 = b.open(principal=principal)  # recovery fills it, then hands over
+    dec = load_request_record(b.store, conv, req.message.message_id)["decision"]
+    assert dec["messageId"] == p.message.message_id and dec["outcome"] == "approve"
+    assert (a.id, p.message.message_id) in b.host.effects
+    res = ib2.receive(wire(p.message), ReceiveSource.relay(RELAY, "1-0"))
+    assert res.kind == "duplicate"
+    ib2.close()
+    b.open(principal=principal).close()  # recovery again: same decision is a no-op
+
+
+def test_registration_file_refresh_keeps_cached_members():
+    owner, me = _owner(), SoftwareIdentity.generate("ed25519")
+    clock = [NOW]
+    peers, pin = _pin_with_principal(owner, me, clock)
+    out = peers.adopt(_file_candidate(me, AgentProfile(principal=pin.principal))).peer
+    assert out.profile.name == "Old" and out.profile.tags == ["a"] and out.principal == pin.principal
+    out = peers.adopt(_file_candidate(me, None)).peer
+    assert out.profile.name == "Old" and out.profile.tags == ["a"]
+    out = peers.adopt(_file_candidate(me, AgentProfile(description="d"))).peer
+    assert out.profile.name == "Old" and out.profile.description == "d" and out.principal == pin.principal
+    assert peers.get(me.get_ace_id()).profile.name == "Old"
+
+
+def test_concurrent_different_decisions_accept_exactly_one():
+    import threading
+
+    clock, owner, a, b, _ = _pair_with_principals()
+    ia, ib = _open(a, owner), _open(b, owner)
+    _, req = _send(b, ia, a, "request", {"action": "pay", "summary": "s"}, 1)
+    ps = [a.outbox.stage(a.peers.get(b.id), "decision", {"requestId": req.message.message_id, "outcome": o})
+          for o in ("approve", "deny")]
+    results = [None, None]
+    start = threading.Barrier(2)
+
+    def run(i):
+        start.wait()
+        results[i] = ib.receive(wire(ps[i].message), ReceiveSource.relay(RELAY, f"{i + 1}-0"))
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    kinds = sorted((r.kind, None if r.error is None else r.error.code) for r in results)
+    assert kinds == [("delivered", None), ("quarantined", "bad_reference")]
+    winner = next(p for p, r in zip(ps, results) if r.kind == "delivered")
+    dec = load_request_record(b.store, req.message.conversation_id, req.message.message_id)["decision"]
+    assert dec["messageId"] == winner.message.message_id

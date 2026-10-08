@@ -51,6 +51,14 @@ from .limits import (
 from .messages import create_message, parse_message, validate_body
 from .outbox import Outbox
 from .peers import PeerStore
+from .principal import (
+    PrincipalContext,
+    PrincipalSigner,
+    check_principal_rules,
+    create_principal_record,
+    principal_sign_data,
+    validate_principal_record,
+)
 from .registration import (
     create_registration_file,
     create_registration_request,
@@ -70,6 +78,7 @@ from .threads import PendingSend, ThreadStore
 from .types import (
     ECONOMIC_TYPES,
     MESSAGE_TYPES,
+    PRINCIPAL_TYPES,
     SIGNING_SCHEMES,
     AcceptBody,
     ACEIdentity,
@@ -78,6 +87,7 @@ from .types import (
     Capability,
     ChainInfo,
     ConfirmBody,
+    DecisionBody,
     DeliverBody,
     DiscoverQuery,
     EncryptionEnvelope,
@@ -92,12 +102,16 @@ from .types import (
     ParsedMessage,
     PeerRecord,
     PricingInfo,
+    PrincipalKey,
+    PrincipalRecord,
     ProfilePricing,
     ReceiptBody,
     RegistrationFile,
     RegistrationRequest,
     RejectBody,
     ReplayState,
+    ReportBody,
+    RequestBody,
     RfqBody,
     SignatureEnvelope,
     SigningConfig,
@@ -106,6 +120,7 @@ from .types import (
     TextBody,
     is_economic_type,
     is_message_type,
+    is_principal_type,
     is_signing_scheme,
 )
 from .webhook import WebhookNotification, verify_webhook_notification
@@ -228,4 +243,18 @@ __all__ = [
     "verify_webhook_notification",
     "post_direct",
     "deliver_direct_or_relay",
+    # principal (09)
+    "PRINCIPAL_TYPES",
+    "is_principal_type",
+    "PrincipalRecord",
+    "PrincipalKey",
+    "PrincipalSigner",
+    "PrincipalContext",
+    "create_principal_record",
+    "validate_principal_record",
+    "principal_sign_data",
+    "check_principal_rules",
+    "RequestBody",
+    "DecisionBody",
+    "ReportBody",
 ]

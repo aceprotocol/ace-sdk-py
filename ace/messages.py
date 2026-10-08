@@ -25,6 +25,7 @@ from .encryption import compute_conversation_id, encrypt
 from .envelope import decode_kem_ciphertext, decode_payload, message_sign_data, revalidate
 from .errors import ACEError
 from .limits import MAX_PLAINTEXT_BYTES, TIMESTAMP_WINDOW_SECONDS
+from .principal import PrincipalContext, check_principal_rules, sender_principal_usable
 from .replay import ReplayDetector
 from .state_machine import ThreadEvent, ThreadStateMachine
 from .types import (
@@ -36,6 +37,7 @@ from .types import (
     SignatureEnvelope,
     is_economic_type,
     is_message_type,
+    is_principal_type,
 )
 
 # --- body schema ------------------------------------------------------------------
@@ -256,13 +258,20 @@ def parse_message(
     replay: ReplayDetector,
     floor: int | None = None,
     clock: Callable[[], int] | None = None,
+    principal: PrincipalContext | None = None,
 ) -> ParsedMessage:
     """Verify, decrypt and validate an inbound message. The first failure wins:
 
     decode -> wrong_recipient -> from (invalid_envelope) -> scheme_mismatch ->
     conversationId (invalid_envelope) -> floor/timestamp (stale_timestamp) -> replay ->
-    invalid_signature -> replay commit -> decrypt -> invalid_body -> state machine.
+    invalid_signature -> replay commit -> decrypt -> invalid_body -> state machine /
+    principal rules.
+
+    Principal types (``request``, ``decision``, ``report``) need ``principal`` (the
+    receiver's :class:`PrincipalContext`); without it they are ``wrong_principal``.
     """
+    if principal is not None and not isinstance(principal, PrincipalContext):
+        raise ACEError("invalid_argument", "principal must be a PrincipalContext")
     if not isinstance(sender, VerifiedPeer):
         raise ACEError("invalid_argument", "sender must be a VerifiedPeer")
     if not isinstance(threads, ThreadStateMachine) or not isinstance(replay, ReplayDetector):
@@ -319,6 +328,8 @@ def parse_message(
     # 13
     if is_economic_type(env.type):
         threads.apply(_event(env), body)
+    elif is_principal_type(env.type):
+        _check_principal(env, body, sender, principal, now)
     return ParsedMessage(
         message_id=env.message_id,
         from_id=env.from_id,
@@ -328,4 +339,40 @@ def parse_message(
         thread_id=env.thread_id,
         timestamp=env.timestamp,
         body=body,
+    )
+
+
+def _check_principal(
+    env: ACEMessage,
+    body: dict,
+    sender: VerifiedPeer,
+    ctx: PrincipalContext | None,
+    now: int,
+) -> None:
+    """06 step 7 for principal types (09 § Same-Account Rules). When the pinned sender
+    principal fails steps 2-5, the sender's binding is refreshed once (R-P20) before the
+    rules run; a failed refresh leaves the pinned binding to decide."""
+    if (
+        ctx is not None
+        and ctx.refresh_sender is not None
+        and not sender_principal_usable(sender.principal, sender.signing_public_key, ctx, now)
+    ):
+        fresh = ctx.refresh_sender(sender.ace_id)
+        if (
+            isinstance(fresh, VerifiedPeer)
+            and fresh.ace_id == sender.ace_id
+            and fresh.signing_public_key == sender.signing_public_key
+        ):
+            sender = fresh
+    check_principal_rules(
+        env.type,
+        body,
+        conversation_id=env.conversation_id,
+        sender_principal=sender.principal,
+        sender_signing_public_key=sender.signing_public_key,
+        self_account=None if ctx is None else ctx.account,
+        open_request_to=None if ctx is None else ctx.open_request_to,
+        now=now,
+        self_signer=None if ctx is None else ctx.self_signer,
+        trusted_signers=frozenset() if ctx is None else ctx.trusted_signers,
     )
