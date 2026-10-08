@@ -196,3 +196,28 @@ def test_resolve_without_relay():
     assert peers.resolve(bob.get_ace_id(), max_age_seconds=0).ace_id == bob.get_ace_id()
     with raises("invalid_argument"):
         peers.resolve("bob")
+
+
+def test_file_refresh_drops_expired_cached_principal():
+    from .test_principal import NOW, _file_candidate, _owner, _pin_with_principal
+
+    owner, me = _owner(), SoftwareIdentity.generate("ed25519")
+    clock = [NOW]
+    peers, pin = _pin_with_principal(owner, me, clock, expires_at=NOW + 5)
+    assert pin.principal is not None
+    clock[0] = NOW + 100
+    out = peers.adopt(_file_candidate(me, None)).peer
+    assert out.principal is None
+    assert peers.get(me.get_ace_id()).principal is None  # pin stays readable
+
+
+def test_file_refresh_carries_unexpired_cached_principal():
+    from .test_principal import NOW, _file_candidate, _owner, _pin_with_principal
+
+    owner, me = _owner(), SoftwareIdentity.generate("ed25519")
+    clock = [NOW]
+    peers, pin = _pin_with_principal(owner, me, clock, expires_at=NOW + 500)
+    clock[0] = NOW + 100
+    out = peers.adopt(_file_candidate(me, None)).peer
+    assert out.principal == pin.principal
+    assert peers.get(me.get_ace_id()).principal == pin.principal

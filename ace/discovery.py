@@ -324,11 +324,17 @@ def verify_registration_file(
 AdoptOutcome = Literal["adopted", "unchanged", "rotated"]
 
 
-def _file_profile(cached: AgentProfile | None, cand: AgentProfile | None) -> AgentProfile | None:
+def _file_profile(
+    cached: AgentProfile | None, cand: AgentProfile | None, now: int
+) -> AgentProfile | None:
     """A kept registration-file candidate replaces only the profile members it supplies;
     absent members are carried over from the cache (R-P27). ``principal`` is replaced only by
-    one whose issuedAt is not older (R-P26)."""
+    one whose issuedAt is not older (R-P26). A cached principal that has expired by ``now`` is
+    dropped, not carried (expiry is revocation; R-P35): the refreshed ``fetchedAt`` would
+    otherwise make the stored record fail re-verification on load."""
     old = None if cached is None else cached.principal
+    if old is not None and old.expires_at <= now:
+        old = None
     new = None if cand is None else cand.principal
     keep = new if old is None or (new is not None and new.issued_at >= old.issued_at) else old
     supplied = {} if cand is None else {
@@ -374,8 +380,10 @@ def adopt_decision(
             # An unsigned (registration-file) source never changes the pinned binding. A kept
             # candidate replaces the other profile members and refreshes fetchedAt, but has no
             # signed timestamp, so it can never remove or downgrade the cached ``principal``:
-            # it replaces it only with a validated one whose issuedAt is not older (R-P26).
-            return _with_profile(pin, _file_profile(pin.profile, candidate.profile)), "unchanged"
+            # it replaces it only with a validated one whose issuedAt is not older (R-P26);
+            # an expired cached one is dropped (R-P35).
+            profile = _file_profile(pin.profile, candidate.profile, now)
+            return _with_profile(pin, profile), "unchanged"
         newer = candidate if candidate.registered_at > pin.registered_at else pin
         merged = _make_peer(
             ace_id=pin.ace_id,
