@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Generator, Iterator, Literal, NamedTuple
 
 from ._encoding import (
+    decode_signature,
     is_ace_id,
     is_conversation_id,
     is_message_id,
@@ -18,8 +19,9 @@ from ._encoding import (
     unix_now,
     wire_int,
 )
+from ._signing import verify_signature
 from .encryption import compute_conversation_id
-from .envelope import decode_envelope, envelope_fingerprint
+from .envelope import decode_envelope, envelope_fingerprint, message_sign_data
 from .errors import ACEError
 from .limits import (
     DEFAULT_REPLAY_CAPACITY,
@@ -271,6 +273,18 @@ def _principal_option(
     return principal["account"], self_signer, trusted
 
 
+def _authenticated_by(env: ACEMessage, peer: Any) -> bool:
+    """The envelope signature verifies under ``peer``'s pinned key and scheme (as parse
+    step 8, including the scheme check); malformed signatures are False."""
+    if env.from_id != peer.ace_id or env.signature.scheme != peer.scheme:
+        return False
+    try:
+        sig = decode_signature(env.signature.value, env.signature.scheme, "invalid_envelope")
+    except ACEError:
+        return False
+    return verify_signature(message_sign_data(env), sig, peer.scheme, peer.signing_public_key)
+
+
 def _history_dicts(snap: ThreadSnapshot | None) -> list[dict]:
     return [] if snap is None else [h.to_dict() for h in snap.history]
 
@@ -428,17 +442,20 @@ class Inbox:
 
         return PrincipalContext(account, lookup, self_signer, trusted)
 
-    def _refresh_principal_sender(self, peer: Any, now: int) -> Any:
+    def _refresh_principal_sender(self, env: ACEMessage, peer: Any, now: int) -> Any:
         """R-P20 (09 § Same-Account Rules): when the pinned sender principal fails steps 2-5,
         refresh the sender's binding from the relay once (rollback barrier) and return the
         binding the rules run on. Runs before any lock is taken, so relay I/O never holds
         ``requests``. A transient failure raises (the message is retryable, the cursor stays);
         a non-ACE exception is ``relay_unavailable``; a permanent ``ACEError`` or no relay
-        leaves the pinned binding to decide."""
+        leaves the pinned binding to decide. Only an envelope authenticated by the pinned
+        signing key triggers a refresh (R-P30); otherwise the pipeline rejects it later."""
         ctx = self._principal_context()
         if ctx is None or sender_principal_usable(
             peer.principal, peer.signing_public_key, ctx, now
         ):
+            return peer
+        if not _authenticated_by(env, peer):
             return peer
         try:
             fresh = self._peers._refresh(peer.ace_id)
@@ -763,7 +780,7 @@ class Inbox:
         # 5 (principal types): refresh a sender whose pinned principal fails 09 steps 2-5
         if is_principal_type(env.type):
             try:
-                peer = self._refresh_principal_sender(peer, now)
+                peer = self._refresh_principal_sender(env, peer, now)
             except ACEError as exc:
                 return ReceiveOutcome(
                     "retryable", error=exc, from_id=env.from_id, message_id=env.message_id

@@ -598,6 +598,7 @@ def test_relay_candidate_without_principal_clears_it():
 
 # --- Task 6: pipeline step 7, Inbox principal context, requests/ ledger ------------------
 
+import base64 as _b64  # noqa: E402
 
 from ace import (  # noqa: E402
     Outbox,
@@ -1024,3 +1025,19 @@ def test_pending_request_ttl_normalized_and_typed():
     assert "requestTtl" not in t
     with raises("storage_failed"):
         PendingSend.from_dict({**t, "requestTtl": 30})
+
+
+def test_forged_principal_envelope_triggers_no_refresh():
+    relay = _FakeRelay()
+    clock, owner, a, b, pb = _pair_with_principals(relay=relay, pin_b_principal=False)
+    relay.record = _peer_record(b.identity, {"principal": pb.to_dict()}, ts=NOW)
+    ia = _open(a, owner)
+    p = b.outbox.stage(b.peers.get(a.id), "request", {"action": "pay", "summary": "s"})
+    forged = p.message.to_dict()
+    sig = bytearray(_b64.b64decode(forged["signature"]["value"]))
+    sig[5] ^= 0x01
+    forged["signature"]["value"] = _b64.b64encode(bytes(sig)).decode()
+    r = ia.receive(wire(forged), ReceiveSource.relay(RELAY, "1-0"))
+    assert r.kind == "quarantined" and r.error.code == "invalid_signature" and relay.calls == 0
+    r = ia.receive(wire(p.message), ReceiveSource.relay(RELAY, "2-0"))
+    assert r.kind == "delivered" and relay.calls == 1
