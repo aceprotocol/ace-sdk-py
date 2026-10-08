@@ -209,15 +209,22 @@ the window (default `TIMESTAMP_WINDOW_SECONDS`) is `stale_timestamp`, a wrong HM
   `create_registration_file(..., principal=...)`; peers carrying one are verified on resolution.
   `Inbox.open(..., principal={"account": "<CAIP-10>", "selfSigner": {...}, "trustedSigners": [...]})`
   enables the `request` / `decision` / `report` messages (same-account rules, `wrong_principal`,
-  `bad_reference`). The default is fail-closed: `selfSigner` defaults to None and `trustedSigners`
-  to empty, so only an `eip155` account whose address is the signer's own passes 09 step 4; without
-  `principal` every principal message is `wrong_principal`. The Outbox keeps a `requests/` ledger of
-  open requests, which a `decision` is matched against under the `requests` lock. When a sender's
-  pinned principal fails 09 steps 2-5, the Inbox refreshes the peer from the relay once (only for
-  envelopes authenticated by the pinned signing key); a transient refresh failure yields a
-  `retryable` outcome (the cursor stays), a permanent one is quarantined. The shared
-  `test-vectors.json` v4 lands in Task 8, so the two `test_registrations` vector tests still fail
-  until then.
+  `bad_reference`). The default is fail-closed: `selfSigner` has no default (None; the host
+  supplies it, usually the signer of its own principal record) and `trustedSigners` defaults to
+  empty, so only an `eip155` account whose address is the signer's own passes 09 step 4; without
+  `principal` every principal message is `wrong_principal`. Signer keys must be canonical
+  Base64 of a valid key for the scheme (`invalid_argument` otherwise). The Outbox keeps a
+  `requests/` ledger of open requests, which a `decision` is matched against under the
+  `requests` lock; a `request` gets a ledger entry only when sent through the Outbox. When a
+  sender's pinned principal fails 09 steps 2-5, the Inbox refreshes the peer from the relay once
+  (only for envelopes authenticated by the pinned signing key); a transient refresh failure
+  yields a `retryable` outcome (the cursor stays), a permanent one is quarantined.
+  `create_registration_file` rejects a principal that is expired or future-dated at the current
+  time (`invalid_principal`); `validate_profile` checks every other profile member before the
+  principal, so a profile invalid in both ways is `invalid_profile`.
+  `RelayClient.discover(DiscoverQuery(account="<CAIP-10>"))` lists peers whose principal names
+  that account. Also exported: `PRINCIPAL_ROLES`, `is_caip10`, `parse_principal_record`
+  (wire parse only), `principal_payload`, `load_request_record`.
 - **Limits.** `MAX_PLAINTEXT_BYTES`, `MAX_PAYLOAD_BYTES`, `MAX_ENVELOPE_BYTES`, … mirror the
   04 "Size Limits" table.
 
