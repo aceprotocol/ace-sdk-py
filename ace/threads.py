@@ -64,13 +64,16 @@ class PendingSend:
             or staged is None
         ):
             raise bad
-        ttl = d.get("requestTtl")
-        if ttl is not None and wire_int(ttl) is None:
+        raw_ttl = d.get("requestTtl")
+        ttl = None if raw_ttl is None else wire_int(raw_ttl)
+        if raw_ttl is not None and ttl is None:
             raise bad
         try:
             message = decode_envelope(d.get("message"))
         except ACEError:
             raise bad from None
+        if ttl is not None and message.type != "request":
+            raise bad  # requestTtl belongs to a principal request only
         return PendingSend(rid, status, staged, message, ttl)
 
 

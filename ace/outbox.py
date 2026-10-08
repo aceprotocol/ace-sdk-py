@@ -6,7 +6,7 @@ import dataclasses
 import uuid
 from typing import Callable, TypeVar
 
-from ._encoding import encode_signature, is_thread_id, unix_now
+from ._encoding import encode_signature, is_thread_id, unix_now, wire_int
 from .discovery import VerifiedPeer
 from .encryption import compute_conversation_id
 from .envelope import message_sign_data
@@ -152,7 +152,7 @@ class Outbox:
                 thread_id=thread_id,
                 timestamp=now,
             )
-            ttl = body.get("ttl") if type_ == "request" else None
+            ttl = wire_int(body.get("ttl")) if type_ == "request" else None
             pending = PendingSend(rid, "pending", now, env, ttl)
             self._write_outbox(pending)
             return pending

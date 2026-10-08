@@ -31,7 +31,13 @@ from .limits import (
 )
 from .messages import parse_message
 from .peers import PeerStore
-from .principal import PrincipalContext, fill_decision, is_caip10, open_request_to
+from .principal import (
+    PrincipalContext,
+    fill_decision,
+    is_caip10,
+    open_request_to,
+    sender_principal_usable,
+)
 from .relay import RelayClient, compare_stream_ids, normalize_relay_url
 from .replay import ReplayDetector
 from .state_machine import ThreadSnapshot, ThreadStateMachine
@@ -45,6 +51,7 @@ from .types import (
     PrincipalKey,
     is_economic_type,
     is_message_type,
+    is_principal_type,
 )
 
 QUARANTINE_CAP = 1000
@@ -388,7 +395,7 @@ class Inbox:
         self._closed = False
         self._quarantine_count: int | None = None
         self._delivered_since_sweep = 0
-        self._held_threads: Any = None
+        self._held_locks: Any = None  # ``threads`` or ``requests``, kept after a failure
         lock = store.lock("receive", 0)
         lock.__enter__()
         self._lock = lock
@@ -409,21 +416,47 @@ class Inbox:
         return max(0, self._now() - self._offline)
 
     def _principal_context(self) -> PrincipalContext | None:
+        """Step-7 context. No ``refresh_sender``: the Inbox refreshes the sender before
+        parsing (``_refresh_principal_sender``), outside the ``requests`` lock."""
         if self._principal is None:
             return None
         account, self_signer, trusted = self._principal
-        store, peers = self._store, self._peers
+        store = self._store
 
         def lookup(conversation_id: str, request_id: str, now: int) -> str | None:
             return open_request_to(store, conversation_id, request_id, now)
 
-        def refresh(ace_id: str) -> Any:
-            try:
-                return peers._refresh(ace_id)
-            except Exception:  # a failed refresh falls through to the rule outcome (R-P20)
-                return None
+        return PrincipalContext(account, lookup, self_signer, trusted)
 
-        return PrincipalContext(account, lookup, self_signer, trusted, refresh)
+    def _refresh_principal_sender(self, peer: Any, now: int) -> Any:
+        """R-P20 (09 § Same-Account Rules): when the pinned sender principal fails steps 2-5,
+        refresh the sender's binding from the relay once (rollback barrier) and return the
+        binding the rules run on. Runs before any lock is taken, so relay I/O never holds
+        ``requests``. A transient failure raises (the message is retryable, the cursor stays);
+        a non-ACE exception is ``relay_unavailable``; a permanent ``ACEError`` or no relay
+        leaves the pinned binding to decide."""
+        ctx = self._principal_context()
+        if ctx is None or sender_principal_usable(
+            peer.principal, peer.signing_public_key, ctx, now
+        ):
+            return peer
+        try:
+            fresh = self._peers._refresh(peer.ace_id)
+        except ACEError as exc:
+            if exc.is_transient:
+                raise
+            return peer
+        except Exception as exc:
+            raise ACEError(
+                "relay_unavailable", f"peer refresh failed: {type(exc).__name__}: {exc}"
+            ) from exc
+        if (
+            fresh is not None
+            and fresh.ace_id == peer.ace_id
+            and fresh.signing_public_key == peer.signing_public_key
+        ):
+            return fresh
+        return peer
 
     def _load_replay(self) -> ReplayDetector:
         state = load_record(self._store, "replay.json")
@@ -462,8 +495,10 @@ class Inbox:
         return dict(cursors)
 
     def _recover(self) -> None:
-        """Repair threads and replay from every delivery record first (ordered by
-        (timestamp, key)), then hand over the pending ones in the same order."""
+        """Repair threads, ``requests/`` decision fills and replay from every delivery record
+        first (ordered by (timestamp, key)), then hand over the pending ones in the same order.
+        A fill that raises ``bad_reference`` or ``wrong_principal`` (only possible with a
+        corrupted store: step 7 and the fill run under one ``requests`` lock) fails ``open()``."""
         records = load_deliveries(self._store, self._local)
         changed = False
         with self._threads._locked():
@@ -510,7 +545,7 @@ class Inbox:
             if self._closed:
                 return
             self._closed = True
-            held, self._held_threads = self._held_threads, None
+            held, self._held_locks = self._held_locks, None
             try:
                 if held is not None:
                     held.__exit__(None, None, None)
@@ -725,6 +760,14 @@ class Inbox:
             if stored.status == "pending":
                 return self._hand_over(stored)
             return ReceiveOutcome("duplicate", from_id=env.from_id, message_id=env.message_id)
+        # 5 (principal types): refresh a sender whose pinned principal fails 09 steps 2-5
+        if is_principal_type(env.type):
+            try:
+                peer = self._refresh_principal_sender(peer, now)
+            except ACEError as exc:
+                return ReceiveOutcome(
+                    "retryable", error=exc, from_id=env.from_id, message_id=env.message_id
+                )
         # 5-7: economic types under ``threads``; a decision under ``requests`` from the open-
         # request check through the requests/ fill (R-P25)
         economic = is_economic_type(env.type)
@@ -741,7 +784,7 @@ class Inbox:
                     )
             result = self._parse_and_commit(env, peer, key, source, now, economic)
             if self._failed and (economic or decision):
-                self._held_threads = (
+                self._held_locks = (
                     held.pop_all()
                 )  # keep other writers out until close()/open() repairs
         if isinstance(result, ReceiveOutcome):

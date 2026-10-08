@@ -768,8 +768,24 @@ def test_wrong_principal_refreshes_peer_once_then_accepts():
     assert r.kind == "delivered" and relay.calls == 1  # pin now valid: no refresh
 
 
-def test_wrong_principal_after_failed_or_useless_refresh():
+def test_transient_refresh_failure_is_retryable_then_accepted():
     relay = _FakeRelay(error=ACEError("relay_unavailable", "down"))
+    clock, owner, a, b, pb = _pair_with_principals(relay=relay, pin_b_principal=False)
+    ia = _open(a, owner)
+    p = b.outbox.stage(b.peers.get(a.id), "request", {"action": "pay", "summary": "s"})
+    r = ia.receive(wire(p.message), ReceiveSource.relay(RELAY, "1-0"))
+    assert r.kind == "retryable" and r.error.code == "relay_unavailable" and relay.calls == 1
+    assert ia._cursors == {} and not ia._failed
+    relay.error = RuntimeError("socket closed")  # a non-ACE exception is relay_unavailable too
+    r = ia.receive(wire(p.message), ReceiveSource.relay(RELAY, "1-0"))
+    assert r.kind == "retryable" and r.error.code == "relay_unavailable" and ia._cursors == {}
+    relay.error, relay.record = None, _peer_record(b.identity, {"principal": pb.to_dict()}, ts=NOW)
+    r = ia.receive(wire(p.message), ReceiveSource.relay(RELAY, "1-0"))
+    assert r.kind == "delivered" and relay.calls == 3 and ia._cursors[RELAY] == "1-0"
+
+
+def test_wrong_principal_after_permanent_or_useless_refresh():
+    relay = _FakeRelay(error=ACEError("unknown_peer", "gone"))
     clock, owner, a, b, pb = _pair_with_principals(relay=relay, pin_b_principal=False)
     ia = _open(a, owner)
     r, _ = _send(b, ia, a, "request", {"action": "pay", "summary": "s"}, 1)
@@ -971,3 +987,40 @@ def test_concurrent_different_decisions_accept_exactly_one():
     winner = next(p for p, r in zip(ps, results) if r.kind == "delivered")
     dec = load_request_record(b.store, req.message.conversation_id, req.message.message_id)["decision"]
     assert dec["messageId"] == winner.message.message_id
+
+
+def test_decision_refresh_runs_outside_requests_lock():
+    relay = _FakeRelay()
+    clock = Clock(NOW)
+    owner = _owner()
+    a, b = Agent("a", "ed25519", clock), Agent("b", "secp256k1", clock, relay=relay)
+    pa = _rec(owner, a.identity)
+    _pin_relay(a.peers, b.identity, _rec(owner, b.identity, roles=["agent"]), name="b")
+    _pin_relay(b.peers, a.identity, None, name="a")  # b's pin of a lacks the principal
+    relay.record = _peer_record(a.identity, {"principal": pa.to_dict()}, ts=NOW)
+    ia = _open(a, owner)
+    _, req = _send(b, ia, a, "request", {"action": "pay", "summary": "s"}, 1)
+    audit = _LockAudit(b.store)
+    held_at_lookup = []
+    orig = relay.lookup_peer
+    relay.lookup_peer = lambda ace_id: (held_at_lookup.append(audit.held), orig(ace_id))[1]
+    ib = b.open(store=audit, principal={"account": ACC, "selfSigner": _signer_dict(owner)})
+    d, _ = _send(a, ib, b, "decision", {"requestId": req.message.message_id, "outcome": "approve"}, 1)
+    assert d.kind == "delivered" and held_at_lookup == [0]
+
+
+def test_pending_request_ttl_normalized_and_typed():
+    from ace.threads import PendingSend
+
+    clock, owner, a, b, _ = _pair_with_principals()
+    p = b.outbox.stage(b.peers.get(a.id), "request", {"action": "pay", "summary": "s", "ttl": 30.0})
+    assert type(p.request_ttl) is int and p.request_ttl == 30
+    d = p.to_dict()
+    assert type(PendingSend.from_dict({**d, "requestTtl": 30.0}).request_ttl) is int
+    for bad in (-1, "30", True, 1.5):
+        with raises("storage_failed"):
+            PendingSend.from_dict({**d, "requestTtl": bad})
+    t = b.outbox.stage(b.peers.get(a.id), "report", {"action": "pay", "summary": "s", "outcome": "ok"}).to_dict()
+    assert "requestTtl" not in t
+    with raises("storage_failed"):
+        PendingSend.from_dict({**t, "requestTtl": 30})
