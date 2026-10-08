@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Generator, Iterator, Literal, NamedTuple
 
 from ._encoding import (
+    decode_b64,
     decode_signature,
     is_ace_id,
     is_conversation_id,
@@ -243,6 +244,7 @@ def _principal_key(value: object, what: str) -> PrincipalKey:
         or not value["publicKey"]
     ):
         raise ACEError("invalid_argument", f"{what} must be {{'scheme', 'publicKey'}}")
+    decode_b64(value["publicKey"], "invalid_argument", f"{what}.publicKey")
     return PrincipalKey(value["scheme"], value["publicKey"])
 
 
@@ -453,6 +455,14 @@ class Inbox:
         ctx = self._principal_context()
         if ctx is None or sender_principal_usable(
             peer.principal, peer.signing_public_key, ctx, now
+        ):
+            return peer
+        # cheap pure-read pre-checks mirroring pipeline steps 1-3 (recipient, window, replay):
+        # nothing is committed; a failing envelope is rejected by the pipeline as usual
+        if (
+            env.to_id != self._local
+            or not self._floor() <= env.timestamp <= now + TIMESTAMP_WINDOW_SECONDS
+            or not self._replay.accepts(env.message_id, env.from_id, env.timestamp)
         ):
             return peer
         if not _authenticated_by(env, peer):
