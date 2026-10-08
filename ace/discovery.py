@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import http.client
 import ipaddress
 import json
@@ -323,6 +324,15 @@ def verify_registration_file(
 AdoptOutcome = Literal["adopted", "unchanged", "rotated"]
 
 
+def _file_profile(cached: AgentProfile | None, cand: AgentProfile | None) -> AgentProfile | None:
+    old = None if cached is None else cached.principal
+    new = None if cand is None else cand.principal
+    keep = new if old is None or (new is not None and new.issued_at >= old.issued_at) else old
+    if keep is None:
+        return cand
+    return dataclasses.replace(cand or AgentProfile(), principal=keep)
+
+
 def _with_profile(pin: VerifiedPeer, profile: AgentProfile | None) -> VerifiedPeer:
     return _make_peer(
         ace_id=pin.ace_id,
@@ -354,9 +364,11 @@ def adopt_decision(
     unsigned = candidate.registration_signature is None
     if pin.encryption_public_key == candidate.encryption_public_key:
         if unsigned:
-            # An unsigned (registration-file) source never changes the pinned binding, but
-            # a kept candidate replaces the cached profile, including ``principal`` (02).
-            return _with_profile(pin, candidate.profile), "unchanged"
+            # An unsigned (registration-file) source never changes the pinned binding. A kept
+            # candidate replaces the other profile members and refreshes fetchedAt, but has no
+            # signed timestamp, so it can never remove or downgrade the cached ``principal``:
+            # it replaces it only with a validated one whose issuedAt is not older (R-P26).
+            return _with_profile(pin, _file_profile(pin.profile, candidate.profile)), "unchanged"
         newer = candidate if candidate.registered_at > pin.registered_at else pin
         merged = _make_peer(
             ace_id=pin.ace_id,

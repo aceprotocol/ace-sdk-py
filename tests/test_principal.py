@@ -541,11 +541,54 @@ def test_expired_pin_still_loads():
     assert PeerStore(store, clock=lambda: clock[0]).get(me.get_ace_id()).principal is not None
 
 
-def test_kept_registration_file_candidate_replaces_cached_principal():
+def _pin_with_principal(owner, me, clock, **kw):
+    peers = PeerStore(MemoryStore(), clock=lambda: clock[0])
+    prof = {"name": "Old", "tags": ["a"], "principal": _rec(owner, me, **kw).to_dict()}
+    pin = peers.adopt(verify_peer_record(_peer_record(me, prof), clock=lambda: NOW)).peer
+    return peers, pin
+
+
+def _file_candidate(me, profile, t=NOW):
+    from ace.discovery import _make_peer
+
+    reg = create_registration_file(me, name="M", endpoint="https://m.example/ace")
+    base = verify_registration_file(reg, pinned_at=t, clock=lambda: t)
+    return _make_peer(ace_id=base.ace_id, scheme=base.scheme, signing_public_key=base.signing_public_key,
+                      encryption_public_key=base.encryption_public_key, registered_at=t,
+                      registration_signature=None, source="registration", profile=profile)
+
+
+def test_file_candidate_without_principal_keeps_cached_principal():
     owner, me = _owner(), SoftwareIdentity.generate("ed25519")
     clock = [NOW]
-    peers = PeerStore(MemoryStore(), clock=lambda: clock[0])
-    peers.adopt(verify_peer_record(_peer_record(me, {"principal": _rec(owner, me).to_dict()}), clock=lambda: NOW))
-    reg = create_registration_file(me, name="M", endpoint="https://m.example/ace")
-    assert peers.pin_registration_file(reg, pinned_at=NOW).principal is None
-    assert peers.get(me.get_ace_id()).principal is None
+    peers, pin = _pin_with_principal(owner, me, clock)
+    clock[0] = NOW + 100
+    out = peers.adopt(_file_candidate(me, AgentProfile(name="New", tags=["b"]))).peer
+    assert out.principal == pin.principal and out.profile.name == "New" and out.profile.tags == ["b"]
+    assert out.encryption_public_key == pin.encryption_public_key
+    assert out.registered_at == pin.registered_at and out.source == pin.source
+    assert out.registration_signature == pin.registration_signature
+    assert peers.get(me.get_ace_id()).principal == pin.principal
+    out = peers.adopt(_file_candidate(me, None)).peer
+    assert out.principal == pin.principal
+
+
+def test_file_candidate_principal_older_or_newer():
+    owner, me = _owner(), SoftwareIdentity.generate("ed25519")
+    clock = [NOW]
+    peers, pin = _pin_with_principal(owner, me, clock)
+    older = PrincipalRecord.from_dict(_rec(owner, me, issued_at=NOW - 20, scope="old").to_dict())
+    assert peers.adopt(_file_candidate(me, AgentProfile(principal=older))).peer.principal == pin.principal
+    newer = PrincipalRecord.from_dict(_rec(owner, me, issued_at=NOW - 5, scope="new").to_dict())
+    out = peers.adopt(_file_candidate(me, AgentProfile(principal=newer))).peer
+    assert out.principal == newer and peers.get(me.get_ace_id()).principal == newer
+
+
+def test_relay_candidate_without_principal_clears_it():
+    owner, me = _owner(), SoftwareIdentity.generate("ed25519")
+    clock = [NOW]
+    peers, _ = _pin_with_principal(owner, me, clock)
+    rec = _peer_record(me, {"name": "New"}, ts=NOW + 10)
+    clock[0] = NOW + 20
+    out = peers.adopt(verify_peer_record(rec, clock=lambda: NOW + 10)).peer
+    assert out.principal is None and peers.get(me.get_ace_id()).principal is None
