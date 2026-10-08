@@ -769,6 +769,55 @@ def test_wrong_principal_refreshes_peer_once_then_accepts():
     assert r.kind == "delivered" and relay.calls == 1  # pin now valid: no refresh
 
 
+def test_cheap_prechecks_skip_the_refresh():
+    relay = _FakeRelay()
+    clock, owner, a, b, pb = _pair_with_principals(relay=relay, pin_b_principal=False)
+    relay.record = _peer_record(b.identity, {"name": "b2", "principal": pb.to_dict()}, ts=NOW)
+    ia = _open(a, owner)
+    p = b.outbox.stage(b.peers.get(a.id), "request", {"action": "pay", "summary": "s"})
+    other = dataclasses.replace(p.message, to_id="ace:sha256:" + "ee" * 32)
+    r = ia.receive(wire(other), ReceiveSource.relay(RELAY, "1-0"))
+    assert r.kind == "quarantined" and r.error.code == "wrong_recipient" and relay.calls == 0
+    stale = dataclasses.replace(p.message, timestamp=NOW - 10_000_000)
+    r = ia.receive(wire(stale), ReceiveSource.relay(RELAY, "2-0"))
+    assert r.kind == "quarantined" and r.error.code == "stale_timestamp" and relay.calls == 0
+    r, p2 = _send(b, ia, a, "request", {"action": "pay", "summary": "s2"}, 3)
+    assert r.kind == "delivered" and relay.calls == 1
+    r = ia.receive(wire(p2.message), ReceiveSource.relay(RELAY, "4-0"))
+    assert r.kind == "duplicate" and relay.calls == 1
+
+
+def test_replay_precheck_is_a_read_not_a_commit():
+    relay = _FakeRelay()
+    clock, owner, a, b, pb = _pair_with_principals(relay=relay, pin_b_principal=False)
+    relay.record = _peer_record(b.identity, {"principal": pb.to_dict()}, ts=NOW)
+    ia = _open(a, owner)
+    p = b.outbox.stage(b.peers.get(a.id), "request", {"action": "pay", "summary": "s"})
+    ia._replay.commit(p.message.message_id, b.id, p.message.timestamp, 0)
+    r = ia.receive(wire(p.message), ReceiveSource.relay(RELAY, "1-0"))
+    assert r.kind == "duplicate" and relay.calls == 0
+
+
+def test_open_rejects_malformed_principal_keys():
+    clock, owner, a, b, _ = _pair_with_principals()
+    good = _signer_dict(owner)
+    pk = good["publicKey"]
+    bad_keys = [
+        {"scheme": "rsa", "publicKey": pk},
+        {"scheme": "ed25519", "publicKey": ""},
+        {"scheme": "ed25519", "publicKey": 3},
+        {"scheme": "ed25519", "publicKey": None},
+        {"scheme": "ed25519", "publicKey": "QR=="},
+        {"scheme": "ed25519", "publicKey": pk.rstrip("=")},
+        {"scheme": "ed25519", "publicKey": "_-_-"},
+    ]
+    for bad_key in bad_keys:
+        for field in ({"selfSigner": bad_key}, {"trustedSigners": [good, bad_key]}):
+            with raises("invalid_argument"):
+                a.open(principal={"account": ACC, **field})
+    a.open(principal={"account": ACC, "selfSigner": good, "trustedSigners": [good]}).close()
+
+
 def test_transient_refresh_failure_is_retryable_then_accepted():
     relay = _FakeRelay(error=ACEError("relay_unavailable", "down"))
     clock, owner, a, b, pb = _pair_with_principals(relay=relay, pin_b_principal=False)
