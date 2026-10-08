@@ -20,7 +20,7 @@ from ._encoding import (
     unix_now,
     wire_int,
 )
-from ._signing import verify_signature
+from ._signing import is_valid_signing_public_key, verify_signature
 from .encryption import compute_conversation_id
 from .envelope import decode_envelope, envelope_fingerprint, message_sign_data
 from .errors import ACEError
@@ -244,7 +244,10 @@ def _principal_key(value: object, what: str) -> PrincipalKey:
         or not value["publicKey"]
     ):
         raise ACEError("invalid_argument", f"{what} must be {{'scheme', 'publicKey'}}")
-    decode_b64(value["publicKey"], "invalid_argument", f"{what}.publicKey")
+    # Canonical Base64 (decode_b64) of a valid key for the scheme, as 09 rule 4 requires.
+    raw = decode_b64(value["publicKey"], "invalid_argument", f"{what}.publicKey", max_bytes=64)
+    if not is_valid_signing_public_key(value["scheme"], raw):
+        raise ACEError("invalid_argument", f"{what}.publicKey is not a valid key for the scheme")
     return PrincipalKey(value["scheme"], value["publicKey"])
 
 
@@ -432,8 +435,8 @@ class Inbox:
         return max(0, self._now() - self._offline)
 
     def _principal_context(self) -> PrincipalContext | None:
-        """Step-7 context. No ``refresh_sender``: the Inbox refreshes the sender before
-        parsing (``_refresh_principal_sender``), outside the ``requests`` lock."""
+        """Step-7 context. The Inbox refreshes the sender before parsing
+        (``_refresh_principal_sender``), outside the ``requests`` lock."""
         if self._principal is None:
             return None
         account, self_signer, trusted = self._principal

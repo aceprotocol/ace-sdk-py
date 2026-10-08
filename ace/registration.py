@@ -83,6 +83,12 @@ def create_registration_file(
         principal=None if principal is None else PrincipalRecord.from_dict(principal),
     )
     verify_registration_file(reg, pinned_at=0)
+    if reg.principal is not None:
+        # A file being published must carry a principal valid now: no expired or
+        # future-dated record (R-P44); ``invalid_principal`` otherwise.
+        from .principal import validate_principal_record
+
+        validate_principal_record(reg.principal, signing_public_key, unix_now(None))
     return reg
 
 _KEEP = object()
@@ -119,7 +125,7 @@ def registration_payload(enc_b64: str, sig_b64: str, scheme: str, profile: objec
         pp.signer.scheme if pp else "",
         pp.signer.public_key if pp else "",
         str(pp.issued_at) if pp else "",
-        str(pp.expires_at if pp.expires_at is not None else 0) if pp else "",
+        str(pp.expires_at) if pp else "",
         (pp.scope or "") if pp else "",
         pp.signature if pp else "",
     )

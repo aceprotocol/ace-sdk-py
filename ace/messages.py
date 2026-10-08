@@ -25,7 +25,7 @@ from .encryption import compute_conversation_id, encrypt
 from .envelope import decode_kem_ciphertext, decode_payload, message_sign_data, revalidate
 from .errors import ACEError
 from .limits import MAX_PLAINTEXT_BYTES, TIMESTAMP_WINDOW_SECONDS
-from .principal import PrincipalContext, check_principal_rules, sender_principal_usable
+from .principal import PrincipalContext, check_principal_rules
 from .replay import ReplayDetector
 from .state_machine import ThreadEvent, ThreadStateMachine
 from .types import (
@@ -349,21 +349,7 @@ def _check_principal(
     ctx: PrincipalContext | None,
     now: int,
 ) -> None:
-    """06 step 7 for principal types (09 § Same-Account Rules). When the pinned sender
-    principal fails steps 2-5, the sender's binding is refreshed once (R-P20) before the
-    rules run; a failed refresh leaves the pinned binding to decide."""
-    if (
-        ctx is not None
-        and ctx.refresh_sender is not None
-        and not sender_principal_usable(sender.principal, sender.signing_public_key, ctx, now)
-    ):
-        fresh = ctx.refresh_sender(sender.ace_id)
-        if (
-            isinstance(fresh, VerifiedPeer)
-            and fresh.ace_id == sender.ace_id
-            and fresh.signing_public_key == sender.signing_public_key
-        ):
-            sender = fresh
+    """06 step 7 for principal types (09 § Same-Account Rules)."""
     check_principal_rules(
         env.type,
         body,

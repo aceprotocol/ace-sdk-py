@@ -81,7 +81,8 @@ class VerifiedPeer:
 
     @property
     def principal(self) -> "PrincipalRecord | None":
-        """The peer's principal record (verified when the peer was verified, 09)."""
+        """The peer's principal record (09): validated when the peer was verified; may have
+        expired since — rules re-validate at ``now``."""
         return None if self.profile is None else self.profile.principal
 
 
@@ -105,12 +106,17 @@ def _tag_list(items: list[str], name: str, max_count: int) -> None:
 
 
 def validate_profile(profile: AgentProfile | dict) -> AgentProfile:
-    """Validate a discovery profile (``invalid_profile``); returns the parsed profile."""
-    if isinstance(profile, dict):
-        profile = AgentProfile.from_dict(profile)
-    if not isinstance(profile, AgentProfile):
+    """Validate a discovery profile (``invalid_profile``); returns the parsed profile.
+
+    ``principal`` is parsed after every other member is checked (R-P45), so a profile with
+    both an invalid member and an invalid principal fails ``invalid_profile``."""
+    if isinstance(profile, AgentProfile):
+        raw = _raw_profile(profile)
+    elif isinstance(profile, dict):
+        raw = profile
+    else:
         raise ACEError("invalid_profile", "profile must be an AgentProfile")
-    p = AgentProfile.from_dict(_raw_profile(profile))
+    p = AgentProfile.from_dict({k: v for k, v in raw.items() if k != "principal"})
 
     def text(value: str | None, name: str, lo: int, hi: int) -> None:
         if value is not None and (not lo <= len(value) <= hi or CONTROL_CHAR_RE.search(value)):
@@ -144,6 +150,8 @@ def validate_profile(profile: AgentProfile | dict) -> AgentProfile:
                 "invalid_profile",
                 "profile.pricing.maxAmount must match ^[0-9]+(\\.[0-9]+)?$ (1-32 chars)",
             )
+    if raw.get("principal") is not None:
+        p.principal = PrincipalRecord.from_dict(raw["principal"])
     return p
 
 
@@ -343,13 +351,13 @@ def verify_registration_file(
 AdoptOutcome = Literal["adopted", "unchanged", "rotated"]
 
 
-def _live_principal(profile: AgentProfile | None, now: int):
+def _live_principal(profile: AgentProfile | None, now: int) -> PrincipalRecord | None:
     """The cached principal unless it has expired by ``now`` (expiry is revocation; R-P35)."""
     p = None if profile is None else profile.principal
     return None if p is not None and p.expires_at <= now else p
 
 
-def _supersedes(new, old) -> bool:
+def _supersedes(new: PrincipalRecord, old: PrincipalRecord) -> bool:
     """Monotonic principal replacement (R-P36): strictly newer issuedAt, or the same record."""
     if new.issued_at != old.issued_at:
         return new.issued_at > old.issued_at

@@ -460,6 +460,7 @@ from ace import (  # noqa: E402
     PeerStore,
     create_registration_file,
     create_registration_request,
+    validate_profile,
     verify_peer_record,
     verify_registration_file,
     verify_registration_request,
@@ -531,6 +532,29 @@ def test_registration_file_principal():
         verify_registration_file(d, clock=lambda: t)
     gone = verify_registration_file(reg.to_dict(), clock=lambda: t + 3600)
     assert gone.principal is None and gone.profile is None  # expired-only: absent (R-P40)
+
+
+def test_registration_file_rejects_expired_or_future_principal():
+    # R-P44: publishing validates the principal at the real now, expiry included.
+    import time
+
+    t = int(time.time())
+    owner, me = _owner(), SoftwareIdentity.generate("ed25519")
+    expired = _rec(owner, me, issued_at=t - 7200, expires_at=t - 60)
+    future = _rec(owner, me, issued_at=t + 3600, expires_at=t + 7200)
+    for rec in (expired, future):
+        with raises("invalid_principal"):
+            create_registration_file(me, name="M", endpoint="https://m.example/ace", principal=rec)
+
+
+def test_profile_checks_precede_principal_parse():
+    # R-P45: other members are checked before the principal (08 order).
+    with raises("invalid_profile"):
+        validate_profile({"name": "x" * 100, "principal": 5})
+    with raises("invalid_profile"):
+        AgentProfile.from_dict({"name": 5, "principal": 5})
+    with raises("invalid_principal"):
+        validate_profile({"name": "ok", "principal": 5})
 
 
 def test_expired_only_principal_is_absent_in_fetched_records():
@@ -846,6 +870,11 @@ def test_open_rejects_malformed_principal_keys():
         {"scheme": "ed25519", "publicKey": "QR=="},
         {"scheme": "ed25519", "publicKey": pk.rstrip("=")},
         {"scheme": "ed25519", "publicKey": "_-_-"},
+        # canonical Base64 but not a valid key for the scheme
+        {"scheme": "ed25519", "publicKey": to_base64(b"\x01" * 31)},
+        {"scheme": "secp256k1", "publicKey": pk},
+        {"scheme": "secp256k1", "publicKey": to_base64(b"\x04" + b"\x01" * 32)},
+        {"scheme": "secp256k1", "publicKey": to_base64(b"\x02" + b"\xff" * 32)},
     ]
     for bad_key in bad_keys:
         for field in ({"selfSigner": bad_key}, {"trustedSigners": [good, bad_key]}):

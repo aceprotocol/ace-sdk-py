@@ -135,6 +135,11 @@ EXPECTED = {
     "validate_principal_record",
     "principal_sign_data",
     "check_principal_rules",
+    "PRINCIPAL_ROLES",
+    "is_caip10",
+    "principal_payload",
+    "parse_principal_record",
+    "load_request_record",
     "RequestBody",
     "DecisionBody",
     "ReportBody",
@@ -147,6 +152,26 @@ def test_exact_exports():
     assert len(ace.__all__) == len(EXPECTED)
     for name in ace.__all__:
         assert hasattr(ace, name), name
+
+
+def test_principal_helpers_exported():
+    from ace import (
+        PRINCIPAL_ROLES,
+        PrincipalRecord,
+        is_caip10,
+        load_request_record,
+        parse_principal_record,
+        principal_payload,
+    )
+
+    assert PRINCIPAL_ROLES == ("controller", "agent") and callable(principal_payload)
+    assert is_caip10("eip155:1:0x" + "ab" * 20) and not is_caip10("nope")
+    assert load_request_record(ace.MemoryStore(), "ab" * 32, "x") is None
+    with raises("invalid_principal"):
+        parse_principal_record(5)
+    assert parse_principal_record is not PrincipalRecord.from_dict
+    for name in ("record_request", "fill_decision", "request_key"):  # ledger writers stay private
+        assert name not in ace.__all__ and not hasattr(ace, name)
 
 
 def test_removed_names_are_gone():

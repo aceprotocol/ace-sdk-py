@@ -52,10 +52,15 @@ from .messages import create_message, parse_message, validate_body
 from .outbox import Outbox
 from .peers import PeerStore
 from .principal import (
+    PRINCIPAL_ROLES,
     PrincipalContext,
     PrincipalSigner,
     check_principal_rules,
     create_principal_record,
+    is_caip10,
+    load_request_record,
+    parse_principal_record,
+    principal_payload,
     principal_sign_data,
     validate_principal_record,
 )
@@ -254,6 +259,11 @@ __all__ = [
     "validate_principal_record",
     "principal_sign_data",
     "check_principal_rules",
+    "PRINCIPAL_ROLES",
+    "is_caip10",
+    "principal_payload",
+    "parse_principal_record",
+    "load_request_record",
     "RequestBody",
     "DecisionBody",
     "ReportBody",

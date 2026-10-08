@@ -30,7 +30,6 @@ from .threads import sha256_hex
 from .types import SIGNING_SCHEMES, ACEIdentity, PrincipalKey, PrincipalRecord, is_principal_type
 
 if TYPE_CHECKING:
-    from .discovery import VerifiedPeer
     from .store import ACEStore
     from .types import ACEMessage, ParsedMessage
 
@@ -42,15 +41,18 @@ _ALLOWED_ROLES = {("controller",), ("agent",), ("controller", "agent")}
 #: ``request`` to, if it was sent in that conversation, no ``decision`` for it was accepted and
 #: it is not expired at ``now``; otherwise None.
 OpenRequestTo = Callable[[str, str, int], "str | None"]
-#: ``refresh_sender(ace_id)``: re-fetch the sender's peer binding once (relay lookup through
-#: the Rollback Barrier) and return it, or None when the refresh failed (R-P20).
-RefreshSender = Callable[[str], "VerifiedPeer | None"]
 _WRONG_DECIDER = "decision from a different controller than the request was sent to"
 _EIP155_ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 
 
 def is_caip10(value: object) -> bool:
     return isinstance(value, str) and _CAIP10_RE.fullmatch(value) is not None
+
+
+def parse_principal_record(value: object) -> PrincipalRecord:
+    """Strict wire parse of a principal record (09 rule 1) without rules 2-10;
+    shape errors are ``invalid_principal``. See :func:`validate_principal_record`."""
+    return PrincipalRecord.from_dict(value)
 
 
 def _bad(msg: str) -> ACEError:
@@ -179,15 +181,13 @@ class PrincipalContext:
     """Step-7 inputs from the receiver: its own principal ``account``; the keys accepted as
     authorities of that account (``self_signer``, the signer of the receiver's own record, and
     host-provided ``trusted_signers``, e.g. read from chain); the ledger lookup
-    ``open_request_to`` (see :data:`OpenRequestTo`); and ``refresh_sender`` (see
-    :data:`RefreshSender`), used once per message when the pinned sender principal is missing,
-    invalid, not an authority of the account, or of another account (09 steps 2-5)."""
+    ``open_request_to`` (see :data:`OpenRequestTo`). The Inbox refreshes a sender whose pinned
+    principal fails 09 steps 2-5 before parsing, so the context carries no refresh hook."""
 
     account: str
     open_request_to: OpenRequestTo | None = None
     self_signer: PrincipalKey | None = None
     trusted_signers: frozenset[PrincipalKey] = frozenset()
-    refresh_sender: RefreshSender | None = None
 
 
 def _is_account_authority(

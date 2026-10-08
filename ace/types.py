@@ -377,7 +377,7 @@ class AgentProfile:
                 currency=_req(p, "currency", str, code, "profile.pricing"),
                 max_amount=_opt(p, "maxAmount", str, code, "profile.pricing"),
             )
-        return AgentProfile(
+        profile = AgentProfile(
             name=_opt(d, "name", str, code, "profile"),
             description=_opt(d, "description", str, code, "profile"),
             image=_opt(d, "image", str, code, "profile"),
@@ -386,10 +386,11 @@ class AgentProfile:
             chains=_opt_str_list(d, "chains", code, "profile"),
             endpoint=_opt(d, "endpoint", str, code, "profile"),
             pricing=pricing,
-            principal=None
-            if d.get("principal") is None
-            else PrincipalRecord.from_dict(d["principal"]),
         )
+        # The principal is parsed after the other members (R-P45, 08 order).
+        if d.get("principal") is not None:
+            profile.principal = PrincipalRecord.from_dict(d["principal"])
+        return profile
 
 
 @dataclass

@@ -1,5 +1,5 @@
 # Pinned dependency versions for ace-sdk v0.3.0
-# Generated: 2026-10-06
+# Generated: 2026-10-08
 # Python: 3.13
 #
 # Regenerate: pip install -e ".[dev]" && pip freeze --exclude ace-sdk > requirements-lock.txt
