@@ -147,8 +147,9 @@ outbox.deliver(pending.request_id, lambda env: secure.deliver(env, peer, replies
 - **`Outbox`** keeps one pending send per thread (`pending_send_conflict`). Retries reuse the
   same envelope; a pending send is cleared on acknowledgement or when a later inbound message
   on the thread proves delivery. It is never abandoned automatically (`abandon` drops it).
-- **`Inbox`** commits each message in the 06 order (delivery record, thread state, replay
-  state, `on_message`, ack), recovers on `open`, and hands every message to `on_message`
+- **`Inbox`** commits each message in the 06 order (delivery record, thread state,
+  `on_message`, ack; the delivery records journal the seen store, and `replay.json` is
+  rewritten every 1024 commits and at `close()`), recovers on `open`, and hands every message to `on_message`
   at least once — exactly once to a host that dedups on `(from_id, message_id)`. It is the
   application receive engine only: `SecureMailbox` feeds it authenticated MLS plaintext
   (in-process code and tests call it directly) and it knows nothing about relays, cursors,

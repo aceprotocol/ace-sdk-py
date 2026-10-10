@@ -33,7 +33,7 @@ from .messages import (
     SchemaValidator,
     apply_receive_rules,
     check_schemas,
-    parse_message,
+    parse_with_gate,
     run_schema_validator,
 )
 from .peers import PeerStore
@@ -63,7 +63,9 @@ from .types import (
 
 QUARANTINE_CAP = 1000
 QUARANTINE_KEEP = 900
-_SWEEP_EVERY = 1024
+_REPLAY_SNAPSHOT_EVERY = (
+    1024  # commits between writes of replay.json (journaled by delivery records)
+)
 _REASON_MAX = 1000
 
 
@@ -334,8 +336,11 @@ class Inbox:
     tests call ``receive`` directly. ``on_message(parsed)`` must persist the host effect
     durably and idempotently, keyed by ``(from_id, message_id)``, then return; raising means
     "retry later". Commit order per message: delivery record, ``requests/`` decision fill
-    (``decision`` only), thread state, replay state, ``on_message``, ack. Open with
-    ``Inbox.open(...)``; the instance holds the store's ``receive`` lock until ``close()``.
+    (``decision`` only), thread state, ``on_message``, ack. The delivery record journals the
+    seen-store commit: ``replay.json`` is rewritten every 1024 commits and at ``close()``,
+    ``open`` re-commits the records written since, and a record is deleted only once a
+    written ``replay.json`` covers it. Open with ``Inbox.open(...)``; the instance holds the
+    store's ``receive`` lock until ``close()``.
 
     ``principal`` (09) is the receiver's principal: ``{"account": <CAIP-10>, "selfSigner":
     {"scheme", "publicKey"} | None, "trustedSigners": [{"scheme", "publicKey"}, ...]}``
@@ -398,7 +403,8 @@ class Inbox:
         self._failed = False
         self._closed = False
         self._quarantine_count: int | None = None
-        self._delivered_since_sweep = 0
+        self._replay_dirty = 0  # commits since replay.json was last written
+        self._acked: dict[str, tuple[str, int]] = {}  # acked records replay.json does not cover yet
         self._held_locks: Any = None  # ``threads`` or ``requests``, kept after a failure
         lock = store.lock("receive", 0)
         lock.__enter__()
@@ -497,6 +503,30 @@ class Inbox:
     def _write_replay(self, replay: ReplayDetector) -> None:
         write_record(self._store, "replay.json", replay.export_state())
 
+    def _persist_replay(self) -> None:
+        """Write the seen store, then delete the acked records it now covers."""
+        self._write_replay(self._replay)
+        self._replay_dirty = 0
+        self._prune_acked()
+
+    def _prune_acked(self) -> None:
+        """Delete the acked records covered by the seen store; only while it equals replay.json."""
+        for key, (from_id, ts) in list(self._acked.items()):
+            if self._replay._covered(from_id, ts):
+                self._store.delete(key)
+                del self._acked[key]
+
+    def _finish(self, rec: _Delivery) -> None:
+        """After the hand-over: drop the record once the written replay state covers it, else
+        mark it ``acked`` (pruned after a later write of replay.json)."""
+        m = rec.message
+        if self._replay_dirty == 0 and self._replay._covered(m.from_id, m.timestamp):
+            self._store.delete(rec.key)
+            return
+        rec.status = "acked"
+        write_record(self._store, rec.key, rec.to_dict())
+        self._acked[rec.key] = (m.from_id, m.timestamp)
+
     def _recover(self) -> None:
         """Repair threads, ``requests/`` decision fills and replay from every delivery record
         first (ordered by (timestamp, key)), then hand over the pending ones in the same order.
@@ -525,21 +555,22 @@ class Inbox:
             if self._replay.accepts(m.message_id, m.from_id, m.timestamp):
                 self._replay.commit(m.message_id, m.from_id, m.timestamp, self._floor())
                 changed = True
+            if rec.status == "acked":
+                self._acked[rec.key] = (m.from_id, m.timestamp)
         if changed:
-            self._write_replay(self._replay)
+            self._persist_replay()
+        else:
+            self._prune_acked()  # replay.json as loaded: its covered acked records go
         for rec in records:
-            m = rec.message
-            if rec.status == "pending":
-                try:
-                    self._on_message(m)
-                except Exception as exc:
-                    raise ACEError(
-                        "handler_failed", f"on_message failed during recovery: {exc}"
-                    ) from exc
-                rec.status = "acked"
-                write_record(self._store, rec.key, rec.to_dict())
-            if self._replay._covered(m.from_id, m.timestamp):
-                self._store.delete(rec.key)
+            if rec.status != "pending":
+                continue
+            try:
+                self._on_message(rec.message)
+            except Exception as exc:
+                raise ACEError(
+                    "handler_failed", f"on_message failed during recovery: {exc}"
+                ) from exc
+            self._finish(rec)
 
     # --- public ---
 
@@ -547,6 +578,11 @@ class Inbox:
         with self._mutex:
             if self._closed:
                 return
+            if not self._failed and self._replay_dirty:
+                try:  # best effort: the delivery records journal these commits
+                    self._persist_replay()
+                except ACEError:
+                    pass
             self._closed = True
             held, self._held_locks = self._held_locks, None
             try:
@@ -639,11 +675,7 @@ class Inbox:
                 message_id=m.message_id,
             )
         try:
-            if self._replay._covered(m.from_id, m.timestamp):
-                self._store.delete(rec.key)
-            else:
-                rec.status = "acked"
-                write_record(self._store, rec.key, rec.to_dict())
+            self._finish(rec)
         except ACEError as exc:
             self._failed = True
             return ReceiveOutcome(
@@ -702,10 +734,17 @@ class Inbox:
             if stored.status == "pending":
                 return self._hand_over(stored)
             return ReceiveOutcome("duplicate", from_id=env.from_id, message_id=env.message_id)
-        tr = self._replay.clone()
+        gate = _PeekReplay(self._replay)
         try:
-            parsed = parse_message(
-                env, self._identity, peer, replay=tr, floor=self._floor(), clock=self._clock
+            parsed = parse_with_gate(
+                env,
+                self._identity,
+                peer,
+                threads=None,
+                replay=gate,
+                floor=self._floor(),
+                clock=self._clock,
+                principal=None,
             )
             run_schema_validator(  # 06 step 6: installed deterministic validation
                 self._schemas, parsed.type, parsed.schema_digest, parsed.thread_id, parsed.body
@@ -713,13 +752,13 @@ class Inbox:
             if self._principal is not None and is_principal_type(parsed.type):
                 peer = self._refresh_principal_sender(env, peer, now)
         except ACEError as exc:
-            return self._rejected(exc, env, tr)
+            return self._rejected(exc, env, gate.verified)
         economic = self._commerce and is_economic_type(parsed.type)
         if economic and parsed.thread_id is None:
             return self._rejected(
                 ACEError("invalid_envelope", "commerce messages require a private threadId"),
                 env,
-                tr,
+                True,
             )
         decision = self._principal is not None and parsed.type == "decision"
         with ExitStack() as held:
@@ -732,25 +771,17 @@ class Inbox:
                     return ReceiveOutcome(
                         "retryable", error=exc, from_id=env.from_id, message_id=env.message_id
                     )
-            result = self._parse_and_commit(env, peer, key, now, economic, decision, parsed, tr)
+            result = self._parse_and_commit(env, peer, key, now, economic, decision, parsed)
             if self._failed and (economic or decision):
                 self._held_locks = (
                     held.pop_all()
                 )  # keep other writers out until close()/open() repairs
         if isinstance(result, ReceiveOutcome):
             return result
-        outcome = self._hand_over(result)  # 7.4-7.5, without the threads lock
-        if outcome.kind == "delivered":
-            self._delivered_since_sweep += 1
-            if self._delivered_since_sweep >= _SWEEP_EVERY:
-                self._delivered_since_sweep = 0
-                try:
-                    self._sweep()
-                except ACEError:
-                    pass
-        return outcome
+        return self._hand_over(result)  # 7.4-7.5, without the threads lock
 
-    def _rejected(self, exc: ACEError, env: ACEMessage, tr: ReplayDetector) -> ReceiveOutcome:
+    def _rejected(self, exc: ACEError, env: ACEMessage, verified: bool) -> ReceiveOutcome:
+        """``verified``: the signature checked out (pipeline step 9 reached)."""
         ids = {"from_id": env.from_id, "message_id": env.message_id}
         if exc.code == "replay":
             return ReceiveOutcome("duplicate", **ids)
@@ -758,9 +789,18 @@ class Inbox:
             return ReceiveOutcome("retryable", error=exc, **ids)
         try:
             outcome = self._quarantine(exc, env)
-            if not tr.accepts(env.message_id, env.from_id, env.timestamp):
-                self._write_replay(tr)
-                self._replay = tr
+            # An authenticated message stays one-shot. No delivery record journals it, so its
+            # commit is written now, on a copy swapped in only once written.
+            if verified:
+                tr = self._replay.clone()
+                if tr.commit(env.message_id, env.from_id, env.timestamp, self._floor()):
+                    self._write_replay(tr)
+                    self._replay = tr
+                    self._replay_dirty = 0
+                    try:
+                        self._prune_acked()
+                    except ACEError:
+                        pass
             return outcome
         except ACEError as store_exc:
             return ReceiveOutcome("retryable", error=store_exc, **ids)
@@ -774,7 +814,6 @@ class Inbox:
         economic: bool,
         decision: bool,
         parsed: ParsedMessage,
-        tr: ReplayDetector,
     ) -> "ReceiveOutcome | _Delivery":
         ids = {"from_id": env.from_id, "message_id": env.message_id}
         try:
@@ -795,7 +834,7 @@ class Inbox:
             if economic and rec is None:
                 self._threads._check_can_open(env.from_id)
         except ACEError as exc:
-            return self._rejected(exc, env, tr)
+            return self._rejected(exc, env, True)
         # 7. durable commit
         snap = machine.get_snapshot(env.conversation_id, parsed.thread_id) if economic else None  # type: ignore[arg-type]
         delivery = _Delivery(key, parsed, envelope_fingerprint(env), now, "pending", snap)
@@ -804,30 +843,35 @@ class Inbox:
         except ACEError as exc:
             return ReceiveOutcome("retryable", error=exc, **ids)
         try:
+            # 7.3 in memory; the record just written journals it until the next replay.json
+            self._replay.commit(env.message_id, env.from_id, env.timestamp, self._floor())
+            self._replay_dirty += 1
             if decision:  # 7.1a: mark the request decided
                 fill_decision(self._store, parsed)
             if snap is not None:  # 7.2
                 self._threads._save(ThreadRecord(snap, _clear_proven_pending(rec, snap)))
-            self._write_replay(tr)  # 7.3
-            self._replay = tr
         except ACEError as exc:
             self._failed = True
             return ReceiveOutcome("retryable", error=exc, **ids)
+        if self._replay_dirty >= _REPLAY_SNAPSHOT_EVERY:
+            try:  # a failed snapshot only delays pruning: the records still journal every commit
+                self._persist_replay()
+            except ACEError:
+                pass
         return delivery
 
-    def _sweep(self) -> int:
-        """Delete ``acked`` delivery records covered by a replay horizon (automatic, every
-        1024 deliveries); returns the count."""
-        with self._mutex:
-            removed = 0
-            for key in self._store.list("deliveries/"):
-                d = load_record(self._store, key)
-                if d is None:
-                    continue
-                rec = _delivery_from_dict(d, key, self._local)
-                if rec.status == "acked" and self._replay._covered(
-                    rec.message.from_id, rec.message.timestamp
-                ):
-                    self._store.delete(key)
-                    removed += 1
-            return removed
+
+class _PeekReplay:
+    """Pipeline steps 7 and 9 against the live seen store without writing it: the Inbox
+    commits only at its commit point. ``verified`` records that step 9 was reached."""
+
+    def __init__(self, replay: ReplayDetector) -> None:
+        self._replay = replay
+        self.verified = False
+
+    def accepts(self, message_id: str, from_id: str, timestamp: int) -> bool:
+        return self._replay.accepts(message_id, from_id, timestamp)
+
+    def commit(self, message_id: str, from_id: str, timestamp: int, floor: int) -> bool:
+        self.verified = True
+        return self._replay.accepts(message_id, from_id, timestamp)

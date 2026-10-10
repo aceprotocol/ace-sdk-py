@@ -395,6 +395,31 @@ def parse_message(
         replay, ReplayDetector
     ):
         raise ACEError("invalid_argument", "threads and replay are required")
+    return parse_with_gate(
+        env,
+        receiver,
+        sender,
+        threads=threads,
+        replay=replay,
+        floor=floor,
+        clock=clock,
+        principal=principal,
+    )
+
+
+def parse_with_gate(
+    env: ACEMessage,
+    receiver: ACEIdentity,
+    sender: VerifiedPeer,
+    *,
+    threads: ThreadStateMachine | None,
+    replay: Any,
+    floor: int | None,
+    clock: Callable[[], int] | None,
+    principal: PrincipalContext | None,
+) -> ParsedMessage:
+    """Internal: ``parse_message`` on validated arguments. ``replay`` is any object with the
+    seen store's ``accepts`` (step 7) and ``commit`` (step 9); the Inbox commits later."""
     receiver_id = receiver.get_ace_id()
     if threads is not None and threads.local_ace_id != receiver_id:
         raise ACEError("invalid_argument", "threads.local_ace_id must be the receiver")

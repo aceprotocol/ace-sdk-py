@@ -86,13 +86,8 @@ def test_delivered_commit_order_and_formats(pair):
     dkey = delivery_key(alice.id, env.message_id)
     tkey = thread_key(env.conversation_id, "deal-1")
     # a new open thread is indexed before its record is written
-    assert counting.writes == [
-        dkey,
-        thread_index_key(alice.id),
-        tkey,
-        "replay.json",
-        dkey,
-    ]
+    # the delivery record journals the seen-store commit; replay.json follows at close
+    assert counting.writes == [dkey, thread_index_key(alice.id), tkey, dkey]
     assert bob.host.calls == [(alice.id, env.message_id)]
     rec = json.loads(bob.store.read(dkey))
     assert set(rec) == {
@@ -130,6 +125,43 @@ def test_delivered_commit_order_and_formats(pair):
     assert counting.writes == []
     assert ThreadStore(bob.store, bob.id).get(env.conversation_id, "deal-1").state == "rfq"
     assert bob.host.calls == [(alice.id, env.message_id)]
+    inbox.close()
+    assert counting.writes == ["replay.json"]
+
+
+def test_delivery_records_journal_the_seen_store(pair):
+    """Between writes of replay.json the delivery records journal the seen store: a crash
+    loses no commit, and a record a horizon covers in memory only is kept until a written
+    replay.json covers it."""
+    clock, alice, bob = pair
+
+    def send(text):
+        return alice.outbox.stage(alice.peers.get(bob.id), "text", {"message": text}).message
+
+    first = send("one")
+    clock.t += 1
+    second = send("two")
+    inbox = bob.open(
+        capacity=16
+    )  # quota 1: the second evicts the first and raises H[alice] over it
+    assert inbox.receive(wire(first)).kind == "delivered"
+    assert inbox.receive(wire(second)).kind == "delivered"
+    assert len(bob.store.list("deliveries/")) == 2
+    crashed = clone_memory(bob.store)  # the process dies: replay.json was never rewritten
+    inbox.close()
+
+    def replay_of(store):
+        return ReplayDetector.from_state(json.loads(store.read("replay.json")), capacity=16)
+
+    assert replay_of(crashed).accepts(first.message_id, first.from_id, first.timestamp)
+    reopened = bob.open(store=crashed, capacity=16)
+    assert reopened.receive(wire(first)).kind == "duplicate"
+    assert reopened.receive(wire(second)).kind == "duplicate"
+    assert len(bob.host.calls) == 2
+    reopened.close()
+    # written: the first message's covered record is pruned, the second kept
+    assert not replay_of(crashed).accepts(first.message_id, first.from_id, first.timestamp)
+    assert len(crashed.list("deliveries/")) == 1
 
 
 def test_non_economic_and_offline_window(pair):
@@ -329,7 +361,9 @@ def test_recovery_divergent_thread(pair):
 def test_sweep_removes_covered_acked(pair, monkeypatch):
     import ace.inbox as inbox_mod
 
-    monkeypatch.setattr(inbox_mod, "_SWEEP_EVERY", 4)  # sweep automatically on the 4th delivery
+    monkeypatch.setattr(
+        inbox_mod, "_REPLAY_SNAPSHOT_EVERY", 4
+    )  # replay.json (then pruning) on the 4th commit
     clock, alice, bob = pair
     inbox = bob.open(offline_window_seconds=1000)
     envs = [rfq(alice, bob, thread_id=f"t{i}") for i in range(3)]
@@ -338,9 +372,7 @@ def test_sweep_removes_covered_acked(pair, monkeypatch):
     assert len(bob.store.list("deliveries/")) == 3
     clock.t += 2000
     late = alice.outbox.stage(alice.peers.get(bob.id), "text", {"message": "later"}).message
-    assert (
-        inbox.receive(wire(late)).kind == "delivered"
-    )  # floor raises H, then sweeps
+    assert inbox.receive(wire(late)).kind == "delivered"  # floor raises H, then sweeps
     assert bob.store.list("deliveries/") == [delivery_key(alice.id, late.message_id)]
     for e in envs:  # still rejected: now below the acceptance floor
         out = inbox.receive(wire(e))
@@ -393,7 +425,7 @@ def _scenario(clock):
     return bob, offer
 
 
-COMMIT_STEPS = 5  # delivery, thread, replay, ack
+COMMIT_STEPS = 4  # delivery, operation archive, thread, ack (replay.json follows at close)
 
 
 @pytest.mark.parametrize("fail_at", range(1, COMMIT_STEPS + 1))
@@ -434,13 +466,13 @@ def test_crash_injection(fail_at, backend, tmp_path):
         (offer.from_id, offer.message_id)
     ]  # nothing lost, no duplicate effect
     # on_message itself runs twice only if the crash hit the ack write after the handover
-    assert len(bob.host.calls) == (2 if fail_at == 5 else 1)
+    assert len(bob.host.calls) == (2 if fail_at == 4 else 1)
+    inbox.close()
     replay = ReplayDetector.from_state(json.loads(base.read("replay.json")), capacity=100000)
     assert not replay.accepts(offer.message_id, offer.from_id, offer.timestamp)
-    inbox.close()
     inbox = bob.open(store=base)
     assert inbox.receive(wire(offer)).kind == "duplicate"
-    assert len(bob.host.calls) == (2 if fail_at == 5 else 1)
+    assert len(bob.host.calls) == (2 if fail_at == 4 else 1)
 
 
 def test_crash_during_quarantine_write(pair):
@@ -630,4 +662,3 @@ def test_outbox_open_skips_acked_covered_deliveries(pair):
     bob.store.write("replay.json", json.dumps(state).encode())
     Outbox.open(bob.identity, bob.store, clock=clock, commerce=True)
     assert ThreadStore(bob.store, bob.id).get(env.conversation_id, "deal-1") is not None
-
