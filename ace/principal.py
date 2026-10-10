@@ -90,7 +90,7 @@ class PrincipalSigner:
 
 def principal_payload(record: PrincipalRecord, subject_signing_public_key: bytes) -> bytes:
     """``encodePayload(account, join(roles), signer.scheme, signer.publicKey, subjectKeyB64,
-    scopeOrEmpty, decimal(expiresAtOr0))`` (09 § Signing Context)."""
+    scopeOrEmpty, decimal(expiresAt))`` (09 § Signing Context)."""
     return encode_payload(
         record.account,
         ",".join(record.roles),
