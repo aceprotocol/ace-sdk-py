@@ -530,8 +530,11 @@ class Inbox:
     def _recover(self) -> None:
         """Repair threads, ``requests/`` decision fills and replay from every delivery record
         first (ordered by (timestamp, key)), then hand over the pending ones in the same order.
-        A fill that raises ``bad_reference`` or ``wrong_principal`` (only possible with a
-        corrupted store: step 7 and the fill run under one ``requests`` lock) fails ``open()``."""
+        A decision's ``requests/`` fill is a replayed processing (09 step 7): the same-account
+        rules run again on the pinned sender. A record that fails them with ``wrong_principal``
+        or ``bad_reference`` was never accepted under this policy (e.g. it was delivered as
+        data while no principal was installed, or the request is already decided) and changes
+        nothing; any other error fails ``open()``."""
         records = load_deliveries(self._store, self._local)
         changed = False
         with self._threads._locked():
@@ -541,14 +544,22 @@ class Inbox:
                 ):
                     continue  # fully committed long ago; its thread may have been pruned
                 repair_thread(self._threads, rec)
-        decisions = [
-            rec.message
-            for rec in records
-            if self._principal is not None and rec.message.type == "decision"
-        ]
+        ctx = self._principal_context()
+        decisions = [rec.message for rec in records if rec.message.type == "decision"]
+        if ctx is None:
+            decisions = []
         if decisions:  # 1a: a decision's requests/ fill (no-op when already filled)
             with self._store.lock("requests"):
                 for m in decisions:
+                    sender = self._peers.get(m.from_id)
+                    if sender is None:
+                        continue
+                    try:
+                        apply_receive_rules(m, sender, threads=None, principal=ctx, now=self._now())
+                    except ACEError as exc:
+                        if exc.code in ("wrong_principal", "bad_reference"):
+                            continue
+                        raise
                     fill_decision(self._store, m)
         for rec in records:
             m = rec.message

@@ -346,11 +346,17 @@ def _live_principal(profile: AgentProfile | None, now: int) -> PrincipalRecord |
     return None if p is not None and p.expires_at <= now else p
 
 
+def _same_authority_domain(a: PrincipalRecord, b: PrincipalRecord) -> bool:
+    """Same (subject, account, signer) authority domain (the subject is the pinned peer)."""
+    return a.account == b.account and a.signer == b.signer
+
+
 def _supersedes(new: PrincipalRecord, old: PrincipalRecord) -> bool:
-    """Monotonic replacement compares signed claims, not proof bytes."""
+    """Monotonic replacement compares signed claims, not proof bytes. Versions of different
+    authority domains are not compared: another domain's ``new`` replaces ``old``."""
     from .principal import same_principal_claims
 
-    if new.account != old.account or new.signer != old.signer:
+    if not _same_authority_domain(new, old):
         return True
     if new.issued_at != old.issued_at:
         return new.issued_at > old.issued_at
@@ -383,12 +389,18 @@ def _file_profile(
 ) -> AgentProfile | None:
     """A kept registration-file candidate replaces only the profile members it supplies;
     absent members are carried over from the cache (R-P27). ``principal`` is replaced only by
-    one whose issuedAt is not older (R-P26). A cached principal that has expired by ``now`` is
-    dropped, not carried (expiry is revocation; R-P35): the refreshed ``fetchedAt`` would
-    otherwise make the stored record fail re-verification on load."""
+    one whose issuedAt is not older (R-P26) and, while the cached one is unexpired, only within
+    its (subject, account, signer) authority domain: the file's principal is not covered by
+    the key-binding signature, so only a relay record moves it to another domain (02). A
+    cached principal that has expired by ``now`` is dropped, not carried (expiry is
+    revocation; R-P35): the refreshed ``fetchedAt`` would otherwise make the stored record
+    fail re-verification on load."""
     old = _live_principal(cached, now)
     new = None if cand is None else cand.principal
-    keep = new if old is None or (new is not None and _supersedes(new, old)) else old
+    replaces = new is not None and (
+        old is None or (_same_authority_domain(new, old) and _supersedes(new, old))
+    )
+    keep = new if replaces else old
     supplied = (
         {}
         if cand is None
@@ -407,7 +419,9 @@ def adopt_decision(
 ) -> tuple[VerifiedPeer, AdoptOutcome]:
     """Internal pure rule used by PeerStore.adopt: returns the binding to store and the outcome.
 
-    Rotation to a different encryption key requires a strictly newer signed binding.
+    Rotation to a different encryption key requires a strictly newer signed binding; it
+    merges the profile exactly as a kept binding of the same source does (02), so a
+    registration file never removes a cached principal.
     """
     if candidate.registered_at > now + TIMESTAMP_WINDOW_SECONDS:
         raise ACEError("invalid_peer", "registeredAt is in the future")
@@ -415,15 +429,15 @@ def adopt_decision(
         return candidate, "adopted"
     if pin.signing_public_key != candidate.signing_public_key or pin.scheme != candidate.scheme:
         raise ACEError("invalid_peer", "signing key or scheme differs from the pinned binding")
+    profile = (
+        _relay_profile(
+            pin.profile, candidate.profile, candidate.registered_at >= pin.registered_at, now
+        )
+        if candidate.source != "registration"
+        else _file_profile(pin.profile, candidate.profile, now)
+    )
     if pin.encryption_public_key == candidate.encryption_public_key:
         newer = candidate if candidate.registered_at > pin.registered_at else pin
-        profile = (
-            _relay_profile(
-                pin.profile, candidate.profile, candidate.registered_at >= pin.registered_at, now
-            )
-            if candidate.source != "registration"
-            else _file_profile(pin.profile, candidate.profile, now)
-        )
         merged = _make_peer(
             ace_id=pin.ace_id,
             scheme=pin.scheme,
@@ -436,7 +450,17 @@ def adopt_decision(
         )
         return merged, "unchanged"
     if candidate.registered_at > pin.registered_at:
-        return candidate, "rotated"
+        rotated = _make_peer(
+            ace_id=candidate.ace_id,
+            scheme=candidate.scheme,
+            signing_public_key=candidate.signing_public_key,
+            encryption_public_key=candidate.encryption_public_key,
+            registered_at=candidate.registered_at,
+            registration_signature=candidate.registration_signature,
+            source=candidate.source,
+            profile=profile,
+        )
+        return rotated, "rotated"
     raise ACEError("stale_peer_binding", "a different encryption key requires a newer registeredAt")
 
 

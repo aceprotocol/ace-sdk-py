@@ -173,6 +173,8 @@ class PeerStore:
             now = self._now()
             rec = self._load(peer.ace_id, enforce_horizon=False)
             pin = rec[0] if rec else None
+            if pin is not None:  # backfill the horizon of a pin cached before horizons existed,
+                self._check_principal_horizon(pin)  # so a later strip cannot erase it (02)
             result, outcome = adopt_decision(pin, peer, now)
             self._check_principal_horizon(result)
             if result is not pin:

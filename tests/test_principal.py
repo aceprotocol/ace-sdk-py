@@ -1240,3 +1240,37 @@ def test_unrelated_issuer_cannot_poison_principal_horizon():
     for principal in [valid, poison, valid]:
         adopted = peers.adopt(verify_peer_record(_peer_record(subject, {"principal": principal.to_dict()}), clock=lambda: NOW))
     assert adopted.peer.principal == valid
+
+
+# --- principal recovery replays the account rules (06 step 1a, 09 § Persistence) ---------
+
+
+def test_recovery_decision_delivered_as_data_never_fills_requests():
+    clock, owner, a, b, _ = _pair_with_principals()  # b is a delegate, not a controller
+    ib = _open(b, account=None)
+    ia0 = _open(a, account=None)
+    _, req = _send(a, ib, b, "request", {"action": "pay", "summary": "s"}, 1)
+    d, _ = _send(b, ia0, a, "decision", {"requestId": req.message.message_id, "outcome": "approve"}, 1)
+    assert d.kind == "delivered"
+    ia0.close()
+    ia1 = _open(a, owner)
+    assert load_request_record(a.store, req.message.conversation_id, req.message.message_id)["decision"] is None
+    ia1.close()
+    ib.close()
+
+
+def test_recovery_two_data_only_decisions_do_not_fail_open_with_a_principal():
+    clock, owner, a, b, _ = _pair_with_principals(roles_b=("controller",))
+    ib = _open(b, account=None)
+    ia0 = _open(a, account=None)
+    _, req = _send(a, ib, b, "request", {"action": "pay", "summary": "s"}, 1)
+    _send(b, ia0, a, "decision", {"requestId": req.message.message_id, "outcome": "deny"}, 1)
+    clock.t += 1
+    _send(b, ia0, a, "decision", {"requestId": req.message.message_id, "outcome": "approve"}, 2)
+    ia0.close()
+    ia1 = _open(a, owner)
+    # the first decision passes the rules at the replayed processing; the second finds the request decided
+    rec = load_request_record(a.store, req.message.conversation_id, req.message.message_id)
+    assert rec["decision"]["outcome"] == "deny"
+    ia1.close()
+    ib.close()
