@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 
 import pytest
@@ -21,6 +22,7 @@ from ace import (
 from ace._encoding import encode_signature, to_base64
 from ace.encryption import encrypt
 from ace.envelope import message_sign_data
+from ace.messages import private_content
 
 from .helpers import peer_of, raises
 
@@ -31,9 +33,14 @@ NOW = 1_800_000_000
 def world():
     alice, bob, carol = (SoftwareIdentity.generate(s) for s in ("ed25519", "secp256k1", "ed25519"))
     return {
-        "alice": alice, "bob": bob, "carol": carol,
-        "pa": peer_of(alice), "pb": peer_of(bob), "pc": peer_of(carol),
-        "ta": ThreadStateMachine(alice.get_ace_id()), "tb": ThreadStateMachine(bob.get_ace_id()),
+        "alice": alice,
+        "bob": bob,
+        "carol": carol,
+        "pa": peer_of(alice),
+        "pb": peer_of(bob),
+        "pc": peer_of(carol),
+        "ta": ThreadStateMachine(alice.get_ace_id()),
+        "tb": ThreadStateMachine(bob.get_ace_id()),
     }
 
 
@@ -291,8 +298,10 @@ def test_economic_parse_applies_state_rules(world):
     # alice (the buyer) cannot offer; craft a correctly signed offer from alice anyway
     forged = resign(
         w,
-        dataclasses.replace(rfq, type="offer", message_id="00000000-0000-4000-8000-000000000009"),
-        plaintext=b'{"price":"1","currency":"USDC"}',
+        dataclasses.replace(rfq, message_id="00000000-0000-4000-8000-000000000009"),
+        plaintext=json.dumps(
+            private_content("offer", {"price": "1", "currency": "USDC"}, "t", None)
+        ).encode(),
     )
     with raises("wrong_role"):
         parse(w, forged)

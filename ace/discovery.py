@@ -18,11 +18,11 @@ import base58
 
 from ._encoding import (
     CONTROL_CHAR_RE,
-    check_wire_int,
     decode_b64,
     decode_signature,
     is_ace_id,
     is_https_url,
+    to_base64,
     unix_now,
     wire_int,
 )
@@ -34,15 +34,12 @@ from .types import (
     SIGNING_SCHEMES,
     AgentProfile,
     PrincipalRecord,
-    ProfilePricing,
     RegistrationFile,
     SigningScheme,
 )
 
 _MINTING = threading.local()  # module-private construction token
-_CAIP2_RE = re.compile(r"[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}")
 _TAG_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
-_AMOUNT_RE = re.compile(r"[0-9]+(\.[0-9]+)?")
 _DOMAIN_RE = re.compile(
     r"[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}"
 )
@@ -55,7 +52,8 @@ class VerifiedPeer:
 
     Only the identity and keys are verified. ``profile`` is unverified relay metadata: it is
     self-asserted by the peer and served by the relay, so never treat it as authenticated
-    (name, endpoint, pricing, etc. may be anything the peer chose to publish).
+    (name, endpoint, ``ext`` (including ``urn:ace:commerce:1``), etc. may be anything the peer
+    chose to publish). A registration file supplies ``profile.ext`` and ``profile.principal``.
     """
 
     ace_id: str
@@ -63,7 +61,7 @@ class VerifiedPeer:
     signing_public_key: bytes
     encryption_public_key: bytes
     registered_at: int
-    registration_signature: str | None
+    registration_signature: str
     source: Literal["relay", "registration"]
     profile: AgentProfile | None
 
@@ -106,7 +104,8 @@ def _tag_list(items: list[str], name: str, max_count: int) -> None:
 
 
 def validate_profile(profile: AgentProfile | dict) -> AgentProfile:
-    """Validate a discovery profile (``invalid_profile``); returns the parsed profile.
+    """Validate a discovery profile (``invalid_profile``); returns the parsed profile, with
+    ``ext`` re-canonicalised (02 § Profile Fields; ``urn:ace:commerce:1`` checked when present).
 
     ``principal`` is parsed after every other member is checked (R-P45), so a profile with
     both an invalid member and an invalid principal fails ``invalid_profile``."""
@@ -135,21 +134,8 @@ def validate_profile(profile: AgentProfile | dict) -> AgentProfile:
         _tag_list(p.tags, "tags", 10)
     if p.capabilities is not None:
         _tag_list(p.capabilities, "capabilities", 20)
-    if p.chains is not None:
-        if len(p.chains) > 10 or not all(_CAIP2_RE.fullmatch(c) for c in p.chains):
-            raise ACEError(
-                "invalid_profile", "profile.chains must be at most 10 CAIP-2 identifiers"
-            )
     if p.endpoint is not None and not is_https_url(p.endpoint):
         raise ACEError("invalid_profile", "profile.endpoint must be an HTTPS URL")
-    if p.pricing is not None:
-        text(p.pricing.currency, "pricing.currency", 1, 16)
-        m = p.pricing.max_amount
-        if m is not None and (len(m) > 32 or _AMOUNT_RE.fullmatch(m) is None):
-            raise ACEError(
-                "invalid_profile",
-                "profile.pricing.maxAmount must match ^[0-9]+(\\.[0-9]+)?$ (1-32 chars)",
-            )
     if raw.get("principal") is not None:
         p.principal = PrincipalRecord.from_dict(raw["principal"])
     return p
@@ -159,14 +145,8 @@ def _raw_profile(p: AgentProfile) -> dict:
     """The attribute values of a (possibly hand-built) profile, for strict re-parsing."""
     d: dict[str, Any] = {
         k: getattr(p, k)
-        for k in ("name", "description", "image", "tags", "capabilities", "chains", "endpoint")
+        for k in ("name", "description", "image", "tags", "capabilities", "endpoint", "ext")
     }
-    pr = p.pricing
-    d["pricing"] = (
-        {"currency": pr.currency, "maxAmount": pr.max_amount}
-        if isinstance(pr, ProfilePricing)
-        else pr
-    )
     pp = p.principal
     d["principal"] = pp.to_dict() if isinstance(pp, PrincipalRecord) else pp
     return d
@@ -274,16 +254,13 @@ def verify_peer_record(record: dict, *, clock: Callable[[], int] | None = None) 
 def verify_registration_file(
     reg: RegistrationFile | dict,
     *,
-    pinned_at: int | None = None,
     clock: Callable[[], int] | None = None,
 ) -> VerifiedPeer:
     """Run all 01 rules (including the ID hash); failures are ``invalid_registration``.
 
-    The peer's ``registered_at`` is ``pinned_at`` or now (a file has no signed timestamp).
+    The peer's ``registered_at`` is the signed binding timestamp.
     """
     code: ACEErrorCode = "invalid_registration"
-    if pinned_at is not None:
-        check_wire_int(pinned_at, "pinned_at")
     if isinstance(reg, dict):
         reg = RegistrationFile.from_dict(reg)
     if not isinstance(reg, RegistrationFile):
@@ -324,8 +301,20 @@ def verify_registration_file(
     if compute_ace_id(signing_key) != reg.id:
         raise ACEError(code, "id does not match the signing key")
     enc_key = decode_encryption_key(s.encryption_public_key, code)
+    registered_at = wire_int(reg.registered_at)
+    if registered_at is None:
+        raise ACEError(code, "registeredAt must be a wire integer")
+    sig = decode_signature(reg.registration_signature, s.scheme, code)
+    if not verify_signature(
+        binding_sign_data(reg.id, registered_at, s.encryption_public_key, to_base64(signing_key)),
+        sig,
+        s.scheme,
+        signing_key,
+    ):
+        raise ACEError(code, "registrationSignature does not verify")
     now = unix_now(clock)
-    profile = None
+    # The file supplies ``profile.ext`` and ``profile.principal`` (02 § Rollback Barrier).
+    profile: AgentProfile | None = None if reg.ext is None else AgentProfile(ext=reg.ext)
     if reg.principal is not None:
         from .principal import validate_principal_record
 
@@ -333,14 +322,14 @@ def verify_registration_file(
             reg.principal, bytes(signing_key), now, allow_expired=True
         )
         if validated.expires_at > now:  # expired-only: treated as absent (R-P40)
-            profile = AgentProfile(principal=validated)
+            profile = AgentProfile(ext=reg.ext, principal=validated)
     return _make_peer(
         ace_id=reg.id,
         scheme=s.scheme,
         signing_public_key=bytes(signing_key),
         encryption_public_key=enc_key,
-        registered_at=now if pinned_at is None else pinned_at,
-        registration_signature=None,
+        registered_at=registered_at,
+        registration_signature=reg.registration_signature,
         source="registration",
         profile=profile,
     )
@@ -358,12 +347,14 @@ def _live_principal(profile: AgentProfile | None, now: int) -> PrincipalRecord |
 
 
 def _supersedes(new: PrincipalRecord, old: PrincipalRecord) -> bool:
-    """Monotonic principal replacement (R-P36): strictly newer issuedAt, or the same record."""
+    """Monotonic replacement compares signed claims, not proof bytes."""
+    from .principal import same_principal_claims
+
+    if new.account != old.account or new.signer != old.signer:
+        return True
     if new.issued_at != old.issued_at:
         return new.issued_at > old.issued_at
-    return json.dumps(new.to_dict(), sort_keys=True, separators=(",", ":")) == json.dumps(
-        old.to_dict(), sort_keys=True, separators=(",", ":")
-    )
+    return same_principal_claims(new, old)
 
 
 def _none_if_empty(profile: AgentProfile) -> AgentProfile | None:
@@ -398,26 +389,17 @@ def _file_profile(
     old = _live_principal(cached, now)
     new = None if cand is None else cand.principal
     keep = new if old is None or (new is not None and _supersedes(new, old)) else old
-    supplied = {} if cand is None else {
-        f.name: getattr(cand, f.name)
-        for f in dataclasses.fields(AgentProfile)
-        if f.name != "principal" and getattr(cand, f.name) is not None
-    }
+    supplied = (
+        {}
+        if cand is None
+        else {
+            f.name: getattr(cand, f.name)
+            for f in dataclasses.fields(AgentProfile)
+            if f.name != "principal" and getattr(cand, f.name) is not None
+        }
+    )
     merged = dataclasses.replace(cached or AgentProfile(), **supplied, principal=keep)
     return None if merged == AgentProfile() else merged
-
-
-def _with_profile(pin: VerifiedPeer, profile: AgentProfile | None) -> VerifiedPeer:
-    return _make_peer(
-        ace_id=pin.ace_id,
-        scheme=pin.scheme,
-        signing_public_key=pin.signing_public_key,
-        encryption_public_key=pin.encryption_public_key,
-        registered_at=pin.registered_at,
-        registration_signature=pin.registration_signature,
-        source=pin.source,
-        profile=profile,
-    )
 
 
 def adopt_decision(
@@ -425,9 +407,7 @@ def adopt_decision(
 ) -> tuple[VerifiedPeer, AdoptOutcome]:
     """Internal pure rule used by PeerStore.adopt: returns the binding to store and the outcome.
 
-    Rotation to a different encryption key requires a signed (relay) binding with a
-    strictly newer ``registered_at``; an unsigned registration-file candidate is adopted
-    only without a pin, or as ``unchanged`` when its key equals the pin (pin kept as is).
+    Rotation to a different encryption key requires a strictly newer signed binding.
     """
     if candidate.registered_at > now + TIMESTAMP_WINDOW_SECONDS:
         raise ACEError("invalid_peer", "registeredAt is in the future")
@@ -435,19 +415,14 @@ def adopt_decision(
         return candidate, "adopted"
     if pin.signing_public_key != candidate.signing_public_key or pin.scheme != candidate.scheme:
         raise ACEError("invalid_peer", "signing key or scheme differs from the pinned binding")
-    unsigned = candidate.registration_signature is None
     if pin.encryption_public_key == candidate.encryption_public_key:
-        if unsigned:
-            # An unsigned (registration-file) source never changes the pinned binding. A kept
-            # candidate replaces the other profile members and refreshes fetchedAt, but has no
-            # signed timestamp, so it can never remove or downgrade the cached ``principal``:
-            # it replaces it only with a validated one whose issuedAt is not older (R-P26);
-            # an expired cached one is dropped (R-P35).
-            profile = _file_profile(pin.profile, candidate.profile, now)
-            return _with_profile(pin, profile), "unchanged"
         newer = candidate if candidate.registered_at > pin.registered_at else pin
-        profile = _relay_profile(
-            pin.profile, candidate.profile, candidate.registered_at >= pin.registered_at, now
+        profile = (
+            _relay_profile(
+                pin.profile, candidate.profile, candidate.registered_at >= pin.registered_at, now
+            )
+            if candidate.source != "registration"
+            else _file_profile(pin.profile, candidate.profile, now)
         )
         merged = _make_peer(
             ace_id=pin.ace_id,
@@ -460,10 +435,6 @@ def adopt_decision(
             profile=profile,
         )
         return merged, "unchanged"
-    if unsigned:
-        raise ACEError(
-            "stale_peer_binding", "an unsigned source cannot rotate a pinned encryption key"
-        )
     if candidate.registered_at > pin.registered_at:
         return candidate, "rotated"
     raise ACEError("stale_peer_binding", "a different encryption key requires a newer registeredAt")

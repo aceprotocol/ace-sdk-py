@@ -93,25 +93,29 @@ def test_adopt_outcomes(store):
     assert peers.get(bob.get_ace_id()).encryption_public_key == bob2.get_encryption_public_key()
 
 
-def test_registration_file_never_rotates(store):
+def test_registration_file_rotates_only_forward(store):
     clock = Clock()
     peers = PeerStore(store, clock=clock)
     bob = SoftwareIdentity.generate("secp256k1")
-    reg = create_registration_file(bob, name="Bob", endpoint="https://bob.example/ace")
-    pinned = peers.pin_registration_file(reg, pinned_at=100)
+    reg = create_registration_file(
+        bob, name="Bob", endpoint="https://bob.example/ace", timestamp=100
+    )
+    pinned = peers.pin_registration_file(reg)
     assert pinned.source == "registration" and pinned.registered_at == 100
     before = store.read(_peer_key(bob.get_ace_id()))
     clock.t += 1000
-    assert peers.pin_registration_file(reg, pinned_at=500).registered_at == 100  # kept exactly
+    assert peers.pin_registration_file(reg).registered_at == 100  # kept exactly
     # a kept candidate refreshes the cache's fetchedAt and profile (02 § Rollback Barrier);
     # the binding itself is unchanged
     after = store.read(_peer_key(bob.get_ace_id()))
     b_rec, a_rec = json.loads(before), json.loads(after)
     assert a_rec["fetchedAt"] == b_rec["fetchedAt"] + 1000
     assert {**a_rec, "fetchedAt": 0} == {**b_rec, "fetchedAt": 0}
-    reg2 = create_registration_file(rotated(bob), name="Bob", endpoint="https://bob.example/ace")
+    reg2 = create_registration_file(
+        rotated(bob), name="Bob", endpoint="https://bob.example/ace", timestamp=100
+    )
     with raises("stale_peer_binding"):
-        peers.pin_registration_file(reg2, pinned_at=10**9)
+        peers.pin_registration_file(reg2)
     # a signed relay binding with newer registeredAt may rotate a file pin
     res = peers.adopt(verify_peer_record(relay_record(rotated(bob), 200)))
     assert res.outcome == "rotated"
@@ -149,6 +153,32 @@ def test_persisted_format_and_reverify(tmp_path):
     store.write(_peer_key(bob.get_ace_id()), json.dumps({**d, "version": 2}).encode())
     with raises("storage_failed"):
         peers.get(bob.get_ace_id())
+
+
+def test_reverify_is_cached_per_stored_bytes(monkeypatch):
+    import ace.peers as peers_module
+
+    clock = Clock()
+    store = MemoryStore()
+    peers = PeerStore(store, clock=clock)
+    bob = SoftwareIdentity.generate("ed25519")
+    peers.adopt(verify_peer_record(relay_record(bob, clock.t, {"name": "Bob"})))
+    calls = []
+    real = peers_module.verify_peer_record
+    monkeypatch.setattr(
+        peers_module, "verify_peer_record", lambda *a, **k: calls.append(1) or real(*a, **k)
+    )
+    first = peers.get(bob.get_ace_id())
+    first.profile.name = "mutated"  # a caller's copy never reaches the cache
+    assert peers.get(bob.get_ace_id()).profile.name == "Bob"
+    assert len(calls) == 1
+    # changed bytes are verified again: tampering after a cached success is still caught
+    d = json.loads(store.read(_peer_key(bob.get_ace_id())))
+    d["registeredAt"] += 1
+    store.write(_peer_key(bob.get_ace_id()), json.dumps(d).encode())
+    with raises("storage_failed"):
+        peers.get(bob.get_ace_id())
+    assert len(calls) == 2
 
 
 def test_resolve_ttl_and_fallbacks():
@@ -191,7 +221,7 @@ def test_resolve_without_relay():
     with raises("unknown_peer"):
         peers.resolve(bob.get_ace_id())
     peers.pin_registration_file(
-        create_registration_file(bob, name="B", endpoint="https://b.example/a"), pinned_at=0
+        create_registration_file(bob, name="B", endpoint="https://b.example/a")
     )
     assert peers.resolve(bob.get_ace_id(), max_age_seconds=0).ace_id == bob.get_ace_id()
     with raises("invalid_argument"):

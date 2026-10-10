@@ -14,7 +14,10 @@ from ace import (
     Inbox,
     MemoryStore,
     PeerStore,
+    RelayClient,
     ReplayDetector,
+    SecureMailbox,
+    SecureTransport,
     ThreadEvent,
     ThreadStateMachine,
     _xwing,
@@ -104,11 +107,9 @@ def test_salt_conversation_and_sign_data():
     sd = V["signData"]
     mp = sd["messagePayload"]
     payload = encode_payload(
-        mp["type"],
         mp["to"],
         mp["conversationId"],
         mp["messageId"],
-        mp["threadId"],
         base64.b64decode(mp["kemCiphertext"]),
         base64.b64decode(mp["ciphertext"]),
     )
@@ -138,7 +139,7 @@ def test_encrypted_message():
         seed,
         env["conversationId"],
     )
-    assert json.loads(raw) == em["expectedBody"]
+    assert json.loads(raw)["body"] == em["expectedBody"]
 
 
 # --- envelopes / bodies ---------------------------------------------------------------------------
@@ -276,7 +277,7 @@ def _auth_request(r: dict) -> RelayAuthRequest:
         return RelayAuthRequest.unregister()
     if r["action"] == "webhook":
         return RelayAuthRequest.webhook(r["method"], r["url"], r["secret"])
-    return RelayAuthRequest.intent(r["need"], r["tags"], r["maxPrice"], r["currency"], r["ttl"])
+    return RelayAuthRequest.intent(r["need"], r["tags"], r.get("ext"), r["ttl"])
 
 
 def test_auth_vector_count():
@@ -362,7 +363,7 @@ def test_peer_binding(case):
                 cand = verify_peer_record(step["record"])
             else:
                 cand = verify_registration_file(
-                    step["registrationFile"], pinned_at=step["pinnedAt"]
+                    step["registrationFile"]
                 )
             pin, got = adopt_decision(pin, cand, case["now"])
         except ACEError as exc:
@@ -429,20 +430,25 @@ def test_relay_errors(v):
 
 
 @pytest.fixture(scope="module")
-def direct_inbox():
-    store = MemoryStore()
-    inbox = Inbox.open(agent("alice"), store, PeerStore(store), lambda m: None)
-    yield inbox
-    inbox.close()
+def direct_mailbox():
+    # The request parsing under test never reaches the MLS engine: none is loaded.
+    store, alice = MemoryStore(), agent("alice")
+    inbox = Inbox.open(alice, store, PeerStore(store), lambda m: None)
+    mailbox = SecureMailbox(
+        alice, store, PeerStore(store), RelayClient("https://relay.example"),
+        SecureTransport(alice, None, store), inbox,
+    )
+    yield mailbox
+    mailbox.close()
 
 
 @pytest.mark.parametrize("v", V["directReceive"]["cases"], ids=lambda v: v["name"])
-def test_direct_receive(v, direct_inbox):
+def test_direct_receive(v, direct_mailbox):
     assert V["directReceive"]["maxDirectBodyBytes"] == MAX_DIRECT_BODY_BYTES
     raw = bytes.fromhex(v["bodyHex"]) if "bodyHex" in v else v["body"].encode("utf-8")
     if "padTo" in v:
         raw = raw.ljust(v["padTo"], b" ")
-    reply = direct_inbox.receive_direct(raw)
+    reply = direct_mailbox.receive_direct(raw)
     assert (reply.status, reply.body) == (v["status"], {"ok": False, "error": v["error"]})
 
 

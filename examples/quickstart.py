@@ -52,11 +52,9 @@ print(bob_threads.allowed_types(parsed.conversation_id, "translation-1", bob.get
 
 # --- 2. Durable pipeline: Outbox -> transport -> Inbox ------------------------------------
 
-# Use FileStore("~/.ace/state") for real agents. With a relay:
-#   relay = RelayClient("https://relay.aceprotocol.org"); relay.register(identity)
-#   peers = PeerStore(store, relay=relay); outbox.deliver(id, relay.send)
-#   result = inbox.pull(relay)  # result.outcomes (ReceiveOutcome list), result.blocked
-#   for outcome in inbox.follow(relay, stop=stop, on_live=lambda: print("live")): ...
+# Application-layer demonstration only. For network delivery use SecureTransport and
+# SecureMailbox / SecureRelayReplies from ace.secure_mailbox (see secure_relay.py).
+# Never expose this inner Inbox directly as an application's network receiver.
 alice_store, bob_store = MemoryStore(), MemoryStore()
 alice_peers, bob_peers = PeerStore(alice_store), PeerStore(bob_store)
 alice_peers.pin_registration_file(bob_reg)
@@ -69,20 +67,19 @@ def on_message(m):
     received[(m.from_id, m.message_id)] = m
 
 
-inbox = Inbox.open(bob, bob_store, bob_peers, on_message)
-outbox = Outbox.open(alice, alice_store)
+inbox = Inbox.open(bob, bob_store, bob_peers, on_message, commerce=True)
+outbox = Outbox.open(alice, alice_store, commerce=True)
 
 pending = outbox.stage(
     alice_peers.resolve(bob.get_ace_id()), "rfq", {"need": "Summarize a PDF"}, thread_id="deal-1"
 )
 
 
-# The transport here hands the envelope straight to Bob's direct endpoint handler: the HTTP
-# request body is {"message": envelope}, answered with receive_direct's status and body.
-# Across the network, use post_direct / deliver_direct_or_relay instead.
+# In-process application boundary: the receiver's Inbox decodes the raw envelope bytes.
+# On the network, SecureMailbox feeds it the same bytes as authenticated MLS plaintext.
 def transport(env):
-    reply = inbox.receive_direct(json.dumps({"message": env.to_dict()}).encode())
-    print(reply.outcome.kind if reply.outcome else reply.body)
+    outcome = inbox.receive(json.dumps(env.to_dict()).encode())
+    print(outcome.kind)
 
 
 outbox.deliver(pending.request_id, transport)

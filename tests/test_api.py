@@ -7,6 +7,16 @@ from ace.errors import _ALL_CODES
 from .helpers import raises
 
 EXPECTED = {
+    "ResourcePolicy",
+    "EXECUTION_REQUEST_TYPE",
+    "EXECUTION_REQUEST_SCHEMA",
+    "EXECUTION_REQUEST_SCHEMA_DIGEST",
+    "parse_execution_request",
+    "create_execution_grant",
+    "execution_grant_digest",
+    "execution_intent_digest",
+    "is_execution_units",
+    "verify_execution_grant_chain",
     "ACEIdentity",
     "SigningScheme",
     "IdentityTier",
@@ -14,11 +24,24 @@ EXPECTED = {
     "RegistrationFile",
     "SigningConfig",
     "Capability",
-    "PricingInfo",
-    "ChainInfo",
     "AgentProfile",
-    "ProfilePricing",
     "DiscoverQuery",
+    "COMMERCE_EXT",
+    "ExtCarrier",
+    "ExtMap",
+    "CommerceProfileExt",
+    "CommerceIntentExt",
+    "CommercePricing",
+    "CommerceAccount",
+    "validate_ext",
+    "validate_commerce_ext",
+    "ext_canonical",
+    "commerce_ext",
+    "intent_commerce_ext",
+    "MAX_EXT_KEYS",
+    "MAX_EXT_KEY_BYTES",
+    "MAX_EXT_BYTES",
+    "MAX_EXT_DEPTH",
     "PeerRecord",
     "ACEMessage",
     "MessageType",
@@ -84,6 +107,15 @@ EXPECTED = {
     "create_message",
     "parse_message",
     "validate_body",
+    "known_schema_digest",
+    "AuditCheckpoint",
+    "AuditTree",
+    "audit_commitment",
+    "create_audit_opening",
+    "create_audit_checkpoint",
+    "verify_audit_checkpoint",
+    "verify_audit_inclusion",
+    "verify_audit_consistency",
     "VerifiedPeer",
     "verify_peer_record",
     "verify_registration_file",
@@ -98,7 +130,6 @@ EXPECTED = {
     "ReplayDetector",
     "ThreadStateMachine",
     # pipeline
-    "ReceiveSource",
     "ReceiveOutcome",
     "PendingSend",
     "Intent",
@@ -111,6 +142,21 @@ EXPECTED = {
     "RelayClient",
     "MemoryStore",
     "FileStore",
+    "check_key",
+    "check_lock_name",
+    # secure network boundary (13)
+    "SecureMailbox",
+    "SecureRelayReplies",
+    "SecureTransport",
+    "PairwiseMLS",
+    "NativeMLSEngine",
+    "MLSError",
+    # integration glue
+    "open_secure_mailbox",
+    "secure_transport_for",
+    "deliver_secure",
+    "InboxPrincipal",
+    "inbox_principal_from_own_record",
     # webhooks
     "Webhook",
     "WebhookNotification",
@@ -144,6 +190,13 @@ EXPECTED = {
     "DecisionBody",
     "ReportBody",
     "__version__",
+    "AuditWitnessReceipt",
+    "AuditWitnessPolicy",
+    "audit_checkpoint_digest",
+    "create_audit_witness_receipt",
+    "verify_audit_witness_receipt",
+    "verify_audit_witness_quorum",
+    "SchemaValidator",
 }
 
 
@@ -164,7 +217,7 @@ def test_principal_helpers_exported():
         principal_payload,
     )
 
-    assert PRINCIPAL_ROLES == ("controller", "agent") and callable(principal_payload)
+    assert PRINCIPAL_ROLES == ("controller", "delegate") and callable(principal_payload)
     assert is_caip10("eip155:1:0x" + "ab" * 20) and not is_caip10("nope")
     assert load_request_record(ace.MemoryStore(), "ab" * 32, "x") is None
     with raises("invalid_principal"):
@@ -189,10 +242,14 @@ def test_removed_names_are_gone():
         "MAX_PAYLOAD_SIZE",
         "SYSTEM_TYPES",
         "DiscoverAgent",
+        "ReceiveSource",
     ):
-        assert name not in ace.__all__
+        assert name not in ace.__all__ and not hasattr(ace, name)
     assert not hasattr(ace.SoftwareIdentity, "to_registration_file")
-    assert not hasattr(ace.Inbox, "sweep")
+    for name in ("sweep", "pull", "follow", "cursor", "receive_direct"):  # SecureMailbox owns them
+        assert not hasattr(ace.Inbox, name)
+    assert ace.PullResult is ace.secure_mailbox.PullResult
+    assert ace.DirectReply is ace.secure_mailbox.DirectReply
     assert not hasattr(ace.ReplayDetector, "covers")
     public = {n for n in dir(ace.ThreadStore) if not n.startswith("_")}
     assert public == {"get", "list", "remove", "allowed_types"}
@@ -230,11 +287,13 @@ def test_limits():
 
 
 def test_error_categories():
-    assert len(_ALL_CODES) == 39
+    assert len(_ALL_CODES) == 40
     for code in ("relay_unavailable", "relay_protocol_error", "fetch_failed", "direct_unavailable"):
         e = ACEError(code)
         assert e.category == "transient" and e.is_transient
     assert ACEError("direct_rejected").category == "permanent"
+    rejected = ACEError("delivery_rejected", "x", remote_code="wrong_role")
+    assert rejected.category == "permanent" and rejected.remote_code == "wrong_role"
     for code in (
         "storage_failed",
         "identity_unavailable",

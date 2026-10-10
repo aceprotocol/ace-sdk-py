@@ -27,6 +27,7 @@ from .discovery import (
     validate_profile,
 )
 from .errors import ACEError
+from .ext import ext_canonical, validate_ext
 from .identity import compute_ace_id, signing_address
 from .limits import KEM_PUBLIC_KEY_SIZE, TIMESTAMP_WINDOW_SECONDS
 from .types import (
@@ -34,7 +35,6 @@ from .types import (
     ACEIdentity,
     AgentProfile,
     Capability,
-    ChainInfo,
     HardwareBacking,
     IdentityTier,
     PrincipalRecord,
@@ -53,17 +53,32 @@ def create_registration_file(
     tier: IdentityTier = 0,
     hardware_backing: HardwareBacking | None = None,
     capabilities: list[Capability] | None = None,
-    settlement: list[str] | None = None,
-    chains: list[ChainInfo] | None = None,
+    ext: dict | None = None,
     principal: "PrincipalRecord | dict | None" = None,
+    timestamp: int | None = None,
 ) -> RegistrationFile:
     """Build the registration file (02) of any identity, software or hardware-backed;
-    raises ``invalid_registration`` if the inputs are invalid."""
+    raises ``invalid_registration`` if the inputs are invalid (``invalid_profile`` for a bad
+    ``ext``). Commerce data (chains, settlement, accounts, pricing) goes under
+    ``ext["urn:ace:commerce:1"]`` (04 § Commerce extension)."""
     from .discovery import verify_registration_file
 
     scheme = identity.get_signing_scheme()
     signing_public_key = bytes(identity.get_signing_public_key())
+    registered_at = unix_now(None) if timestamp is None else timestamp
+    check_wire_int(registered_at, "timestamp")
+    enc = to_base64(bytes(identity.get_encryption_public_key()))
+    signature = encode_signature(
+        identity.sign(
+            binding_sign_data(
+                identity.get_ace_id(), registered_at, enc, to_base64(signing_public_key)
+            )
+        ),
+        scheme,
+    )
     reg = RegistrationFile(
+        registered_at=registered_at,
+        registration_signature=signature,
         ace="1.0",
         id=identity.get_ace_id(),
         name=name,
@@ -78,11 +93,10 @@ def create_registration_file(
         hardware_backing=hardware_backing,
         description=description,
         capabilities=capabilities,
-        settlement=settlement,
-        chains=chains,
+        ext=validate_ext(ext, "profile"),
         principal=None if principal is None else PrincipalRecord.from_dict(principal),
     )
-    verify_registration_file(reg, pinned_at=0)
+    verify_registration_file(reg)
     if reg.principal is not None:
         # A file being published must carry a principal valid now: no expired or
         # future-dated record (R-P44); ``invalid_principal`` otherwise.
@@ -91,13 +105,16 @@ def create_registration_file(
         validate_principal_record(reg.principal, signing_public_key, unix_now(None))
     return reg
 
+
 _KEEP = object()
 
 
 def registration_payload(enc_b64: str, sig_b64: str, scheme: str, profile: object = _KEEP) -> bytes:
-    """The ``register-request`` payload (02).
+    """The ``register-request`` payload (02 § Registration authorization).
 
-    ``profile``: _KEEP, None, or a validated AgentProfile.
+    ``profile``: _KEEP, None, or a validated AgentProfile. ``replace`` appends, after ``mode``:
+    name, description, image, tags, capabilities, endpoint, the canonical JSON of ``ext`` (or
+    empty), then the principal group (``present``/``absent`` + 8 fields): 16 fields in all.
     """
     fields = (enc_b64, sig_b64, scheme)
     if profile is _KEEP:
@@ -105,7 +122,7 @@ def registration_payload(enc_b64: str, sig_b64: str, scheme: str, profile: objec
     if profile is None:
         return encode_payload(*fields, "remove")
     assert isinstance(profile, AgentProfile)
-    pr, pp = profile.pricing, profile.principal
+    pp = profile.principal
     return encode_payload(
         *fields,
         "replace",
@@ -114,11 +131,8 @@ def registration_payload(enc_b64: str, sig_b64: str, scheme: str, profile: objec
         profile.image or "",
         encode_payload(*(profile.tags or [])),
         encode_payload(*(profile.capabilities or [])),
-        encode_payload(*(profile.chains or [])),
         profile.endpoint or "",
-        "present" if pr else "absent",
-        pr.currency if pr else "",
-        (pr.max_amount or "") if pr else "",
+        ext_canonical(profile.ext),
         "present" if pp else "absent",
         pp.account if pp else "",
         ",".join(pp.roles) if pp else "",

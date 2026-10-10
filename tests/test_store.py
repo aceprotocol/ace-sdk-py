@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import json
+import fcntl
 import multiprocessing
 import os
-import socket
 import stat
 import threading
 import time
@@ -125,11 +124,9 @@ def test_file_permissions_and_layout(tmp_path):
     assert stat.S_IMODE(os.stat(root / "deliveries" / "abc.json").st_mode) == 0o600
     assert not [p for p in (root / "deliveries").iterdir() if p.name.startswith(".tmp-")]
     with fs.lock("threads"):
-        info = json.loads((root / "locks" / "threads.lock").read_text())
-        assert info["pid"] == os.getpid() and info["host"] == socket.gethostname()
-        assert isinstance(info["createdAt"], int)
+        assert (root / "locks" / "threads.lock").is_file()
         assert fs.list("") == ["deliveries/abc.json"]  # lock files are not keys
-    assert not (root / "locks" / "threads.lock").exists()
+    assert (root / "locks" / "threads.lock").exists()
     with raises("invalid_argument"):
         fs.write("locks/x.lock", b"")
 
@@ -167,51 +164,19 @@ def test_file_persists_across_instances(tmp_path):
     assert FileStore(tmp_path / "s").read("replay.json") == b"{}"
 
 
-def test_stale_lock_dead_pid(tmp_path):
+def test_kernel_lock_and_permanent_inode(tmp_path):
     fs = FileStore(tmp_path / "s")
-    p = multiprocessing.get_context("spawn").Process(target=_noop)
-    p.start()
-    p.join()
-    (tmp_path / "s" / "locks").mkdir(mode=0o700)
-    (tmp_path / "s" / "locks" / "peers.lock").write_text(
-        json.dumps({"createdAt": 1, "host": socket.gethostname(), "pid": p.pid})
-    )
     with fs.lock("peers", timeout=0):
         pass
-
-
-def test_stale_lock_other_host_or_live_pid_is_respected(tmp_path):
-    fs = FileStore(tmp_path / "s")
-    (tmp_path / "s" / "locks").mkdir(mode=0o700)
-    lock = tmp_path / "s" / "locks" / "peers.lock"
-    lock.write_text(json.dumps({"createdAt": 1, "host": "elsewhere", "pid": 999999}))
-    with raises("lock_busy"):
-        fs.lock("peers", timeout=0.1)
-    lock.write_text(json.dumps({"createdAt": 1, "host": socket.gethostname(), "pid": os.getppid()}))
-    with raises("lock_busy"):
-        fs.lock("peers", timeout=0.1)
-
-
-def test_unparseable_lock(tmp_path):
-    fs = FileStore(tmp_path / "s")
-    (tmp_path / "s" / "locks").mkdir(mode=0o700)
-    lock = tmp_path / "s" / "locks" / "threads.lock"
-    lock.write_text("garbage")
-    with raises("lock_busy"):
-        fs.lock("threads", timeout=0.1)  # fresh: respected
-    old = time.time() - 120
-    os.utime(lock, (old, old))
-    with fs.lock("threads", timeout=0):
+    path = tmp_path / "s" / "locks" / "peers.lock"
+    inode = path.stat().st_ino
+    with path.open("r+") as fd:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with raises("lock_busy"):
+            fs.lock("peers", timeout=0.1)
+    with fs.lock("peers", timeout=0):
         pass
-
-
-def test_release_only_own_content(tmp_path):
-    fs = FileStore(tmp_path / "s")
-    held = fs.lock("threads")
-    lock = tmp_path / "s" / "locks" / "threads.lock"
-    lock.write_text(json.dumps({"createdAt": 2, "host": "other", "pid": 1}))
-    held.release()
-    assert lock.exists()
+    assert path.stat().st_ino == inode
 
 
 # --- two processes -------------------------------------------------------------------------

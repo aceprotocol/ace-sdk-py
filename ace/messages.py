@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
-from typing import Callable
+from typing import Any, Callable
 
 from ._encoding import (
     check_json_value,
@@ -13,6 +15,7 @@ from ._encoding import (
     encode_signature,
     is_conversation_id,
     is_message_id,
+    is_sha256_hex,
     is_thread_id,
     loads_body,
     to_base64,
@@ -123,7 +126,7 @@ def validate_body(type_: MessageType, body: dict) -> None:
         raise ACEError("invalid_argument", "unknown message type")
     if type(body) is not dict:
         raise ACEError("invalid_body", "body must be a JSON object")
-    for name, kind in _SCHEMAS[type_]:
+    for name, kind in _SCHEMAS.get(type_, ()):
         v = body.get(name)
         if v is None:
             if kind in (_STR, _OBJ):
@@ -158,10 +161,57 @@ def decode_body(type_: MessageType, raw: bytes) -> dict:
     return body
 
 
+# --- installed schemas --------------------------------------------------------------
+
+#: A deterministic validator installed with ``Inbox.open(schemas=...)`` /
+#: ``Outbox.open(schemas=...)``, keyed by ``schemaDigest``. It receives
+#: ``{"type", "schemaDigest", "threadId", "body"}`` and returns None when the body is valid.
+#: Raising an ``ACEError`` with a permanent code rejects the message with that code; any other
+#: exception rejects it as ``invalid_body``. The Inbox quarantines, ``Outbox.stage`` raises.
+SchemaValidator = Callable[[dict[str, Any]], None]
+
+
+def check_schemas(schemas: object) -> dict[str, SchemaValidator]:
+    """Validate an ``Inbox.open`` / ``Outbox.open`` ``schemas`` option (``invalid_argument``)."""
+    if schemas is None:
+        return {}
+    if not isinstance(schemas, dict) or not all(
+        is_sha256_hex(digest) and callable(validator) for digest, validator in schemas.items()
+    ):
+        raise ACEError("invalid_argument", "schemas must map 64-hex schemaDigest keys to callables")
+    return dict(schemas)
+
+
+def run_schema_validator(
+    schemas: dict[str, SchemaValidator],
+    type_: str,
+    schema_digest: str,
+    thread_id: str | None,
+    body: dict,
+) -> None:
+    """Run the validator installed for ``schema_digest``, if any (see ``SchemaValidator``)."""
+    validator = schemas.get(schema_digest)
+    if validator is None:
+        return
+    copy = json.loads(dumps_body(body))  # a JSON round-trip copy: the validator cannot mutate
+    try:
+        validator(
+            {"type": type_, "schemaDigest": schema_digest, "threadId": thread_id, "body": copy}
+        )
+    except ACEError as exc:
+        if exc.category == "permanent":
+            raise
+        raise ACEError("invalid_body", f"schema validator failed: {exc.code}") from exc
+    except Exception as exc:
+        raise ACEError(
+            "invalid_body", f"schema validator rejected the body: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
 # --- helpers ----------------------------------------------------------------------
 
 
-def _event(env: ACEMessage) -> ThreadEvent:
+def _event(env: ParsedMessage) -> ThreadEvent:
     return ThreadEvent(
         env.conversation_id,
         env.thread_id,
@@ -176,20 +226,85 @@ def _event(env: ACEMessage) -> ThreadEvent:
 # --- create -----------------------------------------------------------------------
 
 
+_SCHEMA_KIND_NAMES = {
+    "str": "str",
+    "opt_str": "optStr",
+    "obj": "obj",
+    "opt_obj": "optObj",
+    "opt_ttl": "optTtl",
+}
+
+
+def _schema_digest(type_: str, fields: tuple[tuple[str, str], ...]) -> str:
+    descriptor = {
+        "type": type_,
+        "fields": [[name, _SCHEMA_KIND_NAMES[kind]] for name, kind in fields],
+        "outcomes": list(_OUTCOMES.get(type_, ())),
+        "version": 1,
+    }
+    return hashlib.sha256(
+        json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+_KNOWN_SCHEMA_DIGESTS = {t: _schema_digest(t, fields) for t, fields in _SCHEMAS.items()}
+
+
+def known_schema_digest(type_: str) -> str | None:
+    return _KNOWN_SCHEMA_DIGESTS.get(type_)
+
+
+def private_content(
+    type_: str, body: dict, thread_id: str | None, schema_digest: str | None
+) -> dict:
+    expected = known_schema_digest(type_)
+    digest = schema_digest if schema_digest is not None else expected
+    if not is_sha256_hex(digest) or (expected is not None and digest != expected):
+        raise ACEError("invalid_body", "a matching immutable schemaDigest is required")
+    content = {
+        "type": type_,
+        "body": body,
+        "schemaDigest": digest,
+        **({} if thread_id is None else {"threadId": thread_id}),
+    }
+    check_json_value(content)
+    return content
+
+
+def decode_private_content(raw: bytes) -> dict:
+    content = loads_body(raw)
+    if not set(content) <= {"type", "body", "schemaDigest", "threadId"}:
+        raise ACEError("invalid_body", "unknown private content field")
+    if (
+        not is_message_type(content.get("type"))
+        or type(content.get("body")) is not dict
+        or not isinstance(content.get("schemaDigest"), str)
+    ):
+        raise ACEError("invalid_body", "invalid private content")
+    if "threadId" in content and not is_thread_id(content["threadId"]):
+        raise ACEError("invalid_body", "invalid private threadId")
+    result = private_content(
+        content["type"], content["body"], content.get("threadId"), content["schemaDigest"]
+    )
+    validate_body(result["type"], result["body"])
+    return result
+
+
 def create_message(
     sender: ACEIdentity,
     recipient: VerifiedPeer,
     type_: MessageType,
     body: dict,
-    threads: ThreadStateMachine,
+    threads: ThreadStateMachine | None = None,
     *,
     thread_id: str | None = None,
     timestamp: int | None = None,
+    schema_digest: str | None = None,
 ) -> ACEMessage:
     """Encrypt, sign and record an outbound message."""
     if not isinstance(recipient, VerifiedPeer):
         raise ACEError("invalid_argument", "recipient must be a VerifiedPeer")
-    if not isinstance(threads, ThreadStateMachine):
+    if threads is not None and not isinstance(threads, ThreadStateMachine):
         raise ACEError("invalid_argument", "threads must be a ThreadStateMachine")
     # 1. type, threadId, local identity
     if not is_message_type(type_):
@@ -198,10 +313,10 @@ def create_message(
         raise ACEError(
             "invalid_argument", "thread_id must be 1..256 code points without control characters"
         )
-    if thread_id is None and is_economic_type(type_):
+    if threads is not None and thread_id is None and is_economic_type(type_):
         raise ACEError("invalid_argument", "economic messages require thread_id")
     from_id = sender.get_ace_id()
-    if threads.local_ace_id != from_id:
+    if threads is not None and threads.local_ace_id != from_id:
         raise ACEError("invalid_argument", "threads.local_ace_id must be the sender")
     ts = unix_now(None) if timestamp is None else timestamp
     check_wire_int(ts, "timestamp")
@@ -219,30 +334,30 @@ def create_message(
         conversation_id, thread_id, type_, message_id, ts, from_id, recipient.ace_id
     )
     # 4. state machine pre-check
-    threads.check(event, body)
+    if threads is not None:
+        threads.check(event, body)
     # 5. serialize
-    plaintext = dumps_body(body)
+    plaintext = dumps_body(private_content(type_, body, thread_id, schema_digest))
     if len(plaintext) > MAX_PLAINTEXT_BYTES:
         raise ACEError("limit_exceeded", f"body exceeds {MAX_PLAINTEXT_BYTES} bytes")
     # 6. encrypt
     kem_ciphertext, payload = encrypt(plaintext, recipient.encryption_public_key, conversation_id)
     scheme = sender.get_signing_scheme()
     env = ACEMessage(
-        ace="1.0",
+        ace="2.0",
         message_id=message_id,
         from_id=from_id,
         to_id=recipient.ace_id,
         conversation_id=conversation_id,
-        type=type_,
         timestamp=ts,
         encryption=EncryptionEnvelope(to_base64(kem_ciphertext), to_base64(payload)),
         signature=SignatureEnvelope(scheme, ""),
-        thread_id=thread_id,
     )
     # 7. sign
     env.signature.value = encode_signature(sender.sign(message_sign_data(env)), scheme)
     # 8. commit
-    threads.apply(event, body)
+    if threads is not None:
+        threads.apply(event, body)
     return env
 
 
@@ -254,7 +369,7 @@ def parse_message(
     receiver: ACEIdentity,
     sender: VerifiedPeer,
     *,
-    threads: ThreadStateMachine,
+    threads: ThreadStateMachine | None = None,
     replay: ReplayDetector,
     floor: int | None = None,
     clock: Callable[[], int] | None = None,
@@ -267,17 +382,21 @@ def parse_message(
     invalid_signature -> replay commit -> decrypt -> invalid_body -> state machine /
     principal rules.
 
-    Principal types (``request``, ``decision``, ``report``) need ``principal`` (the
-    receiver's :class:`PrincipalContext`); without it they are ``wrong_principal``.
+    ``principal`` (the receiver's :class:`PrincipalContext`) installs the account policy:
+    principal types (``request``, ``decision``, ``report``) then pass 09 § Same-Account
+    Rules or fail with ``wrong_principal``. Without it they are plain data, never verified
+    authority (06 step 7); receiving a message never authorizes execution.
     """
     if principal is not None and not isinstance(principal, PrincipalContext):
         raise ACEError("invalid_argument", "principal must be a PrincipalContext")
     if not isinstance(sender, VerifiedPeer):
         raise ACEError("invalid_argument", "sender must be a VerifiedPeer")
-    if not isinstance(threads, ThreadStateMachine) or not isinstance(replay, ReplayDetector):
+    if (threads is not None and not isinstance(threads, ThreadStateMachine)) or not isinstance(
+        replay, ReplayDetector
+    ):
         raise ACEError("invalid_argument", "threads and replay are required")
     receiver_id = receiver.get_ace_id()
-    if threads.local_ace_id != receiver_id:
+    if threads is not None and threads.local_ace_id != receiver_id:
         raise ACEError("invalid_argument", "threads.local_ace_id must be the receiver")
     # 1
     env = revalidate(env)
@@ -323,28 +442,41 @@ def parse_message(
         raise ACEError(
             "identity_unavailable", f"identity decrypt failed: {type(exc).__name__}"
         ) from exc
-    # 11-12
-    body = decode_body(env.type, plaintext)
-    # 13
-    if is_economic_type(env.type):
-        threads.apply(_event(env), body)
-    elif is_principal_type(env.type):
-        _check_principal(env, body, sender, principal, now)
-    return ParsedMessage(
+    content = decode_private_content(plaintext)
+    parsed = ParsedMessage(
         message_id=env.message_id,
         from_id=env.from_id,
         to_id=env.to_id,
         conversation_id=env.conversation_id,
-        type=env.type,
-        thread_id=env.thread_id,
         timestamp=env.timestamp,
-        body=body,
+        type=content["type"],
+        thread_id=content.get("threadId"),
+        body=content["body"],
+        schema_digest=content["schemaDigest"],
     )
+    apply_receive_rules(parsed, sender, threads=threads, principal=principal, now=now)
+    return parsed
+
+
+def apply_receive_rules(
+    parsed: ParsedMessage,
+    sender: VerifiedPeer,
+    *,
+    threads: ThreadStateMachine | None,
+    principal: PrincipalContext | None,
+    now: int,
+) -> None:
+    """06 step 7 on a decrypted message: the thread state machine (economic types, when
+    ``threads`` is given) and the principal rules (principal types, when ``principal`` is
+    given). ``parse_message`` runs it last; the Inbox runs it under its own locks."""
+    if threads is not None and is_economic_type(parsed.type):
+        threads.apply(_event(parsed), parsed.body)
+    if principal is not None and is_principal_type(parsed.type):
+        _check_principal(parsed, sender, principal, now)
 
 
 def _check_principal(
-    env: ACEMessage,
-    body: dict,
+    env: ParsedMessage,
     sender: VerifiedPeer,
     ctx: PrincipalContext | None,
     now: int,
@@ -352,7 +484,7 @@ def _check_principal(
     """06 step 7 for principal types (09 § Same-Account Rules)."""
     check_principal_rules(
         env.type,
-        body,
+        env.body,
         conversation_id=env.conversation_id,
         sender_principal=sender.principal,
         sender_signing_public_key=sender.signing_public_key,

@@ -20,6 +20,7 @@ from ._encoding import (
 )
 from ._signing import build_sign_data, encode_payload, verify_signature
 from .errors import ACEError
+from .ext import ext_canonical, validate_ext
 from .limits import MAX_INBOX_PAGE, TIMESTAMP_WINDOW_SECONDS
 from .types import SIGNING_SCHEMES, ACEIdentity, SigningScheme
 
@@ -35,8 +36,10 @@ class RelayAuthRequest:
     """What an authenticated relay call signs. Build with the classmethods.
 
     ``listen(since)``, ``inbox(since, limit)``, ``unregister()``,
-    ``intent(need, tags, max_price, currency, ttl)``, ``webhook(method, url, secret)``.
-    ``since`` is ``"-"`` or ``<ms>-<seq>``.
+    ``intent(need, tags, ext, ttl)``, ``webhook(method, url, secret)``.
+    ``since`` is ``"-"`` or ``<ms>-<seq>``. ``ext`` is the intent's namespaced extensions
+    (02 § Profile Fields rules, ``invalid_argument``), stored re-canonicalised; ``None`` when
+    absent or empty.
     """
 
     action: Literal["listen", "inbox", "unregister", "intent", "webhook"]
@@ -44,8 +47,7 @@ class RelayAuthRequest:
     limit: int | None = None
     need: str | None = None
     tags: tuple[str, ...] = ()
-    max_price: str | None = None
-    currency: str | None = None
+    ext: dict | None = None
     ttl: int | None = None
     method: str | None = None
     url: str = ""
@@ -65,9 +67,7 @@ class RelayAuthRequest:
                 isinstance(t, str) and "," not in t for t in self.tags
             ):
                 raise _bad("tags must be strings without ','")
-            for v in (self.max_price, self.currency):
-                if v is not None and not isinstance(v, str):
-                    raise _bad("max_price and currency must be strings or None")
+            object.__setattr__(self, "ext", validate_ext(self.ext, "intent"))
             if type(self.ttl) is not int or wire_int(self.ttl) is None:
                 raise _bad("ttl must be an integer in [0, 2^53-1]")
         elif a == "webhook":
@@ -105,15 +105,14 @@ class RelayAuthRequest:
         cls,
         need: str,
         tags: Sequence[str] = (),
-        max_price: str | None = None,
-        currency: str | None = None,
+        ext: dict | None = None,
         ttl: int = 0,
     ) -> "RelayAuthRequest":
+        """``POST /v1/intents``; put ``maxPrice`` / ``currency`` under
+        ``ext["urn:ace:commerce:1"]`` (04 § Commerce extension)."""
         if isinstance(tags, str):
             raise _bad("tags must be a sequence of strings")
-        return cls(
-            "intent", need=need, tags=tuple(tags), max_price=max_price, currency=currency, ttl=ttl
-        )
+        return cls("intent", need=need, tags=tuple(tags), ext=ext, ttl=ttl)
 
     @classmethod
     def webhook(cls, method: str, url: str = "", secret: str = "") -> "RelayAuthRequest":
@@ -131,8 +130,7 @@ class RelayAuthRequest:
         return encode_payload(
             self.need,
             ",".join(self.tags),
-            self.max_price or "",
-            self.currency or "",
+            ext_canonical(self.ext),
             decimal(self.ttl),  # type: ignore[arg-type]
         )
 

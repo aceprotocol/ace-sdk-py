@@ -146,11 +146,33 @@ def test_create_registration_file_for_any_identity(scheme):
         endpoint="https://hw.example/ace",
         tier=1,
         hardware_backing="secure-enclave",
-        settlement=["x402"],
+        ext={"urn:ace:commerce:1": {"settlement": ["x402"]}},
     )
     reg = create_registration_file(hw, **opts)
     assert reg == create_registration_file(sw, **opts)
     assert reg.signing.address == sw.get_address()
-    assert verify_registration_file(reg, pinned_at=1).ace_id == sw.get_ace_id()
+    assert verify_registration_file(reg).ace_id == sw.get_ace_id()
     with raises("invalid_registration"):
         create_registration_file(hw, name="", endpoint="https://hw.example/ace")
+
+
+def test_registration_binds_encryption_key_and_timestamp():
+    import copy
+
+    from ace import verify_registration_file
+    from ace._encoding import to_base64
+
+    victim, attacker = SoftwareIdentity.generate("ed25519"), SoftwareIdentity.generate("ed25519")
+    reg = create_registration_file(
+        victim, name="Victim", endpoint="https://victim.example"
+    ).to_dict()
+    assert verify_registration_file(reg).ace_id == victim.get_ace_id()
+    substituted = copy.deepcopy(reg)
+    substituted["signing"]["encryptionPublicKey"] = to_base64(attacker.get_encryption_public_key())
+    for bad in [
+        substituted,
+        {**reg, "registeredAt": reg["registeredAt"] + 1},
+        {k: v for k, v in reg.items() if k != "registrationSignature"},
+    ]:
+        with raises("invalid_registration"):
+            verify_registration_file(bad)

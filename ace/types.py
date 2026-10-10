@@ -6,19 +6,28 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Protocol, TypedDict, Union
 
 from .errors import ACEError, ACEErrorCode
+from .ext import NAMESPACED_ID_RE, ExtMap, validate_ext
 
 SigningScheme = Literal["ed25519", "secp256k1"]
 IdentityTier = Literal[0, 1]
 HardwareBacking = Literal["secure-enclave", "tpm", "hsm", "tee"]
 
-MessageType = Literal[
-    "rfq", "offer", "accept", "reject", "invoice", "receipt", "deliver", "confirm", "info", "text",
-    "request", "decision", "report",
-]
+MessageType = str
 
 MESSAGE_TYPES: tuple[str, ...] = (
-    "rfq", "offer", "accept", "reject", "invoice", "receipt", "deliver", "confirm", "info", "text",
-    "request", "decision", "report",
+    "rfq",
+    "offer",
+    "accept",
+    "reject",
+    "invoice",
+    "receipt",
+    "deliver",
+    "confirm",
+    "info",
+    "text",
+    "request",
+    "decision",
+    "report",
 )
 ECONOMIC_TYPES: tuple[str, ...] = MESSAGE_TYPES[:8]
 PRINCIPAL_TYPES: tuple[str, ...] = MESSAGE_TYPES[10:]
@@ -34,7 +43,9 @@ def is_signing_scheme(s: object) -> bool:
 
 
 def is_message_type(t: object) -> bool:
-    return isinstance(t, str) and t in MESSAGE_TYPES
+    return isinstance(t, str) and (
+        t in MESSAGE_TYPES or (len(t) <= 256 and NAMESPACED_ID_RE.fullmatch(t) is not None)
+    )
 
 
 def is_economic_type(t: object) -> bool:
@@ -97,15 +108,6 @@ def _opt_str_list(d: dict, key: str, code: ACEErrorCode, what: str) -> list[str]
 
 # --- registration file ----------------------------------------------------------
 
-@dataclass
-class PricingInfo:
-    model: Literal["per-call", "per-token", "per-hour", "flat"]
-    amount: str
-    currency: str
-
-    def to_dict(self) -> dict[str, Any]:
-        return {"model": self.model, "amount": self.amount, "currency": self.currency}
-
 
 @dataclass
 class Capability:
@@ -113,7 +115,6 @@ class Capability:
     description: str
     input: str | None = None
     output: str | None = None
-    pricing: PricingInfo | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"id": self.id, "description": self.description}
@@ -121,15 +122,7 @@ class Capability:
             d["input"] = self.input
         if self.output is not None:
             d["output"] = self.output
-        if self.pricing is not None:
-            d["pricing"] = self.pricing.to_dict()
         return d
-
-
-@dataclass
-class ChainInfo:
-    network: str  # CAIP-2
-    address: str
 
 
 @dataclass
@@ -148,11 +141,14 @@ class RegistrationFile:
     endpoint: str
     tier: IdentityTier
     signing: SigningConfig
+    registered_at: int
+    registration_signature: str
     hardware_backing: HardwareBacking | None = None
     description: str | None = None
     capabilities: list[Capability] | None = None
-    settlement: list[str] | None = None
-    chains: list[ChainInfo] | None = None
+    #: Namespaced extensions (02 § Profile Fields rules); commerce data lives under
+    #: ``urn:ace:commerce:1`` (04 § Commerce extension).
+    ext: ExtMap | None = None
     principal: "PrincipalRecord | None" = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -164,8 +160,14 @@ class RegistrationFile:
         if self.signing.signing_public_key is not None:
             signing["signingPublicKey"] = self.signing.signing_public_key
         d: dict[str, Any] = {
-            "ace": self.ace, "id": self.id, "name": self.name, "endpoint": self.endpoint,
-            "tier": self.tier, "signing": signing,
+            "ace": self.ace,
+            "id": self.id,
+            "name": self.name,
+            "endpoint": self.endpoint,
+            "tier": self.tier,
+            "signing": signing,
+            "registeredAt": self.registered_at,
+            "registrationSignature": self.registration_signature,
         }
         if self.hardware_backing is not None:
             d["hardwareBacking"] = self.hardware_backing
@@ -173,17 +175,16 @@ class RegistrationFile:
             d["description"] = self.description
         if self.capabilities is not None:
             d["capabilities"] = [c.to_dict() for c in self.capabilities]
-        if self.settlement is not None:
-            d["settlement"] = list(self.settlement)
-        if self.chains is not None:
-            d["chains"] = [{"network": c.network, "address": c.address} for c in self.chains]
+        if self.ext is not None:
+            d["ext"] = {k: dict(v) for k, v in self.ext.items()}
         if self.principal is not None:
             d["principal"] = self.principal.to_dict()
         return d
 
     @staticmethod
     def from_dict(d: object) -> "RegistrationFile":
-        """Parse the wire JSON shape. Type errors raise ``ACEError(invalid_registration)``.
+        """Parse the wire JSON shape. Type errors raise ``ACEError(invalid_registration)``;
+        ``ext`` follows the profile rules (``invalid_profile``) and is re-canonicalised.
 
         Unknown fields are ignored; optional fields that are ``null`` are absent.
         Semantic checks (ID hash, keys, URL grammar) are in ``verify_registration_file``.
@@ -202,30 +203,21 @@ class RegistrationFile:
             for c in caps:
                 if not isinstance(c, dict):
                     raise ACEError(code, "registration.capabilities entries must be objects")
-                p = _opt(c, "pricing", dict, code, "capability")
-                capabilities.append(Capability(
-                    id=_req(c, "id", str, code, "capability"),
-                    description=_req(c, "description", str, code, "capability"),
-                    input=_opt(c, "input", str, code, "capability"),
-                    output=_opt(c, "output", str, code, "capability"),
-                    pricing=None if p is None else PricingInfo(
-                        model=_req(p, "model", str, code, "capability.pricing"),
-                        amount=_req(p, "amount", str, code, "capability.pricing"),
-                        currency=_req(p, "currency", str, code, "capability.pricing"),
-                    ),
-                ))
-        raw_chains = _opt(d, "chains", list, code, "registration")
-        chains = None
-        if raw_chains is not None:
-            if not all(isinstance(c, dict) for c in raw_chains):
-                raise ACEError(code, "registration.chains entries must be objects")
-            chains = [ChainInfo(network=_req(c, "network", str, code, "chain"),
-                                address=_req(c, "address", str, code, "chain")) for c in raw_chains]
+                capabilities.append(
+                    Capability(
+                        id=_req(c, "id", str, code, "capability"),
+                        description=_req(c, "description", str, code, "capability"),
+                        input=_opt(c, "input", str, code, "capability"),
+                        output=_opt(c, "output", str, code, "capability"),
+                    )
+                )
         return RegistrationFile(
             ace=_req(d, "ace", str, code, "registration"),
             id=_req(d, "id", str, code, "registration"),
             name=_req(d, "name", str, code, "registration"),
             endpoint=_req(d, "endpoint", str, code, "registration"),
+            registered_at=d.get("registeredAt"),
+            registration_signature=_req(d, "registrationSignature", str, code, "registration"),
             tier=int(tier),  # type: ignore[arg-type]
             signing=SigningConfig(
                 scheme=_req(signing, "scheme", str, code, "signing"),
@@ -236,8 +228,7 @@ class RegistrationFile:
             hardware_backing=_opt(d, "hardwareBacking", str, code, "registration"),
             description=_opt(d, "description", str, code, "registration"),
             capabilities=capabilities,
-            settlement=_opt_str_list(d, "settlement", code, "registration"),
-            chains=chains,
+            ext=validate_ext(d.get("ext"), "profile"),
             principal=None
             if d.get("principal") is None
             else PrincipalRecord.from_dict(d["principal"]),
@@ -315,30 +306,20 @@ class PrincipalRecord:
 
 # --- discovery profile ------------------------------------------------------------
 
-@dataclass
-class ProfilePricing:
-    currency: str
-    max_amount: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        d: dict[str, Any] = {"currency": self.currency}
-        if self.max_amount is not None:
-            d["maxAmount"] = self.max_amount
-        return d
-
 
 @dataclass
 class AgentProfile:
-    """Relay discovery profile (self-asserted metadata). All fields optional."""
+    """Relay discovery profile (self-asserted metadata). All fields optional. ``ext`` holds
+    namespaced extensions (02 § Profile Fields); commerce data (chains, pricing, settlement,
+    accounts) lives under ``ext["urn:ace:commerce:1"]`` (04 § Commerce extension)."""
 
     name: str | None = None
     description: str | None = None
     image: str | None = None
     tags: list[str] | None = None
     capabilities: list[str] | None = None
-    chains: list[str] | None = None
     endpoint: str | None = None
-    pricing: ProfilePricing | None = None
+    ext: ExtMap | None = None
     principal: PrincipalRecord | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -346,13 +327,13 @@ class AgentProfile:
         for key in ("name", "description", "image"):
             if getattr(self, key) is not None:
                 d[key] = getattr(self, key)
-        for key in ("tags", "capabilities", "chains"):
+        for key in ("tags", "capabilities"):
             if getattr(self, key) is not None:
                 d[key] = list(getattr(self, key))
         if self.endpoint is not None:
             d["endpoint"] = self.endpoint
-        if self.pricing is not None:
-            d["pricing"] = self.pricing.to_dict()
+        if self.ext is not None:
+            d["ext"] = {k: dict(v) for k, v in self.ext.items()}
         if self.principal is not None:
             d["principal"] = self.principal.to_dict()
         return d
@@ -361,31 +342,21 @@ class AgentProfile:
     def from_dict(d: object) -> "AgentProfile":
         """Parse the wire shape; type errors raise ``ACEError(invalid_profile)``.
 
-        Unknown top-level profile fields are ignored (never stored or signed);
-        ``pricing`` must contain only ``currency`` and optional ``maxAmount``.
+        Unknown top-level profile fields are ignored (never stored or signed); ``ext`` is
+        validated by the 02 § Profile Fields rules and re-canonicalised (an empty ``ext`` is
+        absent).
         """
         code: ACEErrorCode = "invalid_profile"
         if not isinstance(d, dict):
             raise ACEError(code, "profile must be a JSON object")
-        p = _opt(d, "pricing", dict, code, "profile")
-        pricing = None
-        if p is not None:
-            extra = set(p) - {"currency", "maxAmount"}
-            if extra:
-                raise ACEError(code, f"profile.pricing has unknown fields: {sorted(extra)[:3]}")
-            pricing = ProfilePricing(
-                currency=_req(p, "currency", str, code, "profile.pricing"),
-                max_amount=_opt(p, "maxAmount", str, code, "profile.pricing"),
-            )
         profile = AgentProfile(
             name=_opt(d, "name", str, code, "profile"),
             description=_opt(d, "description", str, code, "profile"),
             image=_opt(d, "image", str, code, "profile"),
             tags=_opt_str_list(d, "tags", code, "profile"),
             capabilities=_opt_str_list(d, "capabilities", code, "profile"),
-            chains=_opt_str_list(d, "chains", code, "profile"),
             endpoint=_opt(d, "endpoint", str, code, "profile"),
-            pricing=pricing,
+            ext=validate_ext(d.get("ext"), "profile"),
         )
         # The principal is parsed after the other members (R-P45, 08 order).
         if d.get("principal") is not None:
@@ -399,7 +370,6 @@ class DiscoverQuery:
 
     q: str | None = None
     tags: list[str] | tuple[str, ...] | None = None  # sent comma-joined
-    chain: str | None = None
     scheme: str | None = None
     online: bool | None = None
     account: str | None = None
@@ -449,6 +419,7 @@ class ReplayState(TypedDict):
 
 # --- envelope -----------------------------------------------------------------------
 
+
 @dataclass
 class EncryptionEnvelope:
     kem_ciphertext: str  # wire: kemCiphertext
@@ -470,11 +441,9 @@ class ACEMessage:
     from_id: str
     to_id: str
     conversation_id: str
-    type: MessageType
     timestamp: int
     encryption: EncryptionEnvelope
     signature: SignatureEnvelope
-    thread_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -483,7 +452,6 @@ class ACEMessage:
             "from": self.from_id,
             "to": self.to_id,
             "conversationId": self.conversation_id,
-            "type": self.type,
             "timestamp": self.timestamp,
             "encryption": {
                 "kemCiphertext": self.encryption.kem_ciphertext,
@@ -491,8 +459,6 @@ class ACEMessage:
             },
             "signature": {"scheme": self.signature.scheme, "value": self.signature.value},
         }
-        if self.thread_id is not None:
-            d["threadId"] = self.thread_id
         return d
 
 
@@ -506,6 +472,7 @@ class ParsedMessage:
     thread_id: str | None
     timestamp: int
     body: dict[str, Any]
+    schema_digest: str
 
 
 # --- bodies -------------------------------------------------------------------------

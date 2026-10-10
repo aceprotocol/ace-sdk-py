@@ -6,7 +6,7 @@ import hashlib
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
-from ._encoding import is_ace_id, unix_now, wire_int
+from ._encoding import is_ace_id, is_sha256_hex, is_thread_id, unix_now, wire_int
 from .envelope import decode_envelope
 from .errors import ACEError
 from .limits import MAX_OPEN_THREADS_PER_PEER
@@ -18,7 +18,7 @@ from .state_machine import (
     ThreadStateMachine,
 )
 from .store import ACEStore, load_record, write_record
-from .types import ACEMessage
+from .types import ACEMessage, is_message_type
 
 THREAD_RETENTION_SECONDS = 30 * 86400
 _PRUNE_INTERVAL_SECONDS = 3600
@@ -29,23 +29,38 @@ def sha256_hex(*parts: str) -> str:
     return hashlib.sha256(b"\x00".join(p.encode("utf-8") for p in parts)).hexdigest()
 
 
+def sent_key(request_id: str) -> str:
+    """Store key of the archived ``PendingSend`` for ``request_id``."""
+    return f"sent/{sha256_hex(request_id)}.json"
+
+
 @dataclass(frozen=True)
 class PendingSend:
     """A signed envelope staged by ``Outbox`` and not yet acknowledged. ``request_ttl`` is
     the body ``ttl`` of a principal ``request`` (the body is encrypted to the recipient, so
-    the Outbox keeps it to write the ``requests/`` record after delivery); persisted as
+    the Outbox keeps it to write the ``requests/`` record before transport); persisted as
     ``requestTtl`` only when present."""
 
     request_id: str
     status: Literal["pending", "expired"]
     staged_at: int
     message: ACEMessage
+    intent_digest: str
+    type: str
+    schema_digest: str
+    thread_id: str | None = None
     request_ttl: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
-            "message": self.message.to_dict(), "requestId": self.request_id,
-            "stagedAt": self.staged_at, "status": self.status,
+            "message": self.message.to_dict(),
+            "requestId": self.request_id,
+            "stagedAt": self.staged_at,
+            "status": self.status,
+            "intentDigest": self.intent_digest,
+            "type": self.type,
+            "schemaDigest": self.schema_digest,
+            **({} if self.thread_id is None else {"threadId": self.thread_id}),
         }
         if self.request_ttl is not None:
             d["requestTtl"] = self.request_ttl
@@ -72,9 +87,19 @@ class PendingSend:
             message = decode_envelope(d.get("message"))
         except ACEError:
             raise bad from None
-        if ttl is not None and message.type != "request":
+        if ttl is not None and d.get("type") != "request":
             raise bad  # requestTtl belongs to a principal request only
-        return PendingSend(rid, status, staged, message, ttl)
+        digest = d.get("intentDigest")
+        if not is_sha256_hex(digest):
+            raise bad
+        typ, schema, thread = d.get("type"), d.get("schemaDigest"), d.get("threadId")
+        if (
+            not is_message_type(typ)
+            or not is_sha256_hex(schema)
+            or ("threadId" in d and not is_thread_id(thread))
+        ):
+            raise bad
+        return PendingSend(rid, status, staged, message, digest, typ, schema, thread, ttl)
 
 
 @dataclass(frozen=True)
@@ -241,6 +266,14 @@ class ThreadStore:
     def _save(self, record: ThreadRecord) -> None:
         snap = record.snapshot
         key = thread_key(snap.conversation_id, snap.thread_id)
+        if record.pending is None:
+            prior = self._load(snap.conversation_id, snap.thread_id)
+            if prior is not None and prior.pending is not None:
+                write_record(
+                    self._store,
+                    sent_key(prior.pending.request_id),
+                    prior.pending.to_dict(),
+                )
         is_open = snap.state not in TERMINAL_STATES
         if is_open:
             self._set_open(

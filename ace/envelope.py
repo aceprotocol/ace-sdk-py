@@ -12,7 +12,6 @@ from ._encoding import (
     is_ace_id,
     is_conversation_id,
     is_message_id,
-    is_thread_id,
     wire_int,
 )
 from ._signing import build_sign_data, encode_payload, verify_signature
@@ -24,8 +23,6 @@ from .types import (
     EncryptionEnvelope,
     SignatureEnvelope,
     SigningScheme,
-    is_economic_type,
-    is_message_type,
 )
 
 _MIN_PAYLOAD_BYTES = 28
@@ -61,7 +58,7 @@ def decode_envelope(obj: object) -> ACEMessage:
     ace = obj.get("ace")
     if not isinstance(ace, str):
         raise _bad("ace must be a string")
-    if ace != "1.0":
+    if ace != "2.0":
         raise ACEError("unsupported_version", f"unsupported ACE version {ace[:16]!r}")
     message_id = obj.get("messageId")
     if not is_message_id(message_id):
@@ -72,16 +69,8 @@ def decode_envelope(obj: object) -> ACEMessage:
     conversation_id = obj.get("conversationId")
     if not is_conversation_id(conversation_id):
         raise _bad("conversationId must be 64 lowercase hex characters")
-    type_ = obj.get("type")
-    if not is_message_type(type_):
-        raise _bad("unknown message type")
-    thread_id = None
-    if "threadId" in obj:
-        thread_id = obj["threadId"]
-        if not is_thread_id(thread_id):
-            raise _bad("threadId must be 1..256 code points without control characters")
-    if thread_id is None and is_economic_type(type_):
-        raise _bad("economic messages require threadId")
+    if any(k in obj for k in ("type", "threadId", "body", "schemaDigest")):
+        raise _bad("application fields must be encrypted")
     timestamp = wire_int(obj.get("timestamp"))
     if timestamp is None:
         raise _bad("timestamp must be an integer in [0, 2^53-1]")
@@ -104,11 +93,9 @@ def decode_envelope(obj: object) -> ACEMessage:
         from_id=from_id,  # type: ignore[arg-type]
         to_id=to_id,  # type: ignore[arg-type]
         conversation_id=conversation_id,  # type: ignore[arg-type]
-        type=type_,  # type: ignore[arg-type]
         timestamp=timestamp,
         encryption=EncryptionEnvelope(kem_ciphertext=kem_text, payload=payload_text),  # type: ignore[arg-type]
         signature=SignatureEnvelope(scheme=scheme, value=sig["value"]),  # type: ignore[arg-type]
-        thread_id=thread_id,  # type: ignore[arg-type]
     )
 
 
@@ -121,15 +108,13 @@ def revalidate(env: object) -> ACEMessage:
 
 def message_sign_data(env: ACEMessage) -> bytes:
     payload = encode_payload(
-        env.type,
         env.to_id,
         env.conversation_id,
         env.message_id,
-        env.thread_id or "",
         decode_kem_ciphertext(env.encryption.kem_ciphertext),
         decode_payload(env.encryption.payload),
     )
-    return build_sign_data("message", env.from_id, env.timestamp, payload)
+    return build_sign_data("packet", env.from_id, env.timestamp, payload)
 
 
 def verify_envelope_signature(

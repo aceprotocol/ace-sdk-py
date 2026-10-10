@@ -12,8 +12,21 @@ PRINCIPAL_MAX_LIFETIME_SECONDS = 31622400
 OFFLINE_WINDOW_SECONDS = 604800
 MAX_REGISTRATION_FILE_BYTES = 1048576
 MAX_INBOX_PAGE = 100
+#: ``ext`` of a profile, registration file or intent (02-discovery § Profile Fields).
+MAX_EXT_KEYS = 8
+MAX_EXT_KEY_BYTES = 256
+MAX_EXT_BYTES = 4096
+MAX_EXT_DEPTH = 8
 #: Largest direct-delivery request body (08-relay § Direct Delivery).
 MAX_DIRECT_BODY_BYTES = MAX_ENVELOPE_BYTES + 1024
+#: Compact JSON size of an execution intent / execution request.
+MAX_EXECUTION_JSON_BYTES = 60000
+#: Pairwise MLS secure delivery: wire-text lengths, plaintext and engine I/O bytes, frame TTL.
+MLS_MAX_KEY_PACKAGE_CHARS = 10924
+MLS_MAX_MESSAGE_CHARS = 64000
+MLS_MAX_PLAINTEXT_BYTES = 40000
+MLS_MAX_ENGINE_IO_BYTES = 140000
+SECURE_DELIVERY_TTL_SECONDS = 120
 
 KEM_SEED_SIZE = 32
 KEM_PUBLIC_KEY_SIZE = 1216

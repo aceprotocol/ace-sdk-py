@@ -32,8 +32,10 @@ def agent(name: str) -> SoftwareIdentity:
 
 
 def peer_of(identity: SoftwareIdentity, pinned_at: int = 0):
-    reg = create_registration_file(identity, name="Peer", endpoint="https://peer.example/ace")
-    return verify_registration_file(reg, pinned_at=pinned_at)
+    reg = create_registration_file(
+        identity, name="Peer", endpoint="https://peer.example/ace", timestamp=pinned_at
+    )
+    return verify_registration_file(reg)
 
 
 def wire(message) -> bytes:

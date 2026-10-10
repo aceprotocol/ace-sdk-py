@@ -33,9 +33,10 @@ if TYPE_CHECKING:
     from .store import ACEStore
     from .types import ACEMessage, ParsedMessage
 
-PRINCIPAL_ROLES: tuple[str, ...] = ("controller", "agent")
+#: 09 § Principal Record: ``controller`` approves, ``delegate`` acts; canonical order.
+PRINCIPAL_ROLES: tuple[str, ...] = ("controller", "delegate")
 _CAIP10_RE = re.compile(r"[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}:[-.%a-zA-Z0-9]{1,128}")
-_ALLOWED_ROLES = {("controller",), ("agent",), ("controller", "agent")}
+_ALLOWED_ROLES = {("controller",), ("delegate",), ("controller", "delegate")}
 
 #: ``open_request_to(conversation_id, request_id, now)``: the ACE ID the receiver sent that
 #: ``request`` to, if it was sent in that conversation, no ``decision`` for it was accepted and
@@ -47,6 +48,11 @@ _EIP155_ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
 
 def is_caip10(value: object) -> bool:
     return isinstance(value, str) and _CAIP10_RE.fullmatch(value) is not None
+
+
+def same_principal_claims(a: PrincipalRecord, b: PrincipalRecord) -> bool:
+    """Compare authenticated statements, not randomized signature bytes."""
+    return replace(a, signature="") == replace(b, signature="")
 
 
 def parse_principal_record(value: object) -> PrincipalRecord:
@@ -103,7 +109,9 @@ def _check_fields(r: PrincipalRecord, now: int) -> bytes:
     if not is_caip10(r.account):  # 2
         raise _bad("principal.account must be a CAIP-10 account")
     if r.roles not in _ALLOWED_ROLES:  # 3
-        raise _bad('principal.roles must be ["controller"], ["agent"] or ["controller","agent"]')
+        raise _bad(
+            'principal.roles must be ["controller"], ["delegate"] or ["controller","delegate"]'
+        )
     if r.signer.scheme not in SIGNING_SCHEMES:  # 4
         raise _bad("principal.signer.scheme is unsupported")
     signer_key = decode_b64(
@@ -158,7 +166,7 @@ def create_principal_record(
     ``controller`` first); the result is validated at ``issued_at`` (``invalid_principal``
     for invalid inputs). ``expires_at`` is required (09 § Principal Record)."""
     if not isinstance(roles, (list, tuple)) or any(r not in PRINCIPAL_ROLES for r in roles):
-        raise ACEError("invalid_argument", "roles must contain only 'controller' and 'agent'")
+        raise ACEError("invalid_argument", "roles must contain only 'controller' and 'delegate'")
     ts = unix_now(None) if issued_at is None else issued_at
     draft = PrincipalRecord(
         account=account,
@@ -244,11 +252,14 @@ def check_principal_rules(
         raise ACEError("wrong_principal", "signer is not an authority of the account")
     if p.account != self_account:  # 5
         raise ACEError("wrong_principal", "the sender belongs to another account")
+    if p.scope is not None:
+        raise ACEError("wrong_principal", "unsupported principal scope")
     if type_ == "decision":
         if "controller" not in p.roles:  # 6
             raise ACEError("wrong_principal", "only a controller may send a decision")
         recipient = (
-            None if open_request_to is None
+            None
+            if open_request_to is None
             else open_request_to(conversation_id, body["requestId"], now)
         )
         if recipient is None:  # 7 (unknown, decided or expired request)
@@ -277,7 +288,8 @@ def sender_principal_usable(
             raise
         return False
     return (
-        _is_account_authority(p, ctx.self_signer, ctx.trusted_signers)
+        p.scope is None
+        and _is_account_authority(p, ctx.self_signer, ctx.trusted_signers)
         and p.account == ctx.account
     )
 
@@ -344,14 +356,18 @@ def record_request(
         expires_at = min(message.timestamp + check_wire_int(ttl, "ttl"), MAX_SAFE_INTEGER)
     if load_request_record(store, message.conversation_id, message.message_id) is not None:
         return
-    write_record(store, request_key(message.conversation_id, message.message_id), {
-        "conversationId": message.conversation_id,
-        "decision": None,
-        "expiresAt": expires_at,
-        "messageId": message.message_id,
-        "sentAt": sent_at,
-        "to": message.to_id,
-    })
+    write_record(
+        store,
+        request_key(message.conversation_id, message.message_id),
+        {
+            "conversationId": message.conversation_id,
+            "decision": None,
+            "expiresAt": expires_at,
+            "messageId": message.message_id,
+            "sentAt": sent_at,
+            "to": message.to_id,
+        },
+    )
 
 
 def fill_decision(store: "ACEStore", m: "ParsedMessage") -> None:

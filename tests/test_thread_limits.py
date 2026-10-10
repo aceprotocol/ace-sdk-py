@@ -8,7 +8,6 @@ import uuid
 from ace import (
     MAX_OPEN_THREADS_PER_PEER,
     MemoryStore,
-    ReceiveSource,
     ThreadHistoryEntry,
     ThreadSnapshot,
     ThreadStore,
@@ -90,7 +89,7 @@ def test_bound_on_receive_and_stage():
     env = alice.outbox.stage(
         alice.peers.get(bob.id), "rfq", {"need": "x"}, thread_id="one-more"
     ).message
-    out = inbox.receive(wire(env), ReceiveSource.relay("https://relay.example", "1-0"))
+    out = inbox.receive(wire(env))
     assert out.kind == "quarantined" and out.error.code == "limit_exceeded"
     assert bob.host.calls == [] and threads.get(conv, "one-more") is None
     # sender side: pre-checked before any crypto
@@ -100,7 +99,7 @@ def test_bound_on_receive_and_stage():
     offer = bob.outbox.stage(
         bob.peers.get(alice.id), "offer", {"price": "1", "currency": "USDC"}, thread_id="fill-7"
     )
-    assert offer.message.type == "offer"
+    assert offer.type == "offer"
     threads.remove(conv, "fill-0")
     bob.outbox.stage(bob.peers.get(alice.id), "rfq", {"need": "y"}, thread_id="mine")
     assert threads._open_thread_count(alice.id) == MAX_OPEN_THREADS_PER_PEER

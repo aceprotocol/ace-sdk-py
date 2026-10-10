@@ -70,7 +70,7 @@ class Agent:
         self.clock = clock
         self.store = store if store is not None else MemoryStore()
         self.peers = PeerStore(self.store, relay=relay, clock=clock)
-        self.outbox = Outbox.open(self.identity, self.store, clock=clock)
+        self.outbox = Outbox.open(self.identity, self.store, clock=clock, commerce=True)
         self.host = Host()
         self.inbox: Inbox | None = None
 
@@ -81,14 +81,15 @@ class Agent:
             PeerStore(store or self.store, relay=self.peers._relay, clock=self.clock),
             self.host,
             clock=self.clock,
+            commerce=True,
             **kw,
         )
         return self.inbox
 
     def registration(self):
         return create_registration_file(
-            self.identity, name=self.name, endpoint=f"https://{self.name}.example/ace"
+            self.identity, name=self.name, endpoint=f"https://{self.name}.example/ace", timestamp=0
         )
 
     def pin(self, other: "Agent"):
-        return self.peers.pin_registration_file(other.registration(), pinned_at=0)
+        return self.peers.pin_registration_file(other.registration())

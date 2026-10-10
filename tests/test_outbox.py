@@ -6,7 +6,7 @@ import json
 
 import pytest
 
-from ace import ACEError, PendingSend, ReceiveSource, ThreadStore
+from ace import ACEError, Outbox, PendingSend, ThreadStore
 from ace.outbox import _outbox_key
 from ace.threads import thread_key
 
@@ -35,10 +35,18 @@ def test_stage_economic_persists_thread_and_pending(pair):
         "requestId": "req-1",
         "stagedAt": clock.t,
         "status": "pending",
+        "intentDigest": p.intent_digest,
+        "type": p.type,
+        "schemaDigest": p.schema_digest,
+        "threadId": p.thread_id,
     }
     # same requestId: unchanged, no new message
+    with raises("pending_send_conflict"):
+        alice.outbox.stage(
+            alice.peers.get(bob.id), "rfq", {"need": "other"}, thread_id="zzz", request_id="req-1"
+        )
     again = alice.outbox.stage(
-        alice.peers.get(bob.id), "rfq", {"need": "other"}, thread_id="zzz", request_id="req-1"
+        alice.peers.get(bob.id), "rfq", {"need": "x"}, thread_id="d", request_id="req-1"
     )
     assert again == p
     alice.outbox.stage(alice.peers.get(bob.id), "text", {"message": "x"}, request_id="req-2")
@@ -139,7 +147,7 @@ def test_expiry_resign_deliver(pair):
     got = []
     alice.outbox.deliver("r", got.append)
     inbox = bob.open()
-    out = inbox.receive(wire(got[0]), ReceiveSource.relay("https://r.example", "1-0"))
+    out = inbox.receive(wire(got[0]))
     assert out.kind == "delivered" and out.message.timestamp == t0 + 1000
 
 
@@ -170,7 +178,7 @@ def test_abandon(pair):
     )
     alice.outbox.deliver("r1", lambda e: None)
     inbox = bob.open()
-    inbox.receive(wire(first.message), ReceiveSource.direct())
+    inbox.receive(wire(first.message))
     offer = bob.outbox.stage(
         bob.peers.get(alice.id),
         "offer",
@@ -204,7 +212,7 @@ def test_thread_store_prunes_old_terminal_threads(pair):
     p = alice.outbox.stage(peer, "rfq", {"need": "x"}, thread_id="old", request_id="a")
     alice.outbox.deliver("a", lambda e: None)
     inbox = bob.open()
-    inbox.receive(wire(p.message), ReceiveSource.direct())
+    inbox.receive(wire(p.message))
     rej = bob.outbox.stage(
         bob.peers.get(alice.id), "reject", {"reason": "busy"}, thread_id="old", request_id="r"
     )
@@ -217,3 +225,28 @@ def test_thread_store_prunes_old_terminal_threads(pair):
     )
     assert [s.thread_id for s in store.list()] == ["new"]
     assert store.remove(keep.message.conversation_id, "new") and store.list() == []
+
+
+def test_completed_operation_survives_restart(pair):
+    clock, alice, bob = pair
+    peer = alice.peers.get(bob.id)
+    p = alice.outbox.stage(peer, "text", {"message": "same operation"}, request_id="stable")
+    rx = bob.open()
+    assert (
+        alice.outbox.deliver(
+            "stable", lambda env: rx.receive(wire(env))
+        ).kind
+        == "delivered"
+    )
+    restarted = Outbox.open(alice.identity, alice.store, clock=clock)
+    assert (
+        restarted.stage(peer, "text", {"message": "same operation"}, request_id="stable").message
+        == p.message
+    )
+    assert (
+        restarted.deliver("stable", lambda env: rx.receive(wire(env))).kind
+        == "duplicate"
+    )
+    with raises("pending_send_conflict"):
+        restarted.stage(peer, "text", {"message": "different"}, request_id="stable")
+    rx.close()

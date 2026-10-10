@@ -2,20 +2,41 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import uuid
 from typing import Callable, TypeVar
 
-from ._encoding import encode_signature, is_thread_id, unix_now, wire_int
+from ._encoding import (
+    check_json_value,
+    encode_signature,
+    is_thread_id,
+    unix_now,
+    wire_int,
+)
+from ._intent import intent_digest
 from .discovery import VerifiedPeer
 from .encryption import compute_conversation_id
 from .envelope import message_sign_data
 from .errors import ACEError
-from .messages import create_message
+from .messages import (
+    SchemaValidator,
+    check_schemas,
+    create_message,
+    known_schema_digest,
+    run_schema_validator,
+)
 from .principal import record_request
-from .state_machine import ThreadHistoryEntry, ThreadStateMachine
+from .state_machine import ThreadHistoryEntry
 from .store import ACEStore, load_record, write_record
-from .threads import PendingSend, ThreadRecord, ThreadStore, rebuild_snapshot, sha256_hex
+from .threads import (
+    PendingSend,
+    ThreadRecord,
+    ThreadStore,
+    rebuild_snapshot,
+    sent_key,
+    sha256_hex,
+)
 from .types import ACEIdentity, ACEMessage, MessageType, SignatureEnvelope, is_economic_type
 
 T = TypeVar("T")
@@ -52,19 +73,29 @@ class Outbox:
 
     @classmethod
     def open(
-        cls, identity: ACEIdentity, store: ACEStore, *, clock: Callable[[], int] | None = None
+        cls,
+        identity: ACEIdentity,
+        store: ACEStore,
+        *,
+        clock: Callable[[], int] | None = None,
+        commerce: bool = False,
+        schemas: dict[str, SchemaValidator] | None = None,
     ) -> "Outbox":
         """Create an outbox. Under lock ``threads``, repairs thread records from
         ``deliveries/`` whose snapshot strictly extends the stored history (an Inbox that
         crashed between its delivery and thread writes); divergence is ``storage_failed``.
         Records that are ``acked`` and covered by a replay horizon are skipped. Never hands
-        messages over and never writes the replay state."""
+        messages over and never writes the replay state. ``schemas`` installs deterministic
+        validators keyed by ``schemaDigest`` that ``stage`` runs before persisting anything."""
         from .inbox import load_deliveries, repair_thread, stored_horizons
 
+        installed = check_schemas(schemas)
         self = object.__new__(cls)
         self._identity = identity
         self._store = store
         self._clock = clock
+        self._commerce = commerce
+        self._schemas = installed
         self._threads = ThreadStore(store, identity.get_ace_id(), clock=clock)
         with self._threads._locked():
             covered = stored_horizons(store)
@@ -105,18 +136,52 @@ class Outbox:
         *,
         thread_id: str | None = None,
         request_id: str | None = None,
+        schema_digest: str | None = None,
     ) -> PendingSend:
         rid = str(uuid.uuid4()) if request_id is None else _check_request_id(request_id)
         if not isinstance(recipient, VerifiedPeer):
             raise ACEError("invalid_argument", "recipient must be a VerifiedPeer")
         local = self._identity.get_ace_id()
+        check_json_value(body)
+        body = copy.deepcopy(body)
+        schema_digest = known_schema_digest(type_) if schema_digest is None else schema_digest
+        if schema_digest is None:
+            raise ACEError("invalid_body", "schemaDigest is required")
+        run_schema_validator(self._schemas, type_, schema_digest, thread_id, body)
+        digest = intent_digest(
+            {
+                "schemaDigest": schema_digest,
+                "from": local,
+                "to": recipient.ace_id,
+                "type": type_,
+                "threadId": thread_id,
+                "body": body,
+            }
+        )
         with self._threads._locked():
             # a fresh UUID cannot be staged yet: skip the scan over every thread record
             found = None if request_id is None else self._find(rid)
             if found is not None:
-                return found[0]
+                prior = found[0]
+            else:
+                archived = load_record(self._store, sent_key(rid))
+                prior = None if archived is None else PendingSend.from_dict(archived)
+            if prior is not None:
+                if prior.request_id != rid:
+                    raise ACEError("storage_failed", "sent record does not match its requestId")
+                if prior.intent_digest != digest:
+                    raise ACEError(
+                        "pending_send_conflict",
+                        "requestId is already bound to different parameters",
+                    )
+                if found is None:
+                    self._write_outbox(prior)
+                return prior
             now = self._now()
-            if is_economic_type(type_) and thread_id is not None:
+            machine = None
+            if self._commerce and is_economic_type(type_):
+                if thread_id is None:
+                    raise ACEError("invalid_argument", "commerce messages require thread_id")
                 conversation_id = compute_conversation_id(
                     self._identity.get_encryption_public_key(),
                     recipient.encryption_public_key,
@@ -129,40 +194,36 @@ class Outbox:
                     conversation_id, thread_id, local
                 ):
                     self._threads._check_can_open(recipient.ace_id)
-                env = create_message(
-                    self._identity,
-                    recipient,
-                    type_,
-                    body,
-                    machine,
-                    thread_id=thread_id,
-                    timestamp=now,
-                )
-                pending = PendingSend(rid, "pending", now, env)
-                snap = machine.get_snapshot(conversation_id, thread_id)
-                assert snap is not None
-                self._threads._save(ThreadRecord(snap, pending))
-                return pending
             env = create_message(
                 self._identity,
                 recipient,
                 type_,
                 body,
-                ThreadStateMachine(local),
+                machine,
                 thread_id=thread_id,
                 timestamp=now,
+                schema_digest=schema_digest,
             )
             ttl = wire_int(body.get("ttl")) if type_ == "request" else None
-            pending = PendingSend(rid, "pending", now, env, ttl)
-            self._write_outbox(pending)
+            pending = PendingSend(
+                rid, "pending", now, env, digest, type_, schema_digest, thread_id, ttl
+            )
+            if machine is None:
+                self._write_outbox(pending)
+            else:
+                snap = machine.get_snapshot(conversation_id, thread_id)
+                assert snap is not None
+                self._threads._save(ThreadRecord(snap, pending))
             return pending
 
     def deliver(self, request_id: str, transport: Callable[[ACEMessage], T]) -> T:
-        """Send the pending send through ``transport`` and return its result. An ``expired``
-        one is refused with ``envelope_expired`` before any transport call (``resign`` it
-        first). After a successful transport, a principal ``request`` is recorded in
-        ``requests/`` (lock ``requests``) before the pending send is cleared; if that write
-        fails the send stays pending and a retry writes it (06 § Durable Delivery, Sender)."""
+        """Send the pending send through ``transport`` and return its result. The transport is
+        the authenticated secure delivery, ``lambda env: secure.deliver(env, peer, exchange)``
+        (``SecureTransport`` with ``SecureRelayReplies.exchange``); never a bare relay send.
+        An ``expired`` one is refused with ``envelope_expired`` before any transport call
+        (``resign`` it first). Before transport, a principal ``request`` is durably recorded
+        in ``requests/``. A storage failure prevents sending; a lost acknowledgement retains
+        the correlation."""
         rid = _check_request_id(request_id)
         if not callable(transport):
             raise ACEError("invalid_argument", "transport must be callable")
@@ -173,6 +234,9 @@ class Outbox:
         if found[0].status == "expired":
             raise ACEError("envelope_expired", "the pending send expired; resign it first")
         message = found[0].message
+        if found[0].type == "request":
+            with self._store.lock("requests"):
+                record_request(self._store, message, self._now(), found[0].request_ttl)
         try:
             result = transport(message)
         except ACEError as exc:
@@ -181,9 +245,6 @@ class Outbox:
                     rid, message.message_id, lambda p: dataclasses.replace(p, status="expired")
                 )
             raise
-        if message.type == "request":
-            with self._store.lock("requests"):
-                record_request(self._store, message, self._now(), found[0].request_ttl)
         self._set_pending(rid, message.message_id, lambda p: None)
         return result
 
@@ -203,6 +264,7 @@ class Outbox:
             if rec is not None:
                 self._threads._save(ThreadRecord(rec.snapshot, new))
             elif new is None:
+                write_record(self._store, sent_key(rid), p.to_dict())
                 self._store.delete(_outbox_key(rid))
             else:
                 self._write_outbox(new)
@@ -210,12 +272,18 @@ class Outbox:
     def resign(self, request_id: str) -> PendingSend:
         rid = _check_request_id(request_id)
         with self._threads._locked():
+            if self._store.read(sent_key(rid)) is not None:
+                raise ACEError("invalid_argument", "a completed operation cannot be renewed")
             found = self._find(rid)
             if found is None:
                 raise ACEError("invalid_argument", "no pending send with this request_id")
             p, rec = found
             if p.status != "expired":
                 raise ACEError("invalid_argument", "only an expired pending send can be re-signed")
+            if p.request_ttl is not None:
+                raise ACEError(
+                    "invalid_argument", "a request deadline cannot be extended by transport retry"
+                )
             now = self._now()
             old = p.message
             scheme = self._identity.get_signing_scheme()
@@ -228,7 +296,7 @@ class Outbox:
             env.signature.value = encode_signature(
                 self._identity.sign(message_sign_data(env)), scheme
             )
-            new = PendingSend(rid, "pending", p.staged_at, env, p.request_ttl)
+            new = dataclasses.replace(p, status="pending", message=env)
             if rec is None:
                 self._write_outbox(new)
                 return new
@@ -252,6 +320,7 @@ class Outbox:
                 return
             p, rec = found
             if rec is None:
+                write_record(self._store, sent_key(rid), p.to_dict())
                 self._store.delete(_outbox_key(rid))
                 return
             history = list(rec.snapshot.history)
@@ -259,9 +328,10 @@ class Outbox:
                 history.pop()
             snap = rebuild_snapshot(rec.snapshot, history)
             if snap is None:
+                write_record(self._store, sent_key(rid), p.to_dict())
                 self._threads._delete(rec.snapshot)
             else:
-                self._threads._save(ThreadRecord(snap, None))
+                self._threads._save(ThreadRecord(snap, None))  # archives p under sent_key
 
     def pending(self) -> list[PendingSend]:
         out = [rec.pending for rec in self._threads._records() if rec.pending is not None]

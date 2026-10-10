@@ -15,7 +15,7 @@ ACEErrorCode = Literal[
     "invalid_profile", "invalid_principal", "wrong_principal", "invalid_peer",
     "stale_peer_binding", "unknown_peer", "not_registered",
     "relay_rejected", "envelope_expired", "pending_send_conflict", "blocked_address",
-    "direct_rejected",
+    "direct_rejected", "delivery_rejected",
     # transient
     "relay_unavailable", "relay_protocol_error", "fetch_failed", "direct_unavailable",
     # local
@@ -59,7 +59,8 @@ class ACEError(Exception):
         self.message = message or code
         self.status = status
         self.relay_code = relay_code
-        #: ``direct_rejected``: the receiver's ``error`` string (08-relay § Direct Delivery).
+        #: ``direct_rejected``: the receiver's ``error`` string (08-relay § Direct Delivery);
+        #: ``delivery_rejected``: the Inbox code in the receiver's secure-delivery receipt (13).
         self.remote_code = remote_code
         self.retry_after_seconds = retry_after_seconds
 

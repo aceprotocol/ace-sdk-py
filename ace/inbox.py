@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import threading
 from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import Any, Callable, Generator, Iterator, Literal, NamedTuple
+from typing import Any, Callable, Literal
 
 from ._encoding import (
     decode_b64,
@@ -14,7 +13,7 @@ from ._encoding import (
     is_ace_id,
     is_conversation_id,
     is_message_id,
-    is_stream_id,
+    is_sha256_hex,
     is_thread_id,
     loads_json,
     unix_now,
@@ -26,13 +25,17 @@ from .envelope import decode_envelope, envelope_fingerprint, message_sign_data
 from .errors import ACEError
 from .limits import (
     DEFAULT_REPLAY_CAPACITY,
-    MAX_DIRECT_BODY_BYTES,
     MAX_ENVELOPE_BYTES,
-    MAX_INBOX_PAGE,
     OFFLINE_WINDOW_SECONDS,
     TIMESTAMP_WINDOW_SECONDS,
 )
-from .messages import parse_message
+from .messages import (
+    SchemaValidator,
+    apply_receive_rules,
+    check_schemas,
+    parse_message,
+    run_schema_validator,
+)
 from .peers import PeerStore
 from .principal import (
     PrincipalContext,
@@ -40,8 +43,8 @@ from .principal import (
     is_caip10,
     open_request_to,
     sender_principal_usable,
+    validate_principal_record,
 )
-from .relay import RelayClient, compare_stream_ids, normalize_relay_url
 from .replay import ReplayDetector
 from .state_machine import ThreadSnapshot, ThreadStateMachine
 from .store import ACEStore, load_record, write_record
@@ -52,6 +55,7 @@ from .types import (
     ACEMessage,
     ParsedMessage,
     PrincipalKey,
+    PrincipalRecord,
     is_economic_type,
     is_message_type,
     is_principal_type,
@@ -61,35 +65,6 @@ QUARANTINE_CAP = 1000
 QUARANTINE_KEEP = 900
 _SWEEP_EVERY = 1024
 _REASON_MAX = 1000
-
-
-@dataclass(frozen=True)
-class ReceiveSource:
-    """Where an envelope came from. Build with ``ReceiveSource.relay(url, stream_id)`` or
-    ``ReceiveSource.direct()``. ``relay_url`` is normalized."""
-
-    kind: Literal["relay", "direct"]
-    relay_url: str | None = None
-    stream_id: str | None = None
-
-    def __post_init__(self) -> None:
-        if self.kind == "relay":
-            object.__setattr__(self, "relay_url", normalize_relay_url(self.relay_url))
-            if self.stream_id is not None and not is_stream_id(self.stream_id):
-                raise ACEError("invalid_argument", "stream_id must be '<ms>-<seq>'")
-        elif self.kind == "direct":
-            if self.relay_url is not None or self.stream_id is not None:
-                raise ACEError("invalid_argument", "a direct source has no relay_url / stream_id")
-        else:
-            raise ACEError("invalid_argument", "kind must be 'relay' or 'direct'")
-
-    @classmethod
-    def relay(cls, relay_url: str, stream_id: str | None = None) -> "ReceiveSource":
-        return cls("relay", relay_url, stream_id)
-
-    @classmethod
-    def direct(cls) -> "ReceiveSource":
-        return cls("direct")
 
 
 @dataclass(frozen=True)
@@ -103,54 +78,6 @@ class ReceiveOutcome:
     fingerprint: str | None = None
     from_id: str | None = None
     message_id: str | None = None
-
-
-@dataclass(frozen=True)
-class PullResult:
-    """The result of ``Inbox.pull``: every non-retryable outcome in relay order, the error that
-    stopped the drain (a retryable outcome, a fetch error or an invalid argument) or None, and
-    ``has_more`` when ``max_pages`` or ``stop`` ended it before the inbox was drained."""
-
-    outcomes: list[ReceiveOutcome]
-    blocked: ACEError | None
-    has_more: bool = False
-
-    @property
-    def messages(self) -> list[ParsedMessage]:
-        """The delivered messages, in order."""
-        return [o.message for o in self.outcomes if o.kind == "delivered" and o.message is not None]
-
-    @property
-    def delivered(self) -> int:
-        return sum(o.kind == "delivered" for o in self.outcomes)
-
-    @property
-    def duplicates(self) -> int:
-        return sum(o.kind == "duplicate" for o in self.outcomes)
-
-    @property
-    def quarantined(self) -> int:
-        return sum(o.kind == "quarantined" for o in self.outcomes)
-
-
-@dataclass(frozen=True)
-class DirectReply:
-    """The HTTP reply for one direct-delivery request (08-relay § Direct Delivery, Receiver):
-    ``status`` and the JSON ``body`` to send, and the receive ``outcome`` when the request
-    reached the pipeline."""
-
-    status: int
-    body: dict[str, Any]
-    outcome: ReceiveOutcome | None = None
-
-
-def _reject(status: int, error: str, outcome: ReceiveOutcome | None = None) -> DirectReply:
-    return DirectReply(status, {"ok": False, "error": error}, outcome)
-
-
-class _DrainEnd(NamedTuple):
-    reason: Literal["drained", "blocked", "page_limit", "stopped"]
-    error: ACEError | None = None
 
 
 def delivery_key(from_id: str, message_id: str) -> str:
@@ -167,6 +94,7 @@ def _parsed_to_dict(m: ParsedMessage) -> dict[str, Any]:
         "timestamp": m.timestamp,
         "to": m.to_id,
         "type": m.type,
+        "schemaDigest": m.schema_digest,
     }
 
 
@@ -176,7 +104,6 @@ class _Delivery:
     message: ParsedMessage
     fingerprint: str
     received_at: int
-    source: str
     status: str
     thread: ThreadSnapshot | None
 
@@ -185,7 +112,6 @@ class _Delivery:
             "fingerprint": self.fingerprint,
             "message": _parsed_to_dict(self.message),
             "receivedAt": self.received_at,
-            "source": self.source,
             "status": self.status,
             "thread": self.thread.to_dict() if self.thread else None,
         }
@@ -206,6 +132,7 @@ def _delivery_from_dict(d: dict, key: str, local_ace_id: str) -> _Delivery:
         or not is_message_id(m.get("messageId"))
         or not is_conversation_id(m.get("conversationId"))
         or not is_message_type(m.get("type"))
+        or not is_sha256_hex(m.get("schemaDigest"))
         or ts is None
         or not isinstance(m.get("body"), dict)
         or (thread_id is not None and not is_thread_id(thread_id))
@@ -220,19 +147,19 @@ def _delivery_from_dict(d: dict, key: str, local_ace_id: str) -> _Delivery:
         thread_id=thread_id,
         timestamp=ts,
         body=m["body"],
+        schema_digest=m["schemaDigest"],
     )
     if key != delivery_key(parsed.from_id, parsed.message_id):
         raise bad("key")
     received_at = wire_int(d.get("receivedAt"))
     if (
         received_at is None
-        or d.get("source") not in ("relay", "direct")
         or d.get("status") not in ("pending", "acked")
         or not isinstance(d.get("fingerprint"), str)
     ):
         raise bad("fields")
     thread = None if d.get("thread") is None else snapshot_from_dict(d["thread"], local_ace_id)
-    return _Delivery(key, parsed, d["fingerprint"], received_at, d["source"], d["status"], thread)
+    return _Delivery(key, parsed, d["fingerprint"], received_at, d["status"], thread)
 
 
 def _principal_key(value: object, what: str) -> PrincipalKey:
@@ -251,13 +178,63 @@ def _principal_key(value: object, what: str) -> PrincipalKey:
     return PrincipalKey(value["scheme"], value["publicKey"])
 
 
+@dataclass(frozen=True)
+class InboxPrincipal:
+    """The receiver's principal for ``Inbox.open(principal=...)`` (09 § Same-Account Rules):
+    its CAIP-10 ``account``, ``self_signer`` (the signer of the host's own principal record)
+    and host-trusted ``trusted_signers`` (e.g. read from chain). With neither signer given
+    only an ``eip155`` account whose address is the signer's passes step 4 (fail closed)."""
+
+    account: str
+    self_signer: PrincipalKey | None = None
+    trusted_signers: tuple[PrincipalKey, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        """The ``Inbox.open(principal=...)`` wire shape."""
+        key = lambda k: {"scheme": k.scheme, "publicKey": k.public_key}  # noqa: E731
+        return {
+            "account": self.account,
+            "selfSigner": None if self.self_signer is None else key(self.self_signer),
+            "trustedSigners": [key(k) for k in self.trusted_signers],
+        }
+
+
+def inbox_principal_from_own_record(
+    record: PrincipalRecord | dict | None,
+    identity: ACEIdentity,
+    *,
+    now: int | None = None,
+    trusted_signers: list[PrincipalKey] | tuple[PrincipalKey, ...] | None = None,
+) -> tuple[InboxPrincipal | None, str | None]:
+    """The ``principal`` option for a host's own saved principal record (09, R-B12a):
+    ``(principal, warning)``. The record is P_self only while it validates for ``identity``'s
+    signing key at ``now`` (default: the wall clock). A missing record is ``(None, None)``;
+    an invalid or expired one never raises but is ``(None, '<code>: <detail>')`` so the host
+    decides how to surface it; a valid one binds its ``account`` with the record's ``signer``
+    as ``self_signer`` and ``trusted_signers`` (default none)."""
+    if record is None:
+        return None, None
+    try:
+        own = validate_principal_record(
+            record, identity.get_signing_public_key(), unix_now(None) if now is None else now
+        )
+    except ACEError as exc:
+        return None, str(exc)  # already ``<code>: <detail>``
+    except Exception as exc:  # defensive: a malformed record never raises out of here
+        return None, f"invalid_principal: {exc}"
+    return InboxPrincipal(own.account, own.signer, tuple(trusted_signers or ())), None
+
+
 def _principal_option(
     principal: object,
 ) -> tuple[str, PrincipalKey | None, frozenset[PrincipalKey]] | None:
-    """Parse ``Inbox.open(principal=...)``: ``{"account": <CAIP-10>, "selfSigner"?:
-    {"scheme","publicKey"} | None, "trustedSigners"?: [{"scheme","publicKey"}, ...]}``."""
+    """Parse ``Inbox.open(principal=...)``: an ``InboxPrincipal`` or ``{"account": <CAIP-10>,
+    "selfSigner"?: {"scheme","publicKey"} | None,
+    "trustedSigners"?: [{"scheme","publicKey"}, ...]}``."""
     if principal is None:
         return None
+    if isinstance(principal, InboxPrincipal):
+        principal = principal.to_dict()
     if (
         not isinstance(principal, dict)
         or not set(principal) <= {"account", "selfSigner", "trustedSigners"}
@@ -350,19 +327,22 @@ def repair_thread(threads: ThreadStore, rec: _Delivery) -> None:
 
 
 class Inbox:
-    """Durable, exactly-once-to-the-host receive engine.
+    """Durable, exactly-once-to-the-host receive engine (the application codec).
 
-    ``on_message(parsed)`` must persist the host effect durably and idempotently, keyed by
-    ``(from_id, message_id)``, then return; raising means "retry later". Commit order per
-    message: delivery record, ``requests/`` decision fill (``decision`` only), thread state,
-    replay state, ``on_message``, ack, cursor. Open with ``Inbox.open(...)``; the instance
-    holds the store's ``receive`` lock until ``close()``.
+    It knows nothing about the network: ``SecureMailbox`` (the only network receive
+    boundary) feeds it authenticated MLS plaintext through ``receive``; in-process code and
+    tests call ``receive`` directly. ``on_message(parsed)`` must persist the host effect
+    durably and idempotently, keyed by ``(from_id, message_id)``, then return; raising means
+    "retry later". Commit order per message: delivery record, ``requests/`` decision fill
+    (``decision`` only), thread state, replay state, ``on_message``, ack. Open with
+    ``Inbox.open(...)``; the instance holds the store's ``receive`` lock until ``close()``.
 
     ``principal`` (09) is the receiver's principal: ``{"account": <CAIP-10>, "selfSigner":
     {"scheme", "publicKey"} | None, "trustedSigners": [{"scheme", "publicKey"}, ...]}``
     (``selfSigner`` defaults to None and ``trustedSigners`` to empty: then only an ``eip155``
-    account whose address is the signer's passes 09 step 4). Without it every principal
-    message is ``wrong_principal``.
+    account whose address is the signer's passes 09 step 4). Without it no account policy is
+    installed: principal messages are delivered as plain data, unverified, and a ``decision``
+    never fills ``requests/``.
     """
 
     def __init__(self, *_: object, **__: object) -> None:
@@ -381,9 +361,12 @@ class Inbox:
         capacity: int = DEFAULT_REPLAY_CAPACITY,
         offline_window_seconds: int = OFFLINE_WINDOW_SECONDS,
         clock: Callable[[], int] | None = None,
-        principal: dict | None = None,
+        principal: InboxPrincipal | dict | None = None,
+        commerce: bool = False,
+        schemas: dict[str, SchemaValidator] | None = None,
     ) -> "Inbox":
         principal_option = _principal_option(principal)
+        installed = check_schemas(schemas)
         if not isinstance(peers, PeerStore):
             raise ACEError("invalid_argument", "peers must be a PeerStore")
         if not callable(on_message):
@@ -408,6 +391,8 @@ class Inbox:
         self._offline = offline_window_seconds
         self._clock = clock
         self._principal = principal_option
+        self._commerce = commerce
+        self._schemas = installed
         self._threads = ThreadStore(store, self._local, clock=clock)
         self._mutex = threading.RLock()
         self._failed = False
@@ -420,7 +405,6 @@ class Inbox:
         self._lock = lock
         try:
             self._replay = self._load_replay()
-            self._cursors = self._load_cursors()
             self._recover()
         except BaseException:
             self._closed = True
@@ -451,7 +435,7 @@ class Inbox:
         """R-P20 (09 § Same-Account Rules): when the pinned sender principal fails steps 2-5,
         refresh the sender's binding from the relay once (rollback barrier) and return the
         binding the rules run on. Runs before any lock is taken, so relay I/O never holds
-        ``requests``. A transient failure raises (the message is retryable, the cursor stays);
+        ``requests``. A transient failure raises (the message is retryable, nothing committed);
         a non-ACE exception is ``relay_unavailable``; a permanent ``ACEError`` or no relay
         leaves the pinned binding to decide. Only an envelope authenticated by the pinned
         signing key triggers a refresh (R-P30); otherwise the pipeline rejects it later."""
@@ -513,17 +497,6 @@ class Inbox:
     def _write_replay(self, replay: ReplayDetector) -> None:
         write_record(self._store, "replay.json", replay.export_state())
 
-    def _load_cursors(self) -> dict[str, str]:
-        d = load_record(self._store, "cursors.json")
-        if d is None:
-            return {}
-        cursors = d.get("cursors")
-        if not isinstance(cursors, dict) or not all(
-            isinstance(k, str) and is_stream_id(v) for k, v in cursors.items()
-        ):
-            raise ACEError("storage_failed", "cursors.json is invalid")
-        return dict(cursors)
-
     def _recover(self) -> None:
         """Repair threads, ``requests/`` decision fills and replay from every delivery record
         first (ordered by (timestamp, key)), then hand over the pending ones in the same order.
@@ -538,7 +511,11 @@ class Inbox:
                 ):
                     continue  # fully committed long ago; its thread may have been pruned
                 repair_thread(self._threads, rec)
-        decisions = [rec.message for rec in records if rec.message.type == "decision"]
+        decisions = [
+            rec.message
+            for rec in records
+            if self._principal is not None and rec.message.type == "decision"
+        ]
         if decisions:  # 1a: a decision's requests/ fill (no-op when already filled)
             with self._store.lock("requests"):
                 for m in decisions:
@@ -566,10 +543,6 @@ class Inbox:
 
     # --- public ---
 
-    def cursor(self, relay: RelayClient) -> str | None:
-        """The persisted cursor for ``relay`` (keyed by its normalized ``base_url``), or None."""
-        return self._cursors.get(relay.base_url)
-
     def close(self) -> None:
         with self._mutex:
             if self._closed:
@@ -588,17 +561,16 @@ class Inbox:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def receive(self, message: bytes, source: ReceiveSource) -> ReceiveOutcome:
-        """Receive one envelope given as its raw JSON bytes.
+    def receive(self, message: bytes) -> ReceiveOutcome:
+        """Receive one envelope given as its raw JSON bytes (authenticated MLS plaintext from
+        ``SecureMailbox``, or an in-process envelope).
 
         Bytes over ``MAX_ENVELOPE_BYTES``, or that are not UTF-8 JSON, are ``quarantined``
-        (``invalid_envelope``, no fingerprint, nothing stored). A closed inbox, non-bytes
-        ``message`` or an invalid ``source`` raise ``invalid_argument``.
+        (``invalid_envelope``, no fingerprint, nothing stored). A closed inbox or a non-bytes
+        ``message`` raise ``invalid_argument``.
         """
         if not isinstance(message, (bytes, bytearray, memoryview)):
             raise ACEError("invalid_argument", "message must be the raw envelope bytes")
-        if not isinstance(source, ReceiveSource):
-            raise ACEError("invalid_argument", "source must be a ReceiveSource")
         with self._mutex:
             if self._closed:
                 raise ACEError("invalid_argument", "the inbox is closed")
@@ -607,30 +579,11 @@ class Inbox:
                     "retryable",
                     error=ACEError("storage_failed", "inbox is in a failed state; reopen it"),
                 )
-            outcome = self._receive(bytes(message), source)
-            if outcome.kind in ("delivered", "duplicate", "quarantined"):
-                try:
-                    self._advance_cursor(source)
-                except ACEError as exc:
-                    self._failed = True
-                    return ReceiveOutcome("retryable", error=exc)
-            return outcome
+            return self._receive(bytes(message))
 
-    def _advance_cursor(self, source: ReceiveSource) -> None:
-        if source.kind != "relay" or source.stream_id is None:
-            return
-        url = source.relay_url
-        current = self._cursors.get(url)  # type: ignore[arg-type]
-        if current is not None and compare_stream_ids(source.stream_id, current) <= 0:
-            return
-        cursors = {**self._cursors, url: source.stream_id}
-        write_record(self._store, "cursors.json", {"cursors": cursors})
-        self._cursors = cursors  # type: ignore[assignment]
-
-    def _quarantine(self, err: ACEError, env: ACEMessage, source: ReceiveSource) -> ReceiveOutcome:
+    def _quarantine(self, err: ACEError, env: ACEMessage) -> ReceiveOutcome:
         fp = envelope_fingerprint(env)
-        if source.kind == "relay":
-            self._write_quarantine(err, env, fp)
+        self._write_quarantine(err, env, fp)
         return ReceiveOutcome(
             "quarantined", error=err, fingerprint=fp, from_id=env.from_id, message_id=env.message_id
         )
@@ -647,7 +600,6 @@ class Inbox:
                 "fingerprint": fp,
                 "quarantinedAt": self._now(),
                 "reason": err.message[:_REASON_MAX],
-                "source": "relay",
             },
         )
         if existed:
@@ -699,40 +651,7 @@ class Inbox:
             )
         return ReceiveOutcome("delivered", message=m, from_id=m.from_id, message_id=m.message_id)
 
-    def receive_direct(self, body: bytes) -> DirectReply:
-        """Answer one direct-delivery request body (08-relay § Direct Delivery, Receiver).
-
-        Never raises for request content: the reply says what to send. A closed inbox
-        answers 503 ``internal_error`` (not a fault of the request: the sender falls back to
-        the relay). HTTP serving, routing and rate limiting belong to the application.
-        """
-        if not isinstance(body, (bytes, bytearray, memoryview)):
-            raise ACEError("invalid_argument", "body must be the raw request bytes")
-        if self._closed:
-            return _reject(503, "internal_error")
-        if len(body) > MAX_DIRECT_BODY_BYTES:
-            return _reject(413, "payload_too_large")
-        try:
-            obj = loads_json(bytes(body))
-        except ValueError:
-            obj = None
-        if not isinstance(obj, dict) or "message" not in obj:
-            return _reject(400, "invalid_argument")
-        try:
-            raw = json.dumps(obj["message"], ensure_ascii=False, separators=(",", ":"))
-            outcome = self.receive(raw.encode("utf-8", "surrogatepass"), ReceiveSource.direct())
-        except ACEError as exc:
-            if self._closed:  # closed meanwhile
-                return _reject(503, "internal_error")
-            return _reject(400 if exc.category == "permanent" else 503, exc.code)
-        except Exception:
-            return _reject(503, "internal_error")
-        if outcome.kind in ("delivered", "duplicate"):
-            return DirectReply(200, {"ok": True, "messageId": outcome.message_id}, outcome)
-        assert outcome.error is not None
-        return _reject(400 if outcome.kind == "quarantined" else 503, outcome.error.code, outcome)
-
-    def _receive(self, data: bytes, source: ReceiveSource) -> ReceiveOutcome:
+    def _receive(self, data: bytes) -> ReceiveOutcome:
         now = self._now()
         # 1. decode
         if len(data) > MAX_ENVELOPE_BYTES:
@@ -748,14 +667,7 @@ class Inbox:
             )
         except ACEError as exc:
             return ReceiveOutcome("quarantined", error=exc)
-        # 2. direct freshness
-        if source.kind == "direct" and abs(now - env.timestamp) > TIMESTAMP_WINDOW_SECONDS:
-            return self._quarantine(
-                ACEError("stale_timestamp", "direct delivery outside the timestamp window"),
-                env,
-                source,
-            )
-        # 3. peer
+        # 2. peer (freshness is the MLS handshake's job; the replay floor stays in parse)
         try:
             peer = self._peers.resolve(env.from_id)
             my_enc = self._identity.get_encryption_public_key()
@@ -767,7 +679,7 @@ class Inbox:
                     "retryable", error=exc, from_id=env.from_id, message_id=env.message_id
                 )
             try:
-                return self._quarantine(exc, env, source)
+                return self._quarantine(exc, env)
             except ACEError as store_exc:
                 return ReceiveOutcome("retryable", error=store_exc)
         except Exception as exc:  # e.g. a custom relay client or transport bug: retry later
@@ -777,7 +689,7 @@ class Inbox:
             return ReceiveOutcome(
                 "retryable", error=err, from_id=env.from_id, message_id=env.message_id
             )
-        # 4. stored delivery
+        # 3. stored delivery
         key = delivery_key(env.from_id, env.message_id)
         try:
             d = load_record(self._store, key)
@@ -790,23 +702,26 @@ class Inbox:
             if stored.status == "pending":
                 return self._hand_over(stored)
             return ReceiveOutcome("duplicate", from_id=env.from_id, message_id=env.message_id)
-        # 5 (principal types): refresh a sender whose pinned principal fails 09 steps 2-5
-        if is_principal_type(env.type):
-            try:
+        tr = self._replay.clone()
+        try:
+            parsed = parse_message(
+                env, self._identity, peer, replay=tr, floor=self._floor(), clock=self._clock
+            )
+            run_schema_validator(  # 06 step 6: installed deterministic validation
+                self._schemas, parsed.type, parsed.schema_digest, parsed.thread_id, parsed.body
+            )
+            if self._principal is not None and is_principal_type(parsed.type):
                 peer = self._refresh_principal_sender(env, peer, now)
-            except ACEError as exc:
-                if exc.is_transient:
-                    return ReceiveOutcome(
-                        "retryable", error=exc, from_id=env.from_id, message_id=env.message_id
-                    )
-                try:
-                    return self._quarantine(exc, env, source)
-                except ACEError as store_exc:
-                    return ReceiveOutcome("retryable", error=store_exc)
-        # 5-7: economic types under ``threads``; a decision under ``requests`` from the open-
-        # request check through the requests/ fill (R-P25)
-        economic = is_economic_type(env.type)
-        decision = env.type == "decision"
+        except ACEError as exc:
+            return self._rejected(exc, env, tr)
+        economic = self._commerce and is_economic_type(parsed.type)
+        if economic and parsed.thread_id is None:
+            return self._rejected(
+                ACEError("invalid_envelope", "commerce messages require a private threadId"),
+                env,
+                tr,
+            )
+        decision = self._principal is not None and parsed.type == "decision"
         with ExitStack() as held:
             if economic or decision:
                 try:
@@ -817,7 +732,7 @@ class Inbox:
                     return ReceiveOutcome(
                         "retryable", error=exc, from_id=env.from_id, message_id=env.message_id
                     )
-            result = self._parse_and_commit(env, peer, key, source, now, economic)
+            result = self._parse_and_commit(env, peer, key, now, economic, decision, parsed, tr)
             if self._failed and (economic or decision):
                 self._held_locks = (
                     held.pop_all()
@@ -835,66 +750,61 @@ class Inbox:
                     pass
         return outcome
 
+    def _rejected(self, exc: ACEError, env: ACEMessage, tr: ReplayDetector) -> ReceiveOutcome:
+        ids = {"from_id": env.from_id, "message_id": env.message_id}
+        if exc.code == "replay":
+            return ReceiveOutcome("duplicate", **ids)
+        if exc.is_transient:
+            return ReceiveOutcome("retryable", error=exc, **ids)
+        try:
+            outcome = self._quarantine(exc, env)
+            if not tr.accepts(env.message_id, env.from_id, env.timestamp):
+                self._write_replay(tr)
+                self._replay = tr
+            return outcome
+        except ACEError as store_exc:
+            return ReceiveOutcome("retryable", error=store_exc, **ids)
+
     def _parse_and_commit(
         self,
         env: ACEMessage,
         peer: Any,
         key: str,
-        source: ReceiveSource,
         now: int,
         economic: bool,
+        decision: bool,
+        parsed: ParsedMessage,
+        tr: ReplayDetector,
     ) -> "ReceiveOutcome | _Delivery":
-        """Steps 5-7.3 (caller holds ``threads`` for economic types, ``requests`` for a
-        decision). Returns an outcome, or the committed pending delivery to hand over."""
         ids = {"from_id": env.from_id, "message_id": env.message_id}
         try:
             if economic:
-                machine, rec = self._threads._machine(env.conversation_id, env.thread_id)  # type: ignore[arg-type]
+                machine, rec = self._threads._machine(env.conversation_id, parsed.thread_id)
             else:
                 machine, rec = ThreadStateMachine(self._local), None
         except ACEError as exc:
             return ReceiveOutcome("retryable", error=exc, **ids)
-        tr = self._replay.clone()
-        floor = self._floor()
-        # 6. parse
         try:
-            parsed = parse_message(
-                env,
-                self._identity,
+            apply_receive_rules(
+                parsed,
                 peer,
-                threads=machine,
-                replay=tr,
-                floor=floor,
-                clock=self._clock,
+                threads=machine if economic else None,
                 principal=self._principal_context(),
+                now=now,
             )
-            # a verified message that opens a thread is bounded per peer (04 § Open-thread bound)
             if economic and rec is None:
                 self._threads._check_can_open(env.from_id)
         except ACEError as exc:
-            if exc.code == "replay":
-                return ReceiveOutcome("duplicate", **ids)
-            if exc.is_transient:
-                return ReceiveOutcome("retryable", error=exc, **ids)
-            try:
-                outcome = self._quarantine(exc, env, source)
-                if not tr.accepts(env.message_id, env.from_id, env.timestamp):
-                    self._write_replay(tr)  # a verified message stays one-shot
-                    self._replay = tr
-            except ACEError as store_exc:
-                return ReceiveOutcome("retryable", error=store_exc, **ids)
-            return outcome
+            return self._rejected(exc, env, tr)
         # 7. durable commit
-        snap = machine.get_snapshot(env.conversation_id, env.thread_id) if economic else None  # type: ignore[arg-type]
-        delivery = _Delivery(
-            key, parsed, envelope_fingerprint(env), now, source.kind, "pending", snap
-        )
+        snap = machine.get_snapshot(env.conversation_id, parsed.thread_id) if economic else None  # type: ignore[arg-type]
+        delivery = _Delivery(key, parsed, envelope_fingerprint(env), now, "pending", snap)
         try:
             write_record(self._store, key, delivery.to_dict())  # 7.1 commit point
         except ACEError as exc:
             return ReceiveOutcome("retryable", error=exc, **ids)
         try:
-            if parsed.type == "decision":  # 7.1a: mark the request decided
+            if decision:  # 7.1a: mark the request decided
                 fill_decision(self._store, parsed)
             if snap is not None:  # 7.2
                 self._threads._save(ThreadRecord(snap, _clear_proven_pending(rec, snap)))
@@ -921,98 +831,3 @@ class Inbox:
                     self._store.delete(key)
                     removed += 1
             return removed
-
-    # --- relay drivers ---
-
-    def pull(
-        self,
-        relay: RelayClient,
-        *,
-        limit: int = MAX_INBOX_PAGE,
-        max_pages: int | None = None,
-        stop: threading.Event | None = None,
-    ) -> PullResult:
-        """Fetch and receive queued messages from the cursor, page by page. Stops at the first
-        retryable outcome (or fetch error) and returns its error as ``blocked``; ``outcomes``
-        holds every other outcome. ``max_pages`` bounds the pages fetched and ``stop`` ends the
-        pull before the next entry; both set ``has_more``. Never raises: an invalid ``limit``
-        (1-100) or ``max_pages`` (>= 1) is ``blocked`` with ``invalid_argument``. ``outcomes``
-        grows with the backlog; use ``max_pages`` or ``follow`` to bound memory."""
-        if type(limit) is not int or not 1 <= limit <= MAX_INBOX_PAGE:
-            return PullResult(
-                [], ACEError("invalid_argument", f"limit must be an integer in 1..{MAX_INBOX_PAGE}")
-            )
-        if max_pages is not None and (type(max_pages) is not int or max_pages < 1):
-            return PullResult([], ACEError("invalid_argument", "max_pages must be an integer >= 1"))
-        outcomes: list[ReceiveOutcome] = []
-        drain = self._drain(relay, limit, max_pages, stop)
-        while True:
-            try:
-                outcome = next(drain)
-            except StopIteration as done:
-                end = done.value
-                return PullResult(outcomes, end.error, end.reason in ("stopped", "page_limit"))
-            if outcome.kind != "retryable":
-                outcomes.append(outcome)
-
-    def _drain(
-        self,
-        relay: RelayClient,
-        limit: int,
-        max_pages: int | None = None,
-        stop: threading.Event | None = None,
-    ) -> Generator[ReceiveOutcome, None, _DrainEnd]:
-        """Yield each outcome of a drain (a retryable one last); return why it ended."""
-        url = relay.base_url
-        since = self.cursor(relay) or "-"
-        pages = 0
-        while True:
-            # a stopped caller ends before the next page or entry; the cursor marks the spot
-            if stop is not None and stop.is_set():
-                return _DrainEnd("stopped")
-            if max_pages is not None and pages >= max_pages:
-                return _DrainEnd("page_limit")
-            pages += 1
-            try:
-                page = relay.fetch_inbox(self._identity, since=since, limit=limit)
-            except ACEError as exc:
-                return _DrainEnd("blocked", exc)
-            for entry in page.entries:
-                if stop is not None and stop.is_set():
-                    return _DrainEnd("stopped")
-                outcome = self.receive(entry.message, ReceiveSource.relay(url, entry.stream_id))
-                yield outcome
-                if outcome.kind == "retryable":
-                    return _DrainEnd("blocked", outcome.error)
-            if len(page.entries) < limit:
-                return _DrainEnd("drained")
-            since = page.entries[-1].stream_id
-
-    def follow(
-        self,
-        relay: RelayClient,
-        *,
-        stop: threading.Event | None = None,
-        on_live: Callable[[], None] | None = None,
-    ) -> Iterator[ReceiveOutcome]:
-        """Yield the outcomes of an initial ``pull``, then of live SSE events.
-
-        ``on_live`` runs once the initial pull is done and the event stream is connected, and
-        again after each reconnect. A ``retryable`` outcome is yielded, then its error raised;
-        a failed inbox fetch is raised. Set ``stop`` (or close the generator) to end. Outcomes
-        are streamed, not retained: the consumer's pace is the backpressure.
-        """
-        end = yield from self._drain(relay, MAX_INBOX_PAGE, None, stop)
-        if end.error is not None:
-            raise end.error
-        if end.reason == "stopped":
-            return
-        url = relay.base_url
-        for entry in relay.listen(
-            self._identity, since=self.cursor(relay) or "-", stop=stop, on_open=on_live
-        ):
-            outcome = self.receive(entry.message, ReceiveSource.relay(url, entry.stream_id))
-            yield outcome
-            if outcome.kind == "retryable":
-                assert outcome.error is not None
-                raise outcome.error

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, NamedTuple
+import copy
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, TypeVar
 
 from ._encoding import is_ace_id, to_base64, unix_now, wire_int
 from .discovery import (
@@ -10,21 +11,29 @@ from .discovery import (
     VerifiedPeer,
     _make_peer,
     adopt_decision,
-    decode_peer_binding,
-    drop_expired_profile_principal,
-    validate_profile,
     verify_peer_record,
     verify_registration_file,
 )
 from .errors import ACEError
-from .store import ACEStore, load_record, write_record
+from .principal import same_principal_claims, validate_principal_record
+from .store import ACEStore, parse_record, write_record
 from .threads import sha256_hex
-from .types import RegistrationFile
+from .types import PrincipalRecord, RegistrationFile
 
 if TYPE_CHECKING:
     from .relay import RelayClient
 
 DEFAULT_PEER_TTL_SECONDS = 86400
+_VERIFIED_CACHE_SIZE = 256
+
+_T = TypeVar("_T")
+
+
+def _remember(cache: dict[tuple[str, bytes], _T], key: tuple[str, bytes], value: _T) -> _T:
+    if len(cache) >= _VERIFIED_CACHE_SIZE:
+        cache.clear()
+    cache[key] = value
+    return value
 
 
 class PeerAdoption(NamedTuple):
@@ -56,40 +65,31 @@ def _peer_from_record(d: dict, key: str) -> tuple[VerifiedPeer, int]:
         source, fetched_at = d.get("source"), wire_int(d.get("fetchedAt"))
         if fetched_at is None:
             raise ACEError("invalid_peer", "fetchedAt must be an integer")
-        if source == "relay":
-            record = {
-                k: d.get(k)
-                for k in (
-                    "aceId",
-                    "scheme",
-                    "encryptionPublicKey",
-                    "signingPublicKey",
-                    "registrationSignature",
-                    "registeredAt",
-                    "profile",
-                )
-            }
-            peer = verify_peer_record(record, clock=lambda: fetched_at)
-        elif source == "registration":
-            ace_id, scheme, signing_key, enc_key, registered_at = decode_peer_binding(d)
-            if d.get("registrationSignature") is not None:
-                raise ACEError(
-                    "invalid_peer", "a registration-file pin has no registrationSignature"
-                )
-            profile = None if d.get("profile") is None else validate_profile(d["profile"])
-            profile = drop_expired_profile_principal(profile, signing_key, fetched_at)
-            peer = _make_peer(
-                ace_id=ace_id,
-                scheme=scheme,
-                signing_public_key=signing_key,
-                encryption_public_key=enc_key,
-                registered_at=registered_at,
-                registration_signature=None,
-                source="registration",
-                profile=profile,
-            )
-        else:
+        if source not in ("relay", "registration"):
             raise ACEError("invalid_peer", "unknown source")
+        record = {
+            k: d.get(k)
+            for k in (
+                "aceId",
+                "scheme",
+                "encryptionPublicKey",
+                "signingPublicKey",
+                "registrationSignature",
+                "registeredAt",
+                "profile",
+            )
+        }
+        verified = verify_peer_record(record, clock=lambda: fetched_at)
+        peer = _make_peer(
+            ace_id=verified.ace_id,
+            scheme=verified.scheme,
+            signing_public_key=verified.signing_public_key,
+            encryption_public_key=verified.encryption_public_key,
+            registered_at=verified.registered_at,
+            registration_signature=verified.registration_signature,
+            source=source,
+            profile=verified.profile,
+        )
     except ACEError as exc:
         raise ACEError("storage_failed", f"{key}: {exc.message}") from None
     if key != _peer_key(peer.ace_id):
@@ -126,6 +126,10 @@ class PeerStore:
         self._relay = relay
         self._ttl = ttl_seconds
         self._clock = clock
+        # Stored records are re-verified on every read; verification is a pure function of the
+        # exact bytes, so its result is cached per (key, bytes) and a changed row re-verifies.
+        self._verified_pins: dict[tuple[str, bytes], tuple[VerifiedPeer, int]] = {}
+        self._verified_horizons: dict[tuple[str, bytes], PrincipalRecord] = {}
 
     def _now(self) -> int:
         return unix_now(self._clock)
@@ -136,10 +140,27 @@ class PeerStore:
             raise ACEError("invalid_argument", "ace_id must be an ACE ID")
         return ace_id  # type: ignore[return-value]
 
-    def _load(self, ace_id: str) -> tuple[VerifiedPeer, int] | None:
+    def _load(
+        self, ace_id: str, *, enforce_horizon: bool = True
+    ) -> tuple[VerifiedPeer, int] | None:
         key = _peer_key(ace_id)
-        d = load_record(self._store, key)
-        return None if d is None else _peer_from_record(d, key)
+        raw = self._store.read(key)
+        if raw is None:
+            return None
+        cached = self._verified_pins.get((key, bytes(raw)))
+        if cached is None:
+            cached = _remember(
+                self._verified_pins,
+                (key, bytes(raw)),
+                _peer_from_record(parse_record(raw, key), key),
+            )
+        result = (copy.deepcopy(cached[0]), cached[1])  # profile is mutable: never share it
+        if enforce_horizon:
+            try:
+                self._check_principal_horizon(result[0], persist=False)
+            except ACEError as exc:
+                raise ACEError("storage_failed", f"{key}: {exc.message}") from None
+        return result
 
     def get(self, ace_id: str) -> VerifiedPeer | None:
         rec = self._load(self._check_id(ace_id))
@@ -150,17 +171,49 @@ class PeerStore:
             raise ACEError("invalid_argument", "peer must be a VerifiedPeer")
         with self._store.lock("peers"):
             now = self._now()
-            rec = self._load(peer.ace_id)
+            rec = self._load(peer.ace_id, enforce_horizon=False)
             pin = rec[0] if rec else None
             result, outcome = adopt_decision(pin, peer, now)
+            self._check_principal_horizon(result)
             if result is not pin:
                 write_record(self._store, _peer_key(peer.ace_id), _peer_to_record(result, now))
             return PeerAdoption(result, outcome)
 
-    def pin_registration_file(
-        self, reg: RegistrationFile | dict, *, pinned_at: int | None = None
-    ) -> VerifiedPeer:
-        peer = verify_registration_file(reg, pinned_at=pinned_at, clock=self._clock)
+    def _check_principal_horizon(self, peer: VerifiedPeer, *, persist: bool = True) -> None:
+        next_ = peer.principal
+        if next_ is None:
+            return
+        domain = "\0".join(
+            [peer.ace_id, next_.account, next_.signer.scheme, next_.signer.public_key]
+        )
+        key = f"principal-horizons/{sha256_hex(domain)}.json"
+        raw = self._store.read(key)
+        # the key binds aceId, account and signer, so the bytes alone decide validity
+        high = None if raw is None else self._verified_horizons.get((key, bytes(raw)))
+        if raw is not None and high is None:
+            try:
+                d = parse_record(raw, key)
+                if d.get("aceId") != peer.ace_id:
+                    raise ValueError("wrong identity")
+                high = PrincipalRecord.from_dict(d["principal"])
+                if high.account != next_.account or high.signer != next_.signer:
+                    raise ValueError("wrong authority")
+                validate_principal_record(high, peer.signing_public_key, now=high.issued_at)
+            except (ACEError, ValueError, KeyError, TypeError):
+                raise ACEError("storage_failed", f"{key}: invalid principal horizon") from None
+            _remember(self._verified_horizons, (key, bytes(raw)), high)
+        if high is not None and (
+            next_.issued_at < high.issued_at
+            or (next_.issued_at == high.issued_at and not same_principal_claims(next_, high))
+        ):
+            raise ACEError(
+                "invalid_principal", "principal rolls back or conflicts with the durable horizon"
+            )
+        if persist and (high is None or next_.issued_at > high.issued_at):
+            write_record(self._store, key, {"aceId": peer.ace_id, "principal": next_.to_dict()})
+
+    def pin_registration_file(self, reg: RegistrationFile | dict) -> VerifiedPeer:
+        peer = verify_registration_file(reg, clock=self._clock)
         return self.adopt(peer).peer
 
     def remove(self, ace_id: str) -> None:

@@ -17,6 +17,7 @@ from ._encoding import is_ace_id, is_stream_id, unix_now, wire_int
 from .auth import RelayAuthRequest, create_auth_headers
 from .discovery import VerifiedPeer, verify_peer_record
 from .errors import ACEError, ACEErrorCode
+from .ext import validate_ext
 from .limits import MAX_ENVELOPE_BYTES, MAX_INBOX_PAGE
 from .registration import _KEEP, create_registration_request
 from .types import ACEIdentity, ACEMessage, AgentProfile, DiscoverQuery
@@ -122,14 +123,15 @@ class PostedIntent(NamedTuple):
 
 @dataclass(frozen=True)
 class Intent:
-    """A published intent (``GET /v1/intents``). Relay metadata: not signed end to end."""
+    """A published intent (``GET /v1/intents``). Relay metadata: not signed end to end.
+    ``ext`` is the plain extensions object as served (``None`` when absent);
+    ``intent_commerce_ext(intent)`` reads ``urn:ace:commerce:1``."""
 
     intent_id: str
     from_id: str
     need: str
     tags: tuple[str, ...]
-    max_price: str | None
-    currency: str | None
+    ext: dict | None
     ttl: int
     created_at: int
     expires_at: int
@@ -391,7 +393,6 @@ class RelayClient:
         params = {
             "q": q.q,
             "tags": _join_tags(q.tags),
-            "chain": q.chain,
             "scheme": q.scheme,
             "online": None if q.online is None else ("true" if q.online else "false"),
             "account": q.account,
@@ -443,15 +444,15 @@ class RelayClient:
         *,
         ttl: int,
         tags: list[str] | None = None,
-        max_price: str | None = None,
-        currency: str | None = None,
+        ext: dict | None = None,
     ) -> PostedIntent:
-        req = RelayAuthRequest.intent(need, tags or (), max_price, currency, ttl)
+        """``POST /v1/intents``. ``ext`` follows the profile ``ext`` rules (``invalid_argument``);
+        put ``maxPrice`` / ``currency`` under ``ext["urn:ace:commerce:1"]``. An empty ``ext`` is
+        not sent."""
+        req = RelayAuthRequest.intent(need, tags or (), ext, ttl)
         body: dict[str, Any] = {"need": need, "tags": list(req.tags), "ttl": ttl}
-        if max_price is not None:
-            body["maxPrice"] = max_price
-        if currency is not None:
-            body["currency"] = currency
+        if req.ext is not None:
+            body["ext"] = req.ext
         obj = self._object(
             self._call(
                 "POST", "/v1/intents", body=body, identity=identity, auth=req, expect=(200, 201)
@@ -482,8 +483,7 @@ class RelayClient:
                 raise _protocol("intent entries must be objects")
             tags_v = i.get("tags")
             ints = [wire_int(i.get(k)) for k in ("ttl", "createdAt", "expiresAt")]
-            opt = [i.get(k) for k in ("maxPrice", "currency")]
-            # optional members: absent is fine, present but not a string (null included) is not
+            # ``ext`` is optional: absent is fine, present but not an object (null included) is not
             if (
                 not isinstance(i.get("intentId"), str)
                 or not isinstance(i.get("from"), str)
@@ -491,11 +491,15 @@ class RelayClient:
                 or not isinstance(tags_v, list)
                 or not all(isinstance(t, str) for t in tags_v)
                 or None in ints
-                or any(k in i and not isinstance(i[k], str) for k in ("maxPrice", "currency"))
+                or ("ext" in i and not isinstance(i["ext"], dict))
             ):
                 raise _protocol("malformed intent entry")
+            try:  # the served ext must satisfy the intent ext rules (incl. urn:ace:commerce:1)
+                ext = validate_ext(i.get("ext"), "intent")
+            except ACEError as exc:
+                raise _protocol(f"malformed intent ext: {exc.message}") from None
             out.append(
-                Intent(i["intentId"], i["from"], i["need"], tuple(tags_v), opt[0], opt[1], *ints)
+                Intent(i["intentId"], i["from"], i["need"], tuple(tags_v), ext, *ints)
             )  # type: ignore[arg-type]
         return IntentPage(out, self._cursor(obj))
 

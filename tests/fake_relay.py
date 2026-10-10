@@ -324,11 +324,7 @@ class FakeRelay:
 
     def _post_v1_intents(self, h, query, body):
         req = RelayAuthRequest.intent(
-            body["need"],
-            body.get("tags") or (),
-            body.get("maxPrice"),
-            body.get("currency"),
-            wire_int(body["ttl"]),
+            body["need"], body.get("tags") or (), body.get("ext"), wire_int(body["ttl"])
         )
         ace_id = self._auth(h, req)
         now = self.clock()
@@ -341,9 +337,8 @@ class FakeRelay:
             "createdAt": now,
             "expiresAt": now + body["ttl"],
         }
-        for k in ("maxPrice", "currency"):
-            if body.get(k) is not None:
-                intent[k] = body[k]
+        if req.ext is not None:
+            intent["ext"] = req.ext  # stored re-canonicalised, served byte-for-byte
         self.intents.append(intent)
         self._reply(h, 201, {"intentId": intent["intentId"], "expiresAt": intent["expiresAt"]})
 

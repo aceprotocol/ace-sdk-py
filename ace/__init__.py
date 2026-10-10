@@ -11,6 +11,22 @@ from ._encoding import (
     is_thread_id,
     to_base64,
 )
+from .audit import (
+    AuditCheckpoint,
+    AuditTree,
+    AuditWitnessPolicy,
+    AuditWitnessReceipt,
+    audit_checkpoint_digest,
+    audit_commitment,
+    create_audit_checkpoint,
+    create_audit_opening,
+    create_audit_witness_receipt,
+    verify_audit_checkpoint,
+    verify_audit_consistency,
+    verify_audit_inclusion,
+    verify_audit_witness_quorum,
+    verify_audit_witness_receipt,
+)
 from .auth import RelayAuthRequest, create_auth_headers, parse_auth_headers, verify_auth_headers
 from .direct import deliver_direct_or_relay, post_direct
 from .discovery import (
@@ -29,8 +45,36 @@ from .encryption import (
 )
 from .envelope import decode_envelope, envelope_fingerprint, verify_envelope_signature
 from .errors import ACEError, ACEErrorCategory, ACEErrorCode
+from .execution_request import (
+    EXECUTION_REQUEST_SCHEMA,
+    EXECUTION_REQUEST_SCHEMA_DIGEST,
+    EXECUTION_REQUEST_TYPE,
+    parse_execution_request,
+)
+from .ext import (
+    COMMERCE_EXT,
+    CommerceAccount,
+    CommerceIntentExt,
+    CommercePricing,
+    CommerceProfileExt,
+    ExtCarrier,
+    ExtMap,
+    commerce_ext,
+    ext_canonical,
+    intent_commerce_ext,
+    validate_commerce_ext,
+    validate_ext,
+)
+from .grants import (
+    ResourcePolicy,
+    create_execution_grant,
+    execution_grant_digest,
+    execution_intent_digest,
+    is_execution_units,
+    verify_execution_grant_chain,
+)
 from .identity import SoftwareIdentity, compute_ace_id
-from .inbox import DirectReply, Inbox, PullResult, ReceiveOutcome, ReceiveSource
+from .inbox import Inbox, InboxPrincipal, ReceiveOutcome, inbox_principal_from_own_record
 from .limits import (
     DEFAULT_REPLAY_CAPACITY,
     KEM_CIPHERTEXT_SIZE,
@@ -38,6 +82,10 @@ from .limits import (
     KEM_SEED_SIZE,
     MAX_DIRECT_BODY_BYTES,
     MAX_ENVELOPE_BYTES,
+    MAX_EXT_BYTES,
+    MAX_EXT_DEPTH,
+    MAX_EXT_KEY_BYTES,
+    MAX_EXT_KEYS,
     MAX_INBOX_PAGE,
     MAX_JSON_DEPTH,
     MAX_OPEN_THREADS_PER_PEER,
@@ -48,7 +96,13 @@ from .limits import (
     OFFLINE_WINDOW_SECONDS,
     TIMESTAMP_WINDOW_SECONDS,
 )
-from .messages import create_message, parse_message, validate_body
+from .messages import (
+    SchemaValidator,
+    create_message,
+    known_schema_digest,
+    parse_message,
+    validate_body,
+)
 from .outbox import Outbox
 from .peers import PeerStore
 from .principal import (
@@ -71,6 +125,17 @@ from .registration import (
 )
 from .relay import Intent, RelayClient, Webhook
 from .replay import ReplayDetector
+from .secure_mailbox import (
+    DirectReply,
+    PullResult,
+    SecureMailbox,
+    SecureRelayReplies,
+    deliver_secure,
+    open_secure_mailbox,
+    secure_transport_for,
+)
+from .secure_transport import SecureTransport
+from .session import MLSError, NativeMLSEngine, PairwiseMLS
 from .state_machine import (
     ThreadEvent,
     ThreadHistoryEntry,
@@ -78,7 +143,7 @@ from .state_machine import (
     ThreadState,
     ThreadStateMachine,
 )
-from .store import ACEStore, FileStore, MemoryStore
+from .store import ACEStore, FileStore, MemoryStore, check_key, check_lock_name
 from .threads import PendingSend, ThreadStore
 from .types import (
     ECONOMIC_TYPES,
@@ -90,7 +155,6 @@ from .types import (
     ACEMessage,
     AgentProfile,
     Capability,
-    ChainInfo,
     ConfirmBody,
     DecisionBody,
     DeliverBody,
@@ -106,10 +170,8 @@ from .types import (
     OfferBody,
     ParsedMessage,
     PeerRecord,
-    PricingInfo,
     PrincipalKey,
     PrincipalRecord,
-    ProfilePricing,
     ReceiptBody,
     RegistrationFile,
     RegistrationRequest,
@@ -131,6 +193,20 @@ from .types import (
 from .webhook import WebhookNotification, verify_webhook_notification
 
 __all__ = [
+    "AuditCheckpoint",
+    "AuditTree",
+    "AuditWitnessReceipt",
+    "AuditWitnessPolicy",
+    "audit_checkpoint_digest",
+    "create_audit_witness_receipt",
+    "verify_audit_witness_receipt",
+    "verify_audit_witness_quorum",
+    "audit_commitment",
+    "create_audit_opening",
+    "create_audit_checkpoint",
+    "verify_audit_checkpoint",
+    "verify_audit_consistency",
+    "verify_audit_inclusion",
     "__version__",
     # types
     "ACEIdentity",
@@ -140,10 +216,7 @@ __all__ = [
     "RegistrationFile",
     "SigningConfig",
     "Capability",
-    "PricingInfo",
-    "ChainInfo",
     "AgentProfile",
-    "ProfilePricing",
     "DiscoverQuery",
     "PeerRecord",
     "ACEMessage",
@@ -170,7 +243,6 @@ __all__ = [
     "ReplayState",
     "RegistrationRequest",
     "RelayAuthRequest",
-    "ReceiveSource",
     "ReceiveOutcome",
     "DirectReply",
     "PendingSend",
@@ -194,6 +266,10 @@ __all__ = [
     "MAX_ENVELOPE_BYTES",
     "MAX_DIRECT_BODY_BYTES",
     "MAX_JSON_DEPTH",
+    "MAX_EXT_KEYS",
+    "MAX_EXT_KEY_BYTES",
+    "MAX_EXT_BYTES",
+    "MAX_EXT_DEPTH",
     "MAX_THREAD_ID_LENGTH",
     "MAX_OPEN_THREADS_PER_PEER",
     "TIMESTAMP_WINDOW_SECONDS",
@@ -223,11 +299,26 @@ __all__ = [
     "create_message",
     "parse_message",
     "validate_body",
+    "known_schema_digest",
+    "SchemaValidator",
     "VerifiedPeer",
     "verify_peer_record",
     "verify_registration_file",
     "fetch_registration_file",
     "validate_profile",
+    # namespaced extensions (02 § Profile Fields) and urn:ace:commerce:1 (04)
+    "COMMERCE_EXT",
+    "ExtCarrier",
+    "ExtMap",
+    "CommerceProfileExt",
+    "CommerceIntentExt",
+    "CommercePricing",
+    "CommerceAccount",
+    "validate_ext",
+    "validate_commerce_ext",
+    "ext_canonical",
+    "commerce_ext",
+    "intent_commerce_ext",
     "is_blocked_address",
     "create_registration_file",
     "create_registration_request",
@@ -245,6 +336,21 @@ __all__ = [
     "RelayClient",
     "MemoryStore",
     "FileStore",
+    "check_key",
+    "check_lock_name",
+    # secure network boundary (13)
+    "SecureMailbox",
+    "SecureRelayReplies",
+    "SecureTransport",
+    # integration glue: receive boundary, sending side, own principal option
+    "open_secure_mailbox",
+    "secure_transport_for",
+    "deliver_secure",
+    "InboxPrincipal",
+    "inbox_principal_from_own_record",
+    "PairwiseMLS",
+    "NativeMLSEngine",
+    "MLSError",
     "verify_webhook_notification",
     "post_direct",
     "deliver_direct_or_relay",
@@ -267,4 +373,14 @@ __all__ = [
     "RequestBody",
     "DecisionBody",
     "ReportBody",
+    "ResourcePolicy",
+    "EXECUTION_REQUEST_SCHEMA",
+    "EXECUTION_REQUEST_SCHEMA_DIGEST",
+    "EXECUTION_REQUEST_TYPE",
+    "parse_execution_request",
+    "create_execution_grant",
+    "execution_grant_digest",
+    "execution_intent_digest",
+    "is_execution_units",
+    "verify_execution_grant_chain",
 ]

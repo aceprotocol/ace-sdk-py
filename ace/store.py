@@ -3,23 +3,22 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import json
 import os
 import re
-import socket
 import stat
 import threading
 import time
 from typing import Any, Callable, ContextManager, Protocol, runtime_checkable
 
-from ._encoding import canonical_state_bytes, wire_int
+from ._encoding import canonical_state_bytes
 from .errors import ACEError
 
 KEY_RE = re.compile(r"[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*")
 LOCK_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")  # 06-security § Appendix A
 MAX_KEY_LENGTH = 200
 MAX_VALUE_BYTES = 64 * 1024 * 1024
-_STALE_LOCK_SECONDS = 60
 _POLL_SECONDS = 0.05
 
 
@@ -53,9 +52,14 @@ def check_key(key: object) -> str:
     return key
 
 
-def _check_lock_args(name: object, timeout: object) -> tuple[str, float]:
+def check_lock_name(name: object) -> str:
     if not isinstance(name, str) or LOCK_NAME_RE.fullmatch(name) is None:
         raise ACEError("invalid_argument", f"invalid lock name {str(name)[:64]!r}")
+    return name
+
+
+def _check_lock_args(name: object, timeout: object) -> tuple[str, float]:
+    check_lock_name(name)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not timeout >= 0:
         raise ACEError("invalid_argument", "timeout must be a non-negative number")
     return name, float(timeout)
@@ -103,6 +107,7 @@ def _acquire_mutex(m: threading.Lock, name: str, timeout: float) -> None:
 
 
 # --- MemoryStore ------------------------------------------------------------------------
+
 
 class MemoryStore:
     """In-memory ``ACEStore``: a dict plus one in-process mutex per lock name."""
@@ -152,37 +157,32 @@ def _io_error(what: str, exc: BaseException) -> ACEError:
     return ACEError("storage_failed", f"{what}: {type(exc).__name__}: {exc}")
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        pass  # EPERM: alive, owned by another user
-    return True
-
-
 class FileStore:
     """``ACEStore`` over a directory (``root/<key>``).
 
     Directories are created 0700 and files 0600. Reads refuse symlinks and files over
     64 MiB. Writes go to ``.tmp-<16 hex>`` (``O_CREAT|O_EXCL|O_NOFOLLOW``), are fsynced,
     renamed over the key and the directory is fsynced. Locks are ``root/locks/<name>.lock``
-    files holding ``{"createdAt","host","pid"}``; a lock left by a dead process on this host,
-    or an unparseable lock file older than 60 s, is taken over. Concurrent access to one
-    root by different SDK languages is unsupported; the files at rest are portable.
+    permanent files with POSIX flock. The kernel releases locks on process exit; never
+    unlink or replace lock files. A local filesystem is required (network mounts unsupported).
     """
 
     def __init__(self, root: str | os.PathLike[str]) -> None:
         try:
+            missing = []
+            cursor = os.path.abspath(os.fspath(root))
+            while not os.path.lexists(cursor):
+                missing.append(cursor)
+                cursor = os.path.dirname(cursor)
             os.makedirs(root, mode=0o700, exist_ok=True)
+            for path in reversed(missing):
+                self._fsync_dir(os.path.dirname(path))
             self._root = os.path.realpath(os.fspath(root))
             st = os.stat(self._root)
         except OSError as exc:
             raise _io_error("cannot create store root", exc) from None
         if not stat.S_ISDIR(st.st_mode):
             raise ACEError("storage_failed", "store root is not a directory")
-        self._host = socket.gethostname()
 
     @property
     def root(self) -> str:
@@ -370,14 +370,14 @@ class FileStore:
             m = _PROCESS_LOCKS.setdefault((self._root, name), threading.Lock())
         _acquire_mutex(m, name, timeout)
         try:
-            content = self._acquire_file(name, deadline)
+            fd = self._acquire_file(name, deadline)
         except BaseException:
             m.release()
             raise
 
         def release() -> None:
             try:
-                self._release_file(name, content)
+                os.close(fd)
             finally:
                 m.release()
 
@@ -386,87 +386,31 @@ class FileStore:
     def _lock_path(self, name: str) -> str:
         return os.path.join(self._root, "locks", name + ".lock")
 
-    def _acquire_file(self, name: str, deadline: float) -> bytes:
+    def _acquire_file(self, name: str, deadline: float) -> int:
+        fd = None
         try:
             self._ensure_dir(["locks"])
-        except OSError as exc:
-            raise _io_error("create locks directory", exc) from None
-        path = self._lock_path(name)
-        content = canonical_state_bytes(
-            {"createdAt": int(time.time()), "host": self._host, "pid": os.getpid()}
-        )
-        while True:
-            try:
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            except FileExistsError:
-                if self._take_over_stale(path):
-                    continue
-                if time.monotonic() >= deadline:
-                    raise _busy(name) from None
-                time.sleep(
-                    min(_POLL_SECONDS, max(0.0, deadline - time.monotonic())) or _POLL_SECONDS
-                )
-                continue
-            except OSError as exc:
-                raise _io_error(f"create lock {name}", exc) from None
-            try:
+            fd = os.open(
+                self._lock_path(name), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600
+            )
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise ACEError("storage_failed", "lock is not a regular file")
+            while True:
                 try:
-                    os.write(fd, content)
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-                self._fsync_dir(os.path.dirname(path))
-            except OSError as exc:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
-                raise _io_error(f"write lock {name}", exc) from None
-            return content
-
-    def _take_over_stale(self, path: str) -> bool:
-        """Unlink a stale lock file; True means retry immediately."""
-        try:
-            raw = self._read_file(path)
-            st = os.lstat(path)
-        except FileNotFoundError:
-            return True
-        except (OSError, ACEError):
-            return False
-        if raw is None:
-            return True
-        stale = False
-        try:
-            info = json.loads(raw.decode("utf-8"))
-            pid = wire_int(info.get("pid")) if isinstance(info, dict) else None
-            host = info.get("host") if isinstance(info, dict) else None
-            if pid is None or not isinstance(host, str):
-                raise ValueError("lock file fields")
-            stale = host == self._host and pid > 0 and not _pid_alive(pid)
-        except (ValueError, UnicodeDecodeError, AttributeError):
-            stale = time.time() - st.st_mtime > _STALE_LOCK_SECONDS
-        if not stale:
-            return False
-        try:
-            # Narrow the race with another taker: unlink only if the content is unchanged.
-            if self._read_file(path) == raw:
-                os.unlink(path)
-        except FileNotFoundError:
-            pass
-        except (OSError, ACEError):
-            return False
-        return True
-
-    def _release_file(self, name: str, content: bytes) -> None:
-        path = self._lock_path(name)
-        try:
-            if self._read_file(path) == content:
-                os.unlink(path)
-                self._fsync_dir(os.path.dirname(path))
-        except FileNotFoundError:
-            pass
-        except OSError as exc:
-            raise _io_error(f"release lock {name}", exc) from None
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return fd
+                except OSError as exc:
+                    if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise _busy(name) from None
+                    time.sleep(min(_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+        except BaseException as exc:
+            if fd is not None:
+                os.close(fd)
+            if isinstance(exc, OSError):
+                raise _io_error(f"acquire lock {name}", exc) from None
+            raise
 
 
 # --- JSON records -----------------------------------------------------------------------
@@ -481,8 +425,11 @@ def write_record(store: ACEStore, key: str, obj: dict) -> None:
 def load_record(store: ACEStore, key: str) -> dict | None:
     """Read a ``version: 1`` JSON object; anything else is ``storage_failed``."""
     raw = store.read(key)
-    if raw is None:
-        return None
+    return None if raw is None else parse_record(raw, key)
+
+
+def parse_record(raw: bytes, key: str) -> dict:
+    """``load_record`` on bytes already read from ``key``."""
     try:
         obj = json.loads(bytes(raw).decode("utf-8"))
     except (UnicodeDecodeError, ValueError, RecursionError):

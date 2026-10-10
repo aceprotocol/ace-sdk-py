@@ -10,6 +10,7 @@ import pytest
 
 import ace.relay as relay_mod
 from ace import (
+    COMMERCE_EXT,
     ACEError,
     AgentProfile,
     DiscoverQuery,
@@ -17,6 +18,7 @@ from ace import (
     SoftwareIdentity,
     ThreadStateMachine,
     create_message,
+    intent_commerce_ext,
     verify_registration_file,
 )
 from ace.registration import create_registration_file
@@ -175,18 +177,24 @@ def test_unregister_and_intents(relay, ids):
         "translate 500 words",
         ttl=3600,
         tags=["translate", "fr"],
-        max_price="10",
-        currency="USDC",
+        ext={COMMERCE_EXT: {"maxPrice": "10", "currency": "USDC"}, "urn:x:1": {"b": 1, "a": "é"}},
     )
     page = client.list_intents()
     assert len(page.intents) == 1
     intent = page.intents[0]
     assert intent.intent_id == posted.intent_id and intent.from_id == alice.get_ace_id()
+    commerce = {"currency": "USDC", "maxPrice": "10"}
+    canonical = {COMMERCE_EXT: commerce, "urn:x:1": {"a": "é", "b": 1}}
     assert (
         intent.tags == ("translate", "fr")
-        and intent.max_price == "10"
+        and intent.ext == canonical
+        and intent_commerce_ext(intent) == {"currency": "USDC", "maxPrice": "10"}
         and intent.expires_at == posted.expires_at
     )
+    client.post_intent(alice, "no ext", ttl=60, ext={})  # an empty ext is absent: not sent
+    assert "ext" not in relay.intents[-1]
+    with raises("invalid_argument"):
+        client.post_intent(alice, "bad", ttl=60, ext={COMMERCE_EXT: {"maxPrice": "1"}})
     client.unregister(alice)
     assert alice.get_ace_id() not in relay.identities
     with raises("not_registered"):
@@ -528,8 +536,8 @@ def test_list_intents_strict_entries(relay):
     assert client.list_intents().intents[0].tags == ()
     for bad in (
         {k: v for k, v in base.items() if k != "tags"},
-        {**base, "maxPrice": None},
-        {**base, "currency": 5},
+        {**base, "ext": None},
+        {**base, "ext": "x"},
     ):
         body = json.dumps({"intents": [bad], "cursor": None}).encode()
         relay.raw_responses["/v1/intents"] = (200, body, "application/json")

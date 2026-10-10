@@ -1,6 +1,7 @@
 """Direct delivery, sender side (08-relay § Direct Delivery, Sender).
 
-The receiver side is ``Inbox.receive_direct``.
+A transport for secure delivery frames (``SecureRelayReplies``): direct endpoint first,
+relay fallback. The receiver side is ``SecureMailbox.receive_direct``.
 """
 
 from __future__ import annotations
@@ -112,13 +113,14 @@ def deliver_direct_or_relay(
     *,
     timeout: float = DEFAULT_DIRECT_TIMEOUT_SECONDS,
 ) -> Callable[[ACEMessage], DeliveryPath]:
-    """An ``Outbox.deliver`` transport: ``post_direct`` to ``endpoint`` when given, else (or
-    on ``direct_unavailable`` or an unsafe/invalid endpoint) ``relay.send``. A
-    ``direct_rejected`` error is raised as is: the recipient already rejected this
-    envelope, so it is not sent through the relay. Returns the path that delivered.
+    """A transport for ``SecureRelayReplies`` / secure delivery frames (the ``send`` of
+    ``SecureRelayReplies``): ``post_direct`` to ``endpoint`` when given, else (or on
+    ``direct_unavailable`` or an unsafe/invalid endpoint) ``relay.send``. A
+    ``direct_rejected`` error is raised as is: the recipient already rejected this frame,
+    so it is not sent through the relay. Returns the path that delivered.
 
-    Both paths carry the same envelope (same ``messageId``); the receiver's replay state
-    makes a second copy a duplicate.
+    Both paths carry the same frame (same ``messageId``); the receiver answers a second
+    copy with the same reply.
     """
 
     def transport(message: ACEMessage) -> DeliveryPath:

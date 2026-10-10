@@ -9,12 +9,13 @@ import ssl
 import pytest
 
 from ace import (
+    COMMERCE_EXT,
     AgentProfile,
-    ProfilePricing,
     RegistrationFile,
     RelayAuthRequest,
     SoftwareIdentity,
     VerifiedPeer,
+    commerce_ext,
     create_auth_headers,
     create_registration_request,
     discovery as disc,
@@ -64,7 +65,8 @@ def test_verify_peer_record(scheme):
         {"registeredAt": -1},
         {"registeredAt": NOW + 1},
         {"registrationSignature": None},
-        {"profile": {"pricing": {"currency": "USDC", "x": 1}}},
+        {"profile": {"ext": {COMMERCE_EXT: {"pricing": {"currency": "USDC", "x": 1}}}}},
+        {"profile": {"ext": {"not-namespaced": {}}}},
         {"signingPublicKey": base64.b64encode(b"\x02" + b"\x00" * 32).decode()},
     ]
     for override in bad:
@@ -90,11 +92,11 @@ def test_verify_registration_file_rules():
     reg_secp = create_registration_file(secp, name="B", endpoint="https://b.example/ace").to_dict()
     peer = verify_registration_file(reg_ed, clock=lambda: 42)
     assert (
-        peer.registered_at == 42
+        peer.registered_at == reg_ed["registeredAt"]
         and peer.source == "registration"
-        and peer.registration_signature is None
+        and peer.registration_signature == reg_ed["registrationSignature"]
     )
-    assert verify_registration_file(reg_secp, pinned_at=7).registered_at == 7
+    assert verify_registration_file(reg_secp).registered_at == reg_secp["registeredAt"]
     lower = {
         **reg_secp,
         "signing": {**reg_secp["signing"], "address": reg_secp["signing"]["address"].lower()},
@@ -102,6 +104,36 @@ def test_verify_registration_file_rules():
     verify_registration_file(lower)  # case-insensitive address comparison
     with_unknown = {**reg_ed, "future": {"x": 1}, "description": None}
     verify_registration_file(with_unknown)
+    # pre-ext commerce members are unknown members now: dropped, never an error
+    legacy = {
+        **reg_ed,
+        "settlement": [1],
+        "chains": [{"network": "x"}],
+        "capabilities": [{"id": "x", "description": "d", "pricing": {"model": "flat"}}],
+    }
+    legacy_peer = verify_registration_file(legacy)
+    assert legacy_peer.profile is None
+    assert RegistrationFile.from_dict(legacy).capabilities[0].to_dict() == {
+        "id": "x",
+        "description": "d",
+    }
+    # a file's ext is supplied as profile.ext (02 § Rollback Barrier); errors are invalid_profile
+    ext = {COMMERCE_EXT: {"settlement": ["crypto/instant"], "chains": ["eip155:8453"]}}
+    with_ext = create_registration_file(ed, name="A", endpoint="https://a.example/ace", ext=ext)
+    assert with_ext.to_dict()["ext"] == ext
+    peer_ext = verify_registration_file(with_ext.to_dict())
+    assert peer_ext.profile == AgentProfile(ext=ext)
+    assert commerce_ext(peer_ext.profile) == ext[COMMERCE_EXT]
+    assert commerce_ext(with_ext) == ext[COMMERCE_EXT] and commerce_ext(None) is None
+    assert "ext" not in create_registration_file(
+        ed, name="A", endpoint="https://a.example/ace", ext={}
+    ).to_dict()
+    bad_exts = ({"x": {}}, {COMMERCE_EXT: {"chains": ["x"]}}, {COMMERCE_EXT: {"maxPrice": "1"}})
+    for bad_ext in bad_exts:
+        with raises("invalid_profile"):
+            verify_registration_file({**reg_ed, "ext": bad_ext})
+        with raises("invalid_profile"):
+            create_registration_file(ed, name="A", endpoint="https://a.example/ace", ext=bad_ext)
 
     def mut(reg, **kw):
         out = {**reg, **{k: v for k, v in kw.items() if k != "signing"}}
@@ -124,15 +156,11 @@ def test_verify_registration_file_rules():
         mut(reg_secp, signing={"signingPublicKey": None}),
         mut(reg_secp, signing={"address": "0x" + "0" * 40}),
         mut(reg_ed, capabilities=[{"id": "x"}]),
-        mut(reg_ed, settlement=[1]),
-        mut(reg_ed, chains=[{"network": "x"}]),
         {"ace": "1.0"},
     ]
     for reg in bad:
         with raises("invalid_registration"):
             verify_registration_file(reg)
-    with raises("invalid_argument"):
-        verify_registration_file(reg_ed, pinned_at=-1)
     assert isinstance(RegistrationFile.from_dict(reg_ed), RegistrationFile)
 
 
@@ -141,13 +169,24 @@ def test_validate_profile():
         {
             "name": "Agent",
             "tags": ["a-b"],
-            "pricing": {"currency": "USDC", "maxAmount": "1.5"},
+            "ext": {
+                "urn:x:1": {"b": [1, "é"], "a": {}},
+                COMMERCE_EXT: {"pricing": {"currency": "USDC", "maxAmount": "1.5"}},
+            },
             "unknownField": 1,
+            "chains": ["eip155:1"],  # pre-ext top-level members are unknown: dropped
+            "pricing": {"currency": "x" * 99},
             "image": None,
         }
     )
-    assert p.pricing == ProfilePricing("USDC", "1.5") and p.image is None
+    assert commerce_ext(p) == {"pricing": {"currency": "USDC", "maxAmount": "1.5"}}
+    assert p.image is None
+    assert list(p.ext) == [COMMERCE_EXT, "urn:x:1"] and list(p.ext["urn:x:1"]) == ["a", "b"]
+    assert p.to_dict() == {"name": "Agent", "tags": ["a-b"], "ext": p.ext}
+    assert validate_profile({"name": "A", "ext": {}}) == AgentProfile(name="A")
+    assert validate_profile({"name": "A", "ext": None}).ext is None
     validate_profile(AgentProfile())
+    assert validate_profile(AgentProfile(ext={"urn:x:1": {}})).ext == {"urn:x:1": {}}
     bad = [
         {"name": ""},
         {"name": "x" * 65},
@@ -157,14 +196,13 @@ def test_validate_profile():
         {"tags": ["UPPER"]},
         {"tags": ["a"] * 11},
         {"capabilities": ["x" * 33]},
-        {"chains": ["eip155"]},
         {"endpoint": "https://"},
-        {"pricing": {"currency": ""}},
-        {"pricing": {"currency": "x" * 17}},
-        {"pricing": {"currency": "USDC", "maxAmount": "1."}},
-        {"pricing": {"currency": "USDC", "maxAmount": "-1"}},
-        {"pricing": {"currency": "USDC", "maxAmount": "1" * 33}},
-        {"pricing": {"currency": "USDC", "max_amount": "1"}},
+        {"ext": []},
+        {"ext": {"x": {}}},
+        {"ext": {"urn:x:1": "s"}},
+        {"ext": {COMMERCE_EXT: {"chains": ["eip155"]}}},
+        {"ext": {COMMERCE_EXT: {"pricing": {"currency": ""}}}},
+        {"ext": {COMMERCE_EXT: {"pricing": {"currency": "USDC", "max_amount": "1"}}}},
         {"tags": "a"},
         {"name": 5},
     ]
@@ -173,6 +211,8 @@ def test_validate_profile():
             validate_profile(prof)
     with raises("invalid_profile"):
         validate_profile(AgentProfile(name=5))  # type: ignore[arg-type]
+    with raises("invalid_profile"):
+        validate_profile(AgentProfile(ext={"x": {}}))
 
 
 def test_registration_request_modes():
@@ -181,8 +221,11 @@ def test_registration_request_modes():
     assert "profile" not in keep
     removed = create_registration_request(ident, None, timestamp=NOW)
     assert removed["profile"] is None
-    replaced = create_registration_request(ident, {"name": "X", "ignored": 1}, timestamp=NOW)
-    assert replaced["profile"] == {"name": "X"}
+    replaced = create_registration_request(
+        ident, {"name": "X", "ignored": 1, "ext": {"urn:x:1": {"b": 1, "a": 2}}}, timestamp=NOW
+    )
+    assert replaced["profile"] == {"name": "X", "ext": {"urn:x:1": {"a": 2, "b": 1}}}
+    assert list(replaced["profile"]["ext"]["urn:x:1"]) == ["a", "b"]  # canonical order
     for req in (keep, removed, replaced):
         result = verify_registration_request(req, clock=lambda: NOW)
         assert result.peer.registered_at == NOW and result.peer.source == "relay"
@@ -198,6 +241,21 @@ def test_registration_request_modes():
     )
     with raises("invalid_profile"):
         create_registration_request(ident, {"name": ""}, timestamp=NOW)
+    with raises("invalid_profile"):
+        create_registration_request(ident, {"ext": {"urn:x:1": 1}}, timestamp=NOW)
+    # the authorization binds the canonical ext: a re-ordered but equal ext still verifies,
+    # a changed one does not
+    same = {**replaced, "profile": {"name": "X", "ext": {"urn:x:1": {"b": 1, "a": 2}}}}
+    verify_registration_request(same, clock=lambda: NOW)
+    with raises("invalid_authorization"):
+        verify_registration_request(
+            {**replaced, "profile": {"name": "X", "ext": {"urn:x:1": {"a": 2, "b": 2}}}},
+            clock=lambda: NOW,
+        )
+    with raises("invalid_profile"):
+        verify_registration_request(
+            {**replaced, "profile": {"name": "X", "ext": {"bad": {}}}}, clock=lambda: NOW
+        )
     with raises("invalid_argument"):
         verify_registration_request(keep, window_seconds=-1)
     with raises("invalid_registration"):
@@ -252,11 +310,28 @@ def test_auth_headers():
         lambda: RelayAuthRequest.intent("x", ["a,b"]),
         lambda: RelayAuthRequest.intent("x", "ab"),
         lambda: RelayAuthRequest.intent("x", ttl=-1),
+        lambda: RelayAuthRequest.intent("x", ext={"x": {}}, ttl=60),
+        lambda: RelayAuthRequest.intent("x", ext={COMMERCE_EXT: {"currency": "USDC"}}, ttl=60),
         lambda: RelayAuthRequest("bogus"),
     ):  # type: ignore[arg-type]
         with raises("invalid_argument"):
             build()
     assert RelayAuthRequest.unregister().payload() == b""
+    # intent payload: encodePayload(need, join(tags), extCanonicalOrEmpty, decimal(ttl))
+    def fields(p: bytes) -> list[bytes]:
+        out, i = [], 0
+        while i < len(p):
+            n = int.from_bytes(p[i : i + 4], "big")
+            out.append(p[i + 4 : i + 4 + n])
+            i += 4 + n
+        return out
+
+    no_ext = RelayAuthRequest.intent("n", ["a", "b"], None, 60).payload()
+    assert fields(no_ext) == [b"n", b"a,b", b"", b"60"]
+    assert fields(RelayAuthRequest.intent("n", [], {}, 60).payload()) == [b"n", b"", b"", b"60"]
+    with_ext = RelayAuthRequest.intent("n", [], {"urn:x:1": {"b": "é", "a": 1}}, 60).payload()
+    canonical = '{"urn:x:1":{"a":1,"b":"é"}}'.encode("utf-8")  # sorted keys, non-ASCII unescaped
+    assert fields(with_ext) == [b"n", b"", canonical, b"60"]
 
 
 def test_blocked_addresses():

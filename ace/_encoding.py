@@ -44,9 +44,12 @@ def is_message_id(value: object) -> bool:
     return isinstance(value, str) and MESSAGE_ID_RE.fullmatch(value) is not None
 
 
-def is_conversation_id(value: object) -> bool:
-    """64 lowercase hex characters."""
+def is_sha256_hex(value: object) -> bool:
+    """64 lowercase hex characters (a SHA-256 digest)."""
     return isinstance(value, str) and CONVERSATION_ID_RE.fullmatch(value) is not None
+
+
+is_conversation_id = is_sha256_hex
 
 
 def is_thread_id(value: object) -> bool:
@@ -195,8 +198,10 @@ def eip55(address_hex40: str) -> str:
 # --- JSON values ------------------------------------------------------------
 
 
-def check_json_value(value: object, code: ACEErrorCode = "invalid_body") -> None:
-    """Sender-side JSON-value rules: plain JSON types, finite numbers, depth <= 32."""
+def check_json_value(
+    value: object, code: ACEErrorCode = "invalid_body", max_depth: int = MAX_JSON_DEPTH
+) -> None:
+    """Sender-side JSON-value rules: plain JSON types, finite numbers, depth <= ``max_depth``."""
     stack: list[tuple[object, int]] = [(value, 0)]
     while stack:
         v, depth = stack.pop()
@@ -210,8 +215,8 @@ def check_json_value(value: object, code: ACEErrorCode = "invalid_body") -> None
                 raise ACEError(code, "non-finite number")
             continue
         if type(v) is dict or type(v) is list:
-            if depth > MAX_JSON_DEPTH:
-                raise ACEError(code, f"JSON nesting exceeds depth {MAX_JSON_DEPTH}")
+            if depth > max_depth:
+                raise ACEError(code, f"JSON nesting exceeds depth {max_depth}")
             if type(v) is dict:
                 for k, child in v.items():  # type: ignore[union-attr]
                     if not isinstance(k, str):
