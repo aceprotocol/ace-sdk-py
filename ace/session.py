@@ -5,7 +5,6 @@ does not enroll peers, deliver packets, persist secrets, or fall back to static 
 """
 from __future__ import annotations
 
-import base64
 import ctypes
 import json
 import os
@@ -14,7 +13,7 @@ import threading
 from pathlib import Path
 from typing import Callable, Protocol, TypeVar
 
-from ._encoding import MAX_SAFE_INTEGER, canonical_state_bytes, is_ace_id
+from ._encoding import MAX_SAFE_INTEGER, canonical_state_bytes, is_ace_id, to_base64
 from .limits import (
     MLS_MAX_ENGINE_IO_BYTES,
     MLS_MAX_KEY_PACKAGE_CHARS,
@@ -210,7 +209,7 @@ class PairwiseMLS:
     def send(self, plaintext: bytes) -> dict:
         if not isinstance(plaintext, bytes) or len(plaintext) > MLS_MAX_PLAINTEXT_BYTES:
             raise MLSError("session_limit")
-        return self._step({"op": "send", "plaintext": base64.b64encode(plaintext).decode()})
+        return self._step({"op": "send", "plaintext": to_base64(plaintext)})
 
     def receive(self, message: str) -> dict:
         return self._wire_step("receive", "message", message, MLS_MAX_MESSAGE_CHARS)

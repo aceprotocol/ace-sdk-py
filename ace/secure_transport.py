@@ -6,9 +6,7 @@ The exchange callback must enforce its own network timeout and return one ACE re
 
 from __future__ import annotations
 
-import base64
 import hashlib
-import json
 import os
 import re
 import secrets
@@ -19,9 +17,11 @@ from typing import Callable
 from ._encoding import (
     MAX_SAFE_INTEGER,
     canonical_state_bytes,
+    decode_b64,
     is_ace_id,
     is_message_id,
     is_sha256_hex,
+    loads_json,
     unix_now,
     wire_int,
 )
@@ -39,6 +39,7 @@ from .messages import create_message, parse_message
 from .replay import ReplayDetector
 from .session import MLSEngine, MLSError, PairwiseMLS
 from .store import ACEStore, load_record, write_record
+from .threads import sha256_hex
 from .types import ACEIdentity, ACEMessage
 
 SECURE_DELIVERY_TYPE = "urn:ace:secure-delivery:2"
@@ -53,18 +54,16 @@ SECURE_DELIVERY_SCHEMA = hashlib.sha256(
 #: tail of the receipt the sender verifies. ``accept`` raises only for retryable/local failures.
 DeliveryOutcome = str
 _OUTCOME = re.compile(r"delivered|duplicate|rejected:([a-z0-9_]{1,64})")
-
-
-def _hash(raw: bytes) -> str:
-    return hashlib.sha256(raw).hexdigest()
+_MAX_INBOUND_ROWS = 1024
+_SWEEP_SECONDS = 30
 
 
 def _peer_key(peer: str) -> str:
-    return f"secure/peers/{_hash(peer.encode())}.json"
+    return f"secure/peers/{sha256_hex(peer)}.json"
 
 
 def _peer_lock(peer: str) -> str:
-    return f"secure-peer-{_hash(peer.encode())[:48]}"
+    return f"secure-peer-{sha256_hex(peer)[:48]}"
 
 
 def _matches(a: dict, b: dict) -> bool:
@@ -107,7 +106,16 @@ def _policy_generation(store: ACEStore, peer: str) -> int | None:
 def _plain(event: dict) -> bytes:
     if event.get("kind") != "application":
         raise MLSError("invalid_session_event")
-    return base64.b64decode(event["plaintext"], validate=True)
+    return decode_b64(
+        event.get("plaintext"), "invalid_body", "MLS plaintext", max_bytes=MLS_MAX_PLAINTEXT_BYTES
+    )
+
+
+def _inner_envelope(raw: bytes) -> ACEMessage:
+    try:
+        return decode_envelope(loads_json(raw))
+    except (ValueError, UnicodeError) as exc:
+        raise ACEError("invalid_envelope", "invalid UTF-8 or JSON envelope") from exc
 
 
 class SecureTransport:
@@ -126,6 +134,7 @@ class SecureTransport:
         self._pid = os.getpid()
         self._outgoing_lock = threading.Lock()
         self._outgoing = 0
+        self._next_sweep = 0
 
     @staticmethod
     def set_peer_allowed(store: ACEStore, peer: str, allowed: bool) -> None:
@@ -211,6 +220,12 @@ class SecureTransport:
         if not now < f["expiresAt"] <= min(now, parsed.timestamp) + SECURE_DELIVERY_TTL_SECONDS:
             raise MLSError("delivery_expired")
         return f
+
+    def pending_handshakes(self) -> bool:
+        """Whether an offer this transport issued still awaits its data frame."""
+        with self._lock:
+            now = self.clock()
+            return any(s["hello"]["expiresAt"] > now for s in self._sessions.values())
 
     def route(self, packet: ACEMessage, peer: VerifiedPeer) -> dict:
         """Return routing metadata only after ACE authentication and expiry checks."""
@@ -338,8 +353,7 @@ class SecureTransport:
         by the Inbox. A completed attempt re-sends its receipt on replay."""
         if self._pid != os.getpid():
             raise MLSError("session_closed")
-        with self._lock:
-            return self._respond(self._read(packet, peer), peer, accept)
+        return self._respond(self._read(packet, peer), peer, accept)
 
     def _respond(
         self, f: dict, peer: VerifiedPeer, accept: Callable[[bytes], DeliveryOutcome]
@@ -401,7 +415,7 @@ class SecureTransport:
                     except BaseException:
                         session.close()
                         raise
-                input_hash = _hash(canonical_state_bytes(f))
+                input_hash = hashlib.sha256(canonical_state_bytes(f)).hexdigest()
                 received = self._live_journal_row(key)
                 if received is None:
                     raise MLSError("session_closed")
@@ -433,9 +447,7 @@ class SecureTransport:
                     session = active["session"]
                     try:
                         session.join(f["welcome"])
-                        envelope = decode_envelope(
-                            json.loads(_plain(session.receive(f["ciphertext"])))
-                        )
+                        envelope = _inner_envelope(_plain(session.receive(f["ciphertext"])))
                         if (
                             envelope.from_id != peer.ace_id
                             or envelope.to_id != self.identity.get_ace_id()
@@ -490,7 +502,7 @@ class SecureTransport:
 
     def _live_journal_row(self, key: str) -> dict | None:
         """The attempt's journal row, or None when missing or expired (an expired row is
-        deleted here, so the full sweep only runs when the journal reaches its bound)."""
+        deleted here)."""
         row = load_record(self.store, key)
         if row is not None and row["expiresAt"] <= self.clock():
             self.store.delete(key)
@@ -498,11 +510,15 @@ class SecureTransport:
         return row
 
     def _journal_full(self) -> bool:
-        if len(self.store.list("secure/in/")) < 1024:
+        """Whether the receiver journal holds its bound of live rows. Expired rows are swept
+        during receive activity: when the bound is reached, and at most every 30 seconds."""
+        keys = self.store.list("secure/in/")
+        now = self.clock()
+        if len(keys) < _MAX_INBOUND_ROWS and now < self._next_sweep:
             return False
-        for key in self.store.list("secure/in/"):
-            self._live_journal_row(key)
-        return len(self.store.list("secure/in/")) >= 1024
+        self._next_sweep = now + _SWEEP_SECONDS
+        live = sum(self._live_journal_row(key) is not None for key in keys)
+        return live >= _MAX_INBOUND_ROWS
 
     def _sweep_sessions(self) -> None:
         for key, value in list(self._sessions.items()):

@@ -5,11 +5,11 @@ from __future__ import annotations
 import threading
 from contextlib import ExitStack
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Callable, Literal
 
 from ._encoding import (
     decode_b64,
-    decode_signature,
     is_ace_id,
     is_conversation_id,
     is_message_id,
@@ -19,9 +19,9 @@ from ._encoding import (
     unix_now,
     wire_int,
 )
-from ._signing import is_valid_signing_public_key, verify_signature
+from ._signing import is_valid_signing_public_key
 from .encryption import compute_conversation_id
-from .envelope import decode_envelope, envelope_fingerprint, message_sign_data
+from .envelope import decode_envelope, envelope_fingerprint
 from .errors import ACEError
 from .limits import (
     DEFAULT_REPLAY_CAPACITY,
@@ -257,16 +257,19 @@ def _principal_option(
     return principal["account"], self_signer, trusted
 
 
-def _authenticated_by(env: ACEMessage, peer: Any) -> bool:
-    """The envelope signature verifies under ``peer``'s pinned key and scheme (as parse
-    step 8, including the scheme check); malformed signatures are False."""
-    if env.from_id != peer.ace_id or env.signature.scheme != peer.scheme:
-        return False
-    try:
-        sig = decode_signature(env.signature.value, env.signature.scheme, "invalid_envelope")
-    except ACEError:
-        return False
-    return verify_signature(message_sign_data(env), sig, peer.scheme, peer.signing_public_key)
+def _principal_context(
+    option: tuple[str, PrincipalKey | None, frozenset[PrincipalKey]] | None, store: ACEStore
+) -> PrincipalContext | None:
+    """The Inbox's step-7 context, built once. The Inbox refreshes the sender before parsing
+    (``_refresh_principal_sender``), outside the ``requests`` lock."""
+    if option is None:
+        return None
+    account, self_signer, trusted = option
+    return PrincipalContext(account, partial(open_request_to, store), self_signer, trusted)
+
+
+def _retry(err: ACEError, env: ACEMessage | ParsedMessage) -> ReceiveOutcome:
+    return ReceiveOutcome("retryable", error=err, from_id=env.from_id, message_id=env.message_id)
 
 
 def _history_dicts(snap: ThreadSnapshot | None) -> list[dict]:
@@ -395,7 +398,7 @@ class Inbox:
         self._capacity = capacity
         self._offline = offline_window_seconds
         self._clock = clock
-        self._principal = principal_option
+        self._principal = _principal_context(principal_option, store)
         self._commerce = commerce
         self._schemas = installed
         self._threads = ThreadStore(store, self._local, clock=clock)
@@ -424,41 +427,19 @@ class Inbox:
     def _floor(self) -> int:
         return max(0, self._now() - self._offline)
 
-    def _principal_context(self) -> PrincipalContext | None:
-        """Step-7 context. The Inbox refreshes the sender before parsing
-        (``_refresh_principal_sender``), outside the ``requests`` lock."""
-        if self._principal is None:
-            return None
-        account, self_signer, trusted = self._principal
-        store = self._store
-
-        def lookup(conversation_id: str, request_id: str, now: int) -> str | None:
-            return open_request_to(store, conversation_id, request_id, now)
-
-        return PrincipalContext(account, lookup, self_signer, trusted)
-
     def _refresh_principal_sender(self, env: ACEMessage, peer: Any, now: int) -> Any:
         """R-P20 (09 § Same-Account Rules): when the pinned sender principal fails steps 2-5,
         refresh the sender's binding from the relay once (rollback barrier) and return the
         binding the rules run on. Runs before any lock is taken, so relay I/O never holds
         ``requests``. A transient failure raises (the message is retryable, nothing committed);
         a non-ACE exception is ``relay_unavailable``; a permanent ``ACEError`` or no relay
-        leaves the pinned binding to decide. Only an envelope authenticated by the pinned
-        signing key triggers a refresh (R-P30); otherwise the pipeline rejects it later."""
-        ctx = self._principal_context()
+        leaves the pinned binding to decide. Called only after ``parse_with_gate`` accepted the
+        envelope under ``peer`` (recipient, window, replay and signature checked), so only an
+        envelope authenticated by the pinned signing key triggers a refresh (R-P30)."""
+        ctx = self._principal
         if ctx is None or sender_principal_usable(
             peer.principal, peer.signing_public_key, ctx, now
         ):
-            return peer
-        # cheap pure-read pre-checks mirroring pipeline steps 1-3 (recipient, window, replay):
-        # nothing is committed; a failing envelope is rejected by the pipeline as usual
-        if (
-            env.to_id != self._local
-            or not self._floor() <= env.timestamp <= now + TIMESTAMP_WINDOW_SECONDS
-            or not self._replay.accepts(env.message_id, env.from_id, env.timestamp)
-        ):
-            return peer
-        if not _authenticated_by(env, peer):
             return peer
         try:
             fresh = self._peers._refresh(peer.ace_id)
@@ -528,26 +509,28 @@ class Inbox:
         self._acked[rec.key] = (m.from_id, m.timestamp)
 
     def _recover(self) -> None:
-        """Repair threads, ``requests/`` decision fills and replay from every delivery record
-        first (ordered by (timestamp, key)), then hand over the pending ones in the same order.
+        """Delete acked records the loaded replay horizon covers, then repair threads,
+        ``requests/`` decision fills and replay from every remaining delivery record first
+        (ordered by (timestamp, key)), then hand over the pending ones in the same order.
         A decision's ``requests/`` fill is a replayed processing (09 step 7): the same-account
         rules run again on the pinned sender. A record that fails them with ``wrong_principal``
         or ``bad_reference`` was never accepted under this policy (e.g. it was delivered as
         data while no principal was installed, or the request is already decided) and changes
         nothing; any other error fails ``open()``."""
-        records = load_deliveries(self._store, self._local)
+        records = []
+        for rec in load_deliveries(self._store, self._local):
+            if rec.status == "acked" and self._replay._covered(
+                rec.message.from_id, rec.message.timestamp
+            ):
+                self._store.delete(rec.key)  # committed long ago; its thread may be pruned
+            else:
+                records.append(rec)
         changed = False
         with self._threads._locked():
             for rec in records:
-                if rec.status == "acked" and self._replay._covered(
-                    rec.message.from_id, rec.message.timestamp
-                ):
-                    continue  # fully committed long ago; its thread may have been pruned
                 repair_thread(self._threads, rec)
-        ctx = self._principal_context()
-        decisions = [rec.message for rec in records if rec.message.type == "decision"]
-        if ctx is None:
-            decisions = []
+        ctx = self._principal
+        decisions = [r.message for r in records if ctx is not None and r.message.type == "decision"]
         if decisions:  # 1a: a decision's requests/ fill (no-op when already filled)
             with self._store.lock("requests"):
                 for m in decisions:
@@ -570,8 +553,6 @@ class Inbox:
                 self._acked[rec.key] = (m.from_id, m.timestamp)
         if changed:
             self._persist_replay()
-        else:
-            self._prune_acked()  # replay.json as loaded: its covered acked records go
         for rec in records:
             if rec.status != "pending":
                 continue
@@ -689,9 +670,7 @@ class Inbox:
             self._finish(rec)
         except ACEError as exc:
             self._failed = True
-            return ReceiveOutcome(
-                "retryable", error=exc, from_id=m.from_id, message_id=m.message_id
-            )
+            return _retry(exc, m)
         return ReceiveOutcome("delivered", message=m, from_id=m.from_id, message_id=m.message_id)
 
     def _receive(self, data: bytes) -> ReceiveOutcome:
@@ -718,9 +697,7 @@ class Inbox:
                 peer = self._peers.resolve(env.from_id, max_age_seconds=0)
         except ACEError as exc:
             if exc.is_transient:
-                return ReceiveOutcome(
-                    "retryable", error=exc, from_id=env.from_id, message_id=env.message_id
-                )
+                return _retry(exc, env)
             try:
                 return self._quarantine(exc, env)
             except ACEError as store_exc:
@@ -729,18 +706,14 @@ class Inbox:
             err = ACEError(
                 "relay_unavailable", f"peer resolution failed: {type(exc).__name__}: {exc}"
             )
-            return ReceiveOutcome(
-                "retryable", error=err, from_id=env.from_id, message_id=env.message_id
-            )
+            return _retry(err, env)
         # 3. stored delivery
         key = delivery_key(env.from_id, env.message_id)
         try:
             d = load_record(self._store, key)
             stored = None if d is None else _delivery_from_dict(d, key, self._local)
         except ACEError as exc:
-            return ReceiveOutcome(
-                "retryable", error=exc, from_id=env.from_id, message_id=env.message_id
-            )
+            return _retry(exc, env)
         if stored is not None:
             if stored.status == "pending":
                 return self._hand_over(stored)
@@ -779,9 +752,7 @@ class Inbox:
                         self._threads._locked() if economic else self._store.lock("requests")
                     )
                 except ACEError as exc:
-                    return ReceiveOutcome(
-                        "retryable", error=exc, from_id=env.from_id, message_id=env.message_id
-                    )
+                    return _retry(exc, env)
             result = self._parse_and_commit(env, peer, key, now, economic, decision, parsed)
             if self._failed and (economic or decision):
                 self._held_locks = (
@@ -793,11 +764,10 @@ class Inbox:
 
     def _rejected(self, exc: ACEError, env: ACEMessage, verified: bool) -> ReceiveOutcome:
         """``verified``: the signature checked out (pipeline step 9 reached)."""
-        ids = {"from_id": env.from_id, "message_id": env.message_id}
         if exc.code == "replay":
-            return ReceiveOutcome("duplicate", **ids)
+            return ReceiveOutcome("duplicate", from_id=env.from_id, message_id=env.message_id)
         if exc.is_transient:
-            return ReceiveOutcome("retryable", error=exc, **ids)
+            return _retry(exc, env)
         try:
             outcome = self._quarantine(exc, env)
             # An authenticated message stays one-shot. No delivery record journals it, so its
@@ -814,7 +784,7 @@ class Inbox:
                         pass
             return outcome
         except ACEError as store_exc:
-            return ReceiveOutcome("retryable", error=store_exc, **ids)
+            return _retry(store_exc, env)
 
     def _parse_and_commit(
         self,
@@ -826,20 +796,19 @@ class Inbox:
         decision: bool,
         parsed: ParsedMessage,
     ) -> "ReceiveOutcome | _Delivery":
-        ids = {"from_id": env.from_id, "message_id": env.message_id}
         try:
             if economic:
                 machine, rec = self._threads._machine(env.conversation_id, parsed.thread_id)
             else:
                 machine, rec = ThreadStateMachine(self._local), None
         except ACEError as exc:
-            return ReceiveOutcome("retryable", error=exc, **ids)
+            return _retry(exc, env)
         try:
             apply_receive_rules(
                 parsed,
                 peer,
                 threads=machine if economic else None,
-                principal=self._principal_context(),
+                principal=self._principal,
                 now=now,
             )
             if economic and rec is None:
@@ -852,7 +821,7 @@ class Inbox:
         try:
             write_record(self._store, key, delivery.to_dict())  # 7.1 commit point
         except ACEError as exc:
-            return ReceiveOutcome("retryable", error=exc, **ids)
+            return _retry(exc, env)
         try:
             # 7.3 in memory; the record just written journals it until the next replay.json
             self._replay.commit(env.message_id, env.from_id, env.timestamp, self._floor())
@@ -863,7 +832,7 @@ class Inbox:
                 self._threads._save(ThreadRecord(snap, _clear_proven_pending(rec, snap)))
         except ACEError as exc:
             self._failed = True
-            return ReceiveOutcome("retryable", error=exc, **ids)
+            return _retry(exc, env)
         if self._replay_dirty >= _REPLAY_SNAPSHOT_EVERY:
             try:  # a failed snapshot only delays pruning: the records still journal every commit
                 self._persist_replay()

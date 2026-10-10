@@ -430,6 +430,10 @@ def test_record_request_rejects_bad_ids():
         record_request(MemoryStore(), _Msg(mid="nope"), NOW)
     with raises("invalid_argument"):
         record_request(MemoryStore(), _Msg(), NOW, ttl=-1)
+    with raises("invalid_argument"):
+        record_request(MemoryStore(), _Msg(to="bob"), NOW)
+    with raises("invalid_argument"):
+        record_request(MemoryStore(), _Msg(ts=1.5), NOW, ttl=60)
 
 
 @pytest.mark.parametrize("patch", [

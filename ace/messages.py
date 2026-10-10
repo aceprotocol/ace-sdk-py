@@ -503,7 +503,7 @@ def apply_receive_rules(
 def _check_principal(
     env: ParsedMessage,
     sender: VerifiedPeer,
-    ctx: PrincipalContext | None,
+    ctx: PrincipalContext,
     now: int,
 ) -> None:
     """06 step 7 for principal types (09 § Same-Account Rules)."""
@@ -513,9 +513,9 @@ def _check_principal(
         conversation_id=env.conversation_id,
         sender_principal=sender.principal,
         sender_signing_public_key=sender.signing_public_key,
-        self_account=None if ctx is None else ctx.account,
-        open_request_to=None if ctx is None else ctx.open_request_to,
+        self_account=ctx.account,
+        open_request_to=ctx.open_request_to,
         now=now,
-        self_signer=None if ctx is None else ctx.self_signer,
-        trusted_signers=frozenset() if ctx is None else ctx.trusted_signers,
+        self_signer=ctx.self_signer,
+        trusted_signers=ctx.trusted_signers,
     )

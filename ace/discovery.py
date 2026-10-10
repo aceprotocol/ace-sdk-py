@@ -314,15 +314,9 @@ def verify_registration_file(
         raise ACEError(code, "registrationSignature does not verify")
     now = unix_now(clock)
     # The file supplies ``profile.ext`` and ``profile.principal`` (02 § Rollback Barrier).
-    profile: AgentProfile | None = None if reg.ext is None else AgentProfile(ext=reg.ext)
-    if reg.principal is not None:
-        from .principal import validate_principal_record
-
-        validated = validate_principal_record(
-            reg.principal, bytes(signing_key), now, allow_expired=True
-        )
-        if validated.expires_at > now:  # expired-only: treated as absent (R-P40)
-            profile = AgentProfile(ext=reg.ext, principal=validated)
+    profile = drop_expired_profile_principal(
+        _none_if_empty(AgentProfile(ext=reg.ext, principal=reg.principal)), bytes(signing_key), now
+    )
     return _make_peer(
         ace_id=reg.id,
         scheme=s.scheme,
@@ -351,16 +345,33 @@ def _same_authority_domain(a: PrincipalRecord, b: PrincipalRecord) -> bool:
     return a.account == b.account and a.signer == b.signer
 
 
-def _supersedes(new: PrincipalRecord, old: PrincipalRecord) -> bool:
-    """Monotonic replacement compares signed claims, not proof bytes. Versions of different
-    authority domains are not compared: another domain's ``new`` replaces ``old``."""
-    from .principal import same_principal_claims
+def _pick_principal(
+    cached: AgentProfile | None, new: PrincipalRecord | None, now: int, *, relay: bool
+) -> PrincipalRecord | None:
+    """The principal a kept candidate leaves pinned (02 § Rollback Barrier). An expired cached
+    principal is dropped (R-P35). Within one authority domain ``new`` replaces the cached one
+    only when it supersedes it (R-P36). Only a relay record clears it (``new`` absent) or moves
+    it to another domain: a registration file's principal is not covered by the key-binding
+    signature (R-P26)."""
+    from .principal import principal_supersedes
 
+    old = _live_principal(cached, now)
+    if new is None:
+        return None if relay else old
+    if old is None:
+        return new
     if not _same_authority_domain(new, old):
-        return True
-    if new.issued_at != old.issued_at:
-        return new.issued_at > old.issued_at
-    return same_principal_claims(new, old)
+        return new if relay else old
+    return new if principal_supersedes(new, old) else old
+
+
+def _mint_replace(peer: VerifiedPeer, **changes: Any) -> VerifiedPeer:
+    """``dataclasses.replace`` for a peer whose replaced members keep it verified."""
+    _MINTING.active = True
+    try:
+        return dataclasses.replace(peer, **changes)
+    finally:
+        _MINTING.active = False
 
 
 def _none_if_empty(profile: AgentProfile) -> AgentProfile | None:
@@ -371,36 +382,26 @@ def _relay_profile(
     cached: AgentProfile | None, cand: AgentProfile | None, newer: bool, now: int
 ) -> AgentProfile | None:
     """A kept relay candidate replaces the cached profile only when its registeredAt is not
-    older (R-P36); a profile without a principal then withdraws it, any other principal must
-    supersede the cached one. An older candidate leaves the cached profile unchanged."""
-    live = _live_principal(cached, now)
+    older (R-P36), its principal chosen by :func:`_pick_principal`. An older candidate leaves
+    the cached profile unchanged except for an expired principal."""
     if not newer:
+        live = _live_principal(cached, now)
         if cached is None or live is cached.principal:
             return cached
         return _none_if_empty(dataclasses.replace(cached, principal=None))
-    new = None if cand is None else cand.principal
-    if new is None or live is None or _supersedes(new, live):
-        return cand
-    return dataclasses.replace(cand, principal=live)
+    if cand is None:
+        return None
+    keep = _pick_principal(cached, cand.principal, now, relay=True)
+    return cand if keep is cand.principal else dataclasses.replace(cand, principal=keep)
 
 
 def _file_profile(
     cached: AgentProfile | None, cand: AgentProfile | None, now: int
 ) -> AgentProfile | None:
     """A kept registration-file candidate replaces only the profile members it supplies;
-    absent members are carried over from the cache (R-P27). ``principal`` is replaced only by
-    one whose issuedAt is not older (R-P26) and, while the cached one is unexpired, only within
-    its (subject, account, signer) authority domain: the file's principal is not covered by
-    the key-binding signature, so only a relay record moves it to another domain (02). A
-    cached principal that has expired by ``now`` is dropped, not carried (expiry is
-    revocation; R-P35): the refreshed ``fetchedAt`` would otherwise make the stored record
-    fail re-verification on load."""
-    old = _live_principal(cached, now)
-    new = None if cand is None else cand.principal
-    replaces = new is not None and (
-        old is None or (_same_authority_domain(new, old) and _supersedes(new, old))
-    )
-    keep = new if replaces else old
+    absent members are carried over from the cache (R-P27); the principal is chosen by
+    :func:`_pick_principal`."""
+    keep = _pick_principal(cached, None if cand is None else cand.principal, now, relay=False)
     supplied = (
         {}
         if cand is None
@@ -410,8 +411,7 @@ def _file_profile(
             if f.name != "principal" and getattr(cand, f.name) is not None
         }
     )
-    merged = dataclasses.replace(cached or AgentProfile(), **supplied, principal=keep)
-    return None if merged == AgentProfile() else merged
+    return _none_if_empty(dataclasses.replace(cached or AgentProfile(), **supplied, principal=keep))
 
 
 def adopt_decision(
@@ -437,30 +437,11 @@ def adopt_decision(
         else _file_profile(pin.profile, candidate.profile, now)
     )
     if pin.encryption_public_key == candidate.encryption_public_key:
+        # keys equal (ace_id derives from the signing key): only the binding and profile differ
         newer = candidate if candidate.registered_at > pin.registered_at else pin
-        merged = _make_peer(
-            ace_id=pin.ace_id,
-            scheme=pin.scheme,
-            signing_public_key=pin.signing_public_key,
-            encryption_public_key=pin.encryption_public_key,
-            registered_at=newer.registered_at,
-            registration_signature=newer.registration_signature,
-            source=newer.source,
-            profile=profile,
-        )
-        return merged, "unchanged"
+        return _mint_replace(newer, profile=profile), "unchanged"
     if candidate.registered_at > pin.registered_at:
-        rotated = _make_peer(
-            ace_id=candidate.ace_id,
-            scheme=candidate.scheme,
-            signing_public_key=candidate.signing_public_key,
-            encryption_public_key=candidate.encryption_public_key,
-            registered_at=candidate.registered_at,
-            registration_signature=candidate.registration_signature,
-            source=candidate.source,
-            profile=profile,
-        )
-        return rotated, "rotated"
+        return _mint_replace(candidate, profile=profile), "rotated"
     raise ACEError("stale_peer_binding", "a different encryption key requires a newer registeredAt")
 
 

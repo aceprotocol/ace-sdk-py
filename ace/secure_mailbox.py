@@ -36,7 +36,8 @@ from .types import ParsedMessage
 class PullResult:
     """The result of ``SecureMailbox.pull``: every outcome in relay order, the error that
     stopped the drain (a retryable error, a fetch error or an invalid argument) or None, and
-    ``has_more`` when ``max_pages`` or ``stop`` ended it before the inbox was drained."""
+    ``has_more`` when ``max_pages``, ``stop``, 10,000 outcomes or the 120 s deadline ended it
+    before the inbox was drained."""
 
     outcomes: list[ReceiveOutcome]
     blocked: ACEError | None
@@ -156,15 +157,16 @@ class SecureMailbox:
         return outcomes
 
     def _receive(self, raw, stream_id=None, envelope=None):
-        """``(accepted, outcomes)``: ``accepted`` is False when the frame itself was refused
-        (its single quarantined outcome then carries the frame-level error). ``envelope`` is
-        ``raw`` already decoded."""
+        """``(refused, outcomes)``: ``refused`` is the wire code when the frame itself was
+        refused (a session-core frame error keeps its own code, 08 § Receiver; its single
+        quarantined outcome carries the error), else None. ``envelope`` is ``raw`` already
+        decoded."""
         self._check()  # Before entering a possibly inherited mutex.
         with self._lock:
             self._check()
             if stream_id and self._cursor and compare_stream_ids(stream_id, self._cursor) <= 0:
-                return True, []
-            accepted = True
+                return None, []
+            refused = None
             try:
                 if envelope is None:
                     envelope = _decode(raw)
@@ -174,7 +176,7 @@ class SecureMailbox:
                 if error.category != "permanent":
                     raise error
                 fingerprint = None if envelope is None else envelope_fingerprint(envelope)
-                accepted = False
+                refused = exc.code if isinstance(exc, MLSError) else error.code
                 outcomes = [ReceiveOutcome("quarantined", error=error, fingerprint=fingerprint)]
             if stream_id:
                 write_record(
@@ -183,9 +185,12 @@ class SecureMailbox:
                     {"identity": self.identity.get_ace_id(), "cursor": stream_id},
                 )
                 self._cursor = stream_id
-            return accepted, outcomes
+            return refused, outcomes
 
     def pull(self, *, limit=MAX_INBOX_PAGE, max_pages=None, stop=None):
+        """Drain the relay inbox. ``max_pages`` counts non-empty pages. While an offer this
+        transport issued is still pending, keep polling (1 s) up to the 120 s handshake
+        deadline so a short-lived call does not destroy its keys (13 § Limits)."""
         outcomes = []
         try:
             self._check()
@@ -195,16 +200,24 @@ class SecureMailbox:
                 or (max_pages is not None and (type(max_pages) is not int or max_pages < 1))
             ):
                 raise ACEError("invalid_argument", "invalid page bounds")
+            deadline = time.monotonic() + SECURE_DELIVERY_TTL_SECONDS
             pages = 0
-            while stop is None or not stop.is_set():
-                if max_pages is not None and pages >= max_pages:
+            while (stop is None or not stop.is_set()) and time.monotonic() < deadline:
+                if (
+                    max_pages is not None
+                    and pages >= max_pages
+                    and not self.secure.pending_handshakes()
+                ):
                     return PullResult(outcomes, None, True)
                 page = self.relay.fetch_inbox(self.identity, since=self._cursor, limit=limit)
-                pages += 1
+                if page.entries:
+                    pages += 1
                 for entry in page.entries:
                     outcomes.extend(self._receive(entry.message, entry.stream_id)[1])
                 if len(page.entries) < limit:
-                    return PullResult(outcomes, None)
+                    if not self.secure.pending_handshakes():
+                        return PullResult(outcomes, None)
+                    time.sleep(min(1, max(0, deadline - time.monotonic())))
                 if len(outcomes) >= 10_000:
                     return PullResult(outcomes, None, True)
             return PullResult(outcomes, None, True)
@@ -239,9 +252,9 @@ class SecureMailbox:
         try:
             raw = canonical_state_bytes(wrapper["message"])
             envelope = _decode(raw)
-            accepted, outcomes = self._receive(raw, envelope=envelope)
-            if not accepted:  # frame-level refusal; a rejected inner envelope is accepted (receipt)
-                return fail(400, outcomes[0].error.code, outcomes[0])
+            refused, outcomes = self._receive(raw, envelope=envelope)
+            if refused:  # frame-level refusal; a rejected inner envelope is accepted (receipt)
+                return fail(400, refused, outcomes[0])
             return DirectReply(
                 200,
                 {"ok": True, "messageId": envelope.message_id},
@@ -250,6 +263,8 @@ class SecureMailbox:
         except Exception as exc:
             if self._closed:
                 return fail(503, "internal_error")  # closed meanwhile
+            if isinstance(exc, MLSError) and exc.is_permanent:
+                return fail(400, exc.code)  # a session-core frame error keeps its code
             error = _error(exc)
             if error.category == "permanent":
                 return fail(400, error.code)

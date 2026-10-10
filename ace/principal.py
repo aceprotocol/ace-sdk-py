@@ -55,6 +55,14 @@ def same_principal_claims(a: PrincipalRecord, b: PrincipalRecord) -> bool:
     return replace(a, signature="") == replace(b, signature="")
 
 
+def principal_supersedes(new: PrincipalRecord, old: PrincipalRecord) -> bool:
+    """Monotonic replacement within one (subject, account, signer) authority domain (R-P36):
+    ``new`` is strictly newer (``issuedAt``) or claim-identical at the same ``issuedAt``."""
+    return new.issued_at > old.issued_at or (
+        new.issued_at == old.issued_at and same_principal_claims(new, old)
+    )
+
+
 def parse_principal_record(value: object) -> PrincipalRecord:
     """Strict wire parse of a principal record (09 rule 1) without rules 2-10;
     shape errors are ``invalid_principal``. See :func:`validate_principal_record`."""
@@ -218,6 +226,33 @@ def _is_account_authority(
     return derived.lower() == address.lower()
 
 
+def _sender_principal(
+    sender_principal: PrincipalRecord | dict | None,
+    sender_signing_public_key: bytes,
+    self_account: str,
+    self_signer: PrincipalKey | None,
+    trusted_signers: frozenset[PrincipalKey],
+    now: int,
+) -> PrincipalRecord | str:
+    """09 § Same-Account Rules steps 2-5 (and the scope check): the validated sender principal,
+    or the ``wrong_principal`` reason. Errors other than ``invalid_principal`` propagate."""
+    if sender_principal is None:  # 2
+        return "the sender has no principal"
+    try:  # 3
+        p = validate_principal_record(sender_principal, sender_signing_public_key, now)
+    except ACEError as exc:
+        if exc.code != "invalid_principal":
+            raise
+        return f"the sender's principal is invalid: {exc.message}"
+    if not _is_account_authority(p, self_signer, trusted_signers):  # 4
+        return "signer is not an authority of the account"
+    if p.account != self_account:  # 5
+        return "the sender belongs to another account"
+    if p.scope is not None:
+        return "unsupported principal scope"
+    return p
+
+
 def check_principal_rules(
     type_: str,
     body: dict,
@@ -238,22 +273,11 @@ def check_principal_rules(
         raise ACEError("invalid_argument", "not a principal message type")
     if self_account is None:  # 1
         raise ACEError("wrong_principal", "the receiver has no principal")
-    if sender_principal is None:  # 2
-        raise ACEError("wrong_principal", "the sender has no principal")
-    try:  # 3
-        p = validate_principal_record(sender_principal, sender_signing_public_key, now)
-    except ACEError as exc:
-        if exc.code != "invalid_principal":
-            raise
-        raise ACEError(
-            "wrong_principal", f"the sender's principal is invalid: {exc.message}"
-        ) from None
-    if not _is_account_authority(p, self_signer, trusted_signers):  # 4
-        raise ACEError("wrong_principal", "signer is not an authority of the account")
-    if p.account != self_account:  # 5
-        raise ACEError("wrong_principal", "the sender belongs to another account")
-    if p.scope is not None:
-        raise ACEError("wrong_principal", "unsupported principal scope")
+    p = _sender_principal(  # 2-5
+        sender_principal, sender_signing_public_key, self_account, self_signer, trusted_signers, now
+    )
+    if isinstance(p, str):
+        raise ACEError("wrong_principal", p)
     if type_ == "decision":
         if "controller" not in p.roles:  # 6
             raise ACEError("wrong_principal", "only a controller may send a decision")
@@ -279,19 +303,15 @@ def sender_principal_usable(
     """True when the pinned sender principal passes 09 steps 2-5 for ``ctx`` (present, valid,
     signed by an authority of the account, same account). False means a peer refresh may
     help (R-P20)."""
-    if sender_principal is None:
-        return False
-    try:
-        p = validate_principal_record(sender_principal, sender_signing_public_key, now)
-    except ACEError as exc:
-        if exc.code != "invalid_principal":
-            raise
-        return False
-    return (
-        p.scope is None
-        and _is_account_authority(p, ctx.self_signer, ctx.trusted_signers)
-        and p.account == ctx.account
+    p = _sender_principal(
+        sender_principal,
+        sender_signing_public_key,
+        ctx.account,
+        ctx.self_signer,
+        ctx.trusted_signers,
+        now,
     )
+    return not isinstance(p, str)
 
 
 # --- requests/ ledger (09 § Persistence, 06 Appendix A) ------------------------------
@@ -350,10 +370,13 @@ def record_request(
         raise ACEError("invalid_argument", "invalid conversationId")
     if not is_message_id(message.message_id):
         raise ACEError("invalid_argument", "invalid messageId")
+    if not is_ace_id(message.to_id):
+        raise ACEError("invalid_argument", "invalid to")
     check_wire_int(sent_at, "sentAt")
     expires_at = None
     if ttl is not None:
-        expires_at = min(message.timestamp + check_wire_int(ttl, "ttl"), MAX_SAFE_INTEGER)
+        check_wire_int(ttl, "ttl")
+        expires_at = min(check_wire_int(message.timestamp, "timestamp") + ttl, MAX_SAFE_INTEGER)
     if load_request_record(store, message.conversation_id, message.message_id) is not None:
         return
     write_record(

@@ -9,13 +9,13 @@ from ._encoding import is_ace_id, to_base64, unix_now, wire_int
 from .discovery import (
     AdoptOutcome,
     VerifiedPeer,
-    _make_peer,
+    _mint_replace,
     adopt_decision,
     verify_peer_record,
     verify_registration_file,
 )
 from .errors import ACEError
-from .principal import same_principal_claims, validate_principal_record
+from .principal import principal_supersedes, validate_principal_record
 from .store import ACEStore, parse_record, write_record
 from .threads import sha256_hex
 from .types import PrincipalRecord, RegistrationFile
@@ -80,16 +80,7 @@ def _peer_from_record(d: dict, key: str) -> tuple[VerifiedPeer, int]:
             )
         }
         verified = verify_peer_record(record, clock=lambda: fetched_at)
-        peer = _make_peer(
-            ace_id=verified.ace_id,
-            scheme=verified.scheme,
-            signing_public_key=verified.signing_public_key,
-            encryption_public_key=verified.encryption_public_key,
-            registered_at=verified.registered_at,
-            registration_signature=verified.registration_signature,
-            source=source,
-            profile=verified.profile,
-        )
+        peer = _mint_replace(verified, source=source)
     except ACEError as exc:
         raise ACEError("storage_failed", f"{key}: {exc.message}") from None
     if key != _peer_key(peer.ace_id):
@@ -204,10 +195,7 @@ class PeerStore:
             except (ACEError, ValueError, KeyError, TypeError):
                 raise ACEError("storage_failed", f"{key}: invalid principal horizon") from None
             _remember(self._verified_horizons, (key, bytes(raw)), high)
-        if high is not None and (
-            next_.issued_at < high.issued_at
-            or (next_.issued_at == high.issued_at and not same_principal_claims(next_, high))
-        ):
+        if high is not None and not principal_supersedes(next_, high):
             raise ACEError(
                 "invalid_principal", "principal rolls back or conflicts with the durable horizon"
             )

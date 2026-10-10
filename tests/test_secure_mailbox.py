@@ -96,6 +96,30 @@ def test_pull_refuses_static_packets_and_bounds_pages(world):
     assert bob.store.list("cursors.json") == []
 
 
+def test_pull_waits_for_its_own_pending_offers(world, monkeypatch):
+    """A short pull keeps polling while an offer it issued is pending (13 § Limits)."""
+    clock, relay, client, alice, bob, mailbox = world
+    import ace.secure_mailbox as module
+
+    post_static(alice, client, bob, "first")
+    pending = iter([True, True, False])
+    mailbox.secure.pending_handshakes = lambda: next(pending, False)
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 1:
+            post_static(alice, client, bob, "late")  # the frame the pending offer waits for
+
+    monkeypatch.setattr(module.time, "sleep", sleep)
+    result = mailbox.pull(max_pages=1)
+    assert len(sleeps) == 1 and not result.has_more and result.blocked is None
+    assert result.quarantined == 2  # the late frame was read past max_pages
+    # without a pending offer, a short page returns at once
+    mailbox.secure.pending_handshakes = lambda: False
+    assert mailbox.pull().outcomes == [] and len(sleeps) == 1
+
+
 def test_follow_yields_initial_pull_then_live_with_on_live(world):
     clock, relay, client, alice, bob, mailbox = world
     for m in ("q0", "q1"):
@@ -204,8 +228,9 @@ def test_receive_direct_contract(world):
     assert mailbox.receive_direct(b'{"msg":{}}').status == 400
     static = alice.outbox.stage(alice.peers.resolve(bob.id), "text", {"message": "x"}).message
     reply = mailbox.receive_direct(body(static))  # a static packet is refused, never delivered
-    assert (reply.status, reply.body) == (400, {"ok": False, "error": "invalid_body"})
+    assert (reply.status, reply.body) == (400, {"ok": False, "error": "secure_delivery_required"})
     assert reply.outcome.kind == "quarantined" and reply.outcome.fingerprint
+    assert reply.outcome.error.code == "invalid_body"  # the pull outcome keeps invalid_body
     eve = Agent("eve", "ed25519", clock)
     eve.pin(bob)
     assert client.register(eve.identity) == "registered"  # resolvable, but not admitted
@@ -215,7 +240,7 @@ def test_receive_direct_contract(world):
     mailbox.peers.resolve = lambda *a, **k: (resolves.append(a), original(*a, **k))[1]
     lookups, pins = relay.requests.count(("GET", "/v1/peer")), bob.store.list("peers/")
     refused = mailbox.receive_direct(body(stranger))
-    assert refused.body == {"ok": False, "error": "invalid_body"}
+    assert refused.body == {"ok": False, "error": "delivery_peer_disabled"}
     assert refused.outcome.error.message == "delivery_peer_disabled" and refused.outcome.fingerprint
     # admission is checked before any peer resolution: no lookup, no pin of the stranger
     assert resolves == [] and relay.requests.count(("GET", "/v1/peer")) == lookups
@@ -341,3 +366,26 @@ def test_bidirectional_secure_relay_and_static_downgrade():
             ma.close()
             mb.close()
             server.close()
+
+
+def test_receiver_journal_sweep_is_periodic(world):
+    """Expired secure/in/ rows are swept during receive activity: at the bound, and at
+    most every 30 seconds below it (13 § Limits)."""
+    clock, relay, client, alice, bob, mailbox = world
+    from ace.store import write_record
+
+    secure = mailbox.secure
+
+    def row(i, expires):
+        write_record(bob.store, f"secure/in/{i:064x}.json", {"expiresAt": expires})
+
+    row(1, clock() - 1)
+    row(2, clock() + 60)
+    assert not secure._journal_full()  # first activity sweeps
+    assert len(bob.store.list("secure/in/")) == 1
+    row(3, clock() - 1)
+    assert not secure._journal_full()  # within 30 s: not swept
+    assert len(bob.store.list("secure/in/")) == 2
+    clock.t += 60
+    assert not secure._journal_full()
+    assert bob.store.list("secure/in/") == []  # row 2 expired too by now
