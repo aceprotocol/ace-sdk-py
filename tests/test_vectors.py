@@ -28,6 +28,7 @@ from ace import (
     PrekeyVault,
     ProfileManifest,
     Profiles,
+    RelayClient,
     ReplayDetector,
     SoftwareIdentity,
     _xwing,
@@ -636,6 +637,24 @@ def test_auth_headers_and_registration():
     assert m.hex() == r["messageHex"] and hashlib.sha256(m).hexdigest() == r["requestDigest"]
     sig = from_base64(r["request"]["signature"]["value"])
     assert verify_signature(m, "register-request", sig, st.signing.public_key)
+
+
+def test_wake_registration_bodies():
+    w = V["auth"]["wake"]
+    me = SoftwareIdentity.from_export(AGENTS["bob"]["export"], now=NOW)
+    client = RelayClient("https://relay.example")
+    sent = []
+    client._call = lambda *a, **k: sent.append(k["body"])  # no network: validation only
+    for b in w["valid"]:
+        client.set_wake(me, b["gateway"], b["token"])
+    assert sent == w["valid"]
+    for c in w["invalid"]:
+        b = c["body"]
+        if set(b) != {"gateway", "token"}:
+            continue  # a closed-object check: the typed call cannot build these
+        with pytest.raises(ACEError) as info:
+            client.set_wake(me, b["gateway"], b["token"])
+        assert info.value.code == c["error"], c["name"]
 
 
 @pytest.mark.parametrize("c", V["relayErrors"]["cases"], ids=ids(V["relayErrors"]["cases"]))

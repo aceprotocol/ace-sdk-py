@@ -1,5 +1,5 @@
-"""Relay HTTP client (07): registration, descriptors, directory, blocks, send, inbox / ack and
-SSE listen.
+"""Relay HTTP client (07): registration, descriptors, directory, blocks, send, inbox / ack, SSE
+listen and wake hints.
 
 Every connection resolves the relay host once, refuses non-public addresses (loopback only with
 ``allow_loopback=True``, for local development) and connects to the vetted IP; plain HTTP is
@@ -28,7 +28,7 @@ from ._encoding import (
     unix_now,
     wire_int,
 )
-from ._relay_url import normalize_relay_url
+from ._relay_url import is_canonical_relay_url, normalize_relay_url
 from ._signing import encode_payload
 from .auth import create_auth_headers
 from .descriptor import VerifiedAgent, verify_published_agent
@@ -52,6 +52,7 @@ _MAX_CONNECT_FAILURES = 10
 _MAX_BACKOFF_SECONDS = 30
 _REGISTER_STATUSES = ("registered", "idempotent", "refreshed", "rotated")
 _RETRY_AFTER_RE = re.compile(r"[0-9]+")
+_WAKE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{22,512}")
 
 _sleep = time.sleep  # patched by tests
 
@@ -411,6 +412,31 @@ class RelayClient:
             identity=identity,
             auth=("block", payload),
         )
+
+    # --- wake hints ---
+
+    def set_wake(self, identity: ACEIdentity, gateway: str, token: str) -> None:
+        """``PUT /v1/wake``: register (or replace) the gateway this relay wakes when entries are
+        queued for ``identity`` (07 § Wake hints). ``token`` is the gateway's opaque token. A relay
+        without wake hints answers ``relay_rejected`` with relay code ``not_found``."""
+        if (
+            not isinstance(gateway, str)
+            or not is_canonical_relay_url(gateway, allow_loopback=self.allow_loopback)
+            or not isinstance(token, str)
+            or _WAKE_TOKEN_RE.fullmatch(token) is None
+        ):
+            raise ACEError("invalid_argument", "wake needs a canonical https gateway and a token")
+        self._call(
+            "PUT",
+            "/v1/wake",
+            body={"gateway": gateway, "token": token},
+            identity=identity,
+            auth=("wake", encode_payload(gateway, token)),
+        )
+
+    def clear_wake(self, identity: ACEIdentity) -> None:
+        """``DELETE /v1/wake``: remove the wake registration (idempotent)."""
+        self._call("DELETE", "/v1/wake", identity=identity, auth=("wake", b""))
 
     # --- packets ---
 

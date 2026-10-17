@@ -582,6 +582,15 @@ class NetworkClient:
         stranger again until contact is re-established."""
         self._decide(ace_id, None, lift=True)
 
+    def set_wake(self, gateway: str, token: str) -> None:
+        """Ask the home relay to wake ``gateway`` with ``token`` when entries are queued for us
+        (07 § Wake hints). A hint only: delivery still comes from ``pull`` / ``follow``."""
+        self.relay.set_wake(self.identity, gateway, token)
+
+    def clear_wake(self) -> None:
+        """Remove the home relay's wake registration."""
+        self.relay.clear_wake(self.identity)
+
     # --- receiving --------------------------------------------------------------------
 
     def _on_message(self, m: PrivateMessage) -> None:

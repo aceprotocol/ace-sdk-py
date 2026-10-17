@@ -12,7 +12,7 @@ from .errors import ACEError
 from .identity import ACEIdentity, check_usable
 
 #: The header-authenticated actions (02 § Signing actions).
-AUTH_ACTIONS = frozenset({"listen", "inbox", "inbox-ack", "block", "unregister"})
+AUTH_ACTIONS = frozenset({"listen", "inbox", "inbox-ack", "block", "unregister", "wake"})
 
 
 def create_auth_headers(

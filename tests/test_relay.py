@@ -117,6 +117,22 @@ def test_send_inbox_ack_and_blocks(relay, pair):
     alice.client.send(text_packet(alice, bob, "again"), permit)
 
 
+def test_wake_registration(relay, pair):
+    alice, _ = pair
+    gateway, token = "https://push.example/ace", "t" * 22
+    alice.client.set_wake(alice.identity, gateway, token)
+    assert relay.wakes[alice.id] == {"gateway": gateway, "token": token}
+    assert relay.requests[-1] == ("PUT", "/v1/wake")
+    alice.client.clear_wake(alice.identity)
+    alice.client.clear_wake(alice.identity)  # idempotent
+    assert relay.wakes == {} and relay.requests[-1] == ("DELETE", "/v1/wake")
+    # a relay without wake hints
+    relay.inject.append(("/v1/wake", 404, "not_found", {}))
+    with raises("relay_rejected") as info:
+        alice.client.set_wake(alice.identity, gateway, token)
+    assert info.value.relay_code == "not_found"
+
+
 def test_error_mapping_and_nonce_replay(relay, pair):
     alice, _ = pair
     path = f"/v1/descriptor/{alice.id}"

@@ -332,3 +332,12 @@ def test_concurrent_block_and_accept_never_end_admitted(relay, pair, block_first
     for t in threads:
         t.join()
     assert alice.peers.is_blocked(b) and relay.blocks[(a, b)][0] is True
+
+
+def test_wake_uses_the_home_relay(relay, pair):
+    alice, _ = pair
+    a = alice.identity.get_ace_id()
+    alice.set_wake("https://push.example/ace", "w" * 32)
+    assert relay.wakes[a] == {"gateway": "https://push.example/ace", "token": "w" * 32}
+    alice.clear_wake()
+    assert a not in relay.wakes

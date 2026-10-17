@@ -38,6 +38,8 @@ def _payload(action: str, query: dict, body) -> bytes:
     if action == "block":
         word = "block" if body["blocked"] else "unblock"
         return encode_payload(body["peer"], word, str(body["revision"]))
+    if action == "wake" and body is not None:
+        return encode_payload(body["gateway"], body["token"])
     return b""
 
 
@@ -50,6 +52,7 @@ class FakeRelay:
         self.request_digests: dict[str, str] = {}
         self.streams: dict[str, list[tuple[str, dict]]] = {}
         self.blocks: dict[tuple[str, str], tuple[bool, int]] = {}  # (owner, peer) -> state
+        self.wakes: dict[str, dict] = {}  # aceId -> {gateway, token}
         self.sent: list[dict] = []  # every accepted /v1/send body
         self.seen_auth: set[tuple[str, str]] = set()
         self.inject: list[tuple[str, int, str, dict]] = []  # (path, status, code, headers)
@@ -74,6 +77,12 @@ class FakeRelay:
 
             def do_POST(self):
                 relay._dispatch(self, "POST")
+
+            def do_PUT(self):
+                relay._dispatch(self, "PUT")
+
+            def do_DELETE(self):
+                relay._dispatch(self, "DELETE")
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.server.daemon_threads = True
@@ -353,6 +362,16 @@ class FakeRelay:
         if old is not None and body["revision"] <= old[1]:
             raise _HTTPError(409, "stale_revision")
         self.blocks[(ace_id, body["peer"])] = (body["blocked"], body["revision"])
+        self._reply(h, 200, {"ok": True})
+
+    def _put_v1_wake(self, h, query, body):
+        ace_id = self._auth(h, "wake", query, body)
+        self.wakes[ace_id] = body
+        self._reply(h, 200, {"ok": True})
+
+    def _delete_v1_wake(self, h, query, body):
+        ace_id = self._auth(h, "wake", query)
+        self.wakes.pop(ace_id, None)
         self._reply(h, 200, {"ok": True})
 
     def _post_v1_send(self, h, query, body):

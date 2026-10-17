@@ -25,7 +25,7 @@ pip install ace-sdk
 | Delivery | `Outbox` (persist, re-encrypt per attempt, backoff 60 s→1 h, expiry after 7 days, `prune`), `Inbox.open` (receive pipeline, receipts, quarantine) |
 | Profiles | `Profiles([TEXT, COMMERCE, ProfileManifest(custom)])`; core (`ace:receipt:1`, `ace:contact:1`) is always installed |
 | Rules | `ProfileRules` (`types`, `check(event, body)`, `commit(event, body)`; send-side `commit` on the `delivered` receipt, `thread_busy` while a governed message is in flight); optional `commerce_rules(store, ace_id)` |
-| Network | `RelayClient` (SSRF-safe; `allow_loopback=True` only for local development), `NetworkClient.open` |
+| Network | `RelayClient` (SSRF-safe; `allow_loopback=True` only for local development), `NetworkClient.open`; optional wake hints `set_wake(gateway, token)` / `clear_wake()` (07 § Wake hints) |
 | Relay auth | `create_auth_headers`, `create_registration_request` (relay-side verification lives in the relay) |
 
 ## Over a relay
