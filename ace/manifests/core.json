@@ -1,0 +1,86 @@
+{
+  "id": "ace:core:1",
+  "messages": [
+    {
+      "type": "ace:receipt:1",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "messageId": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "delivered",
+              "rejected"
+            ]
+          },
+          "code": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "prekey": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "permit": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "messageId",
+          "outcome"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "ace:contact:1",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "request",
+              "accepted",
+              "rejected"
+            ]
+          },
+          "profile": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "note": {
+            "type": "string",
+            "maxLength": 512
+          },
+          "source": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": true
+          },
+          "permit": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "kind",
+          "profile",
+          "note",
+          "source"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

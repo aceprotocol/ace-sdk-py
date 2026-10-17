@@ -1,0 +1,21 @@
+{
+  "id": "ace:text:1",
+  "messages": [
+    {
+      "type": "ace:text:1",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string",
+            "maxLength": 262144
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

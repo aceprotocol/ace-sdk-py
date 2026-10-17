@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ace-sdk"
+version = "0.5.0"
+description = "ACE Protocol SDK: post-quantum agent identity, private packets and profiles"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+readme = "README.md"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "cryptography>=48.0.1",
+    "typing-extensions>=4.1; python_version < \"3.11\"",
+]
+
+[project.urls]
+Homepage = "https://aceprotocol.org"
+Repository = "https://github.com/aceprotocol/ace-sdk-py"
+Issues = "https://github.com/aceprotocol/ace-sdk-py/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.0",
+    "ruff>=0.16.10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[tool.setuptools.packages.find]
+include = ["ace*"]
+
+[tool.setuptools.package-data]
+ace = ["manifests/*.json"]

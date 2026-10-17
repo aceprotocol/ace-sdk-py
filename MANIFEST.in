@@ -1,0 +1,8 @@
+# The sdist carries the package, its license, README and build configuration only.
+include LICENSE README.md pyproject.toml
+graft ace
+prune tests
+prune examples
+prune build
+prune ace_sdk.egg-info
+global-exclude __pycache__ *.py[cod]

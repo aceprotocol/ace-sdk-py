@@ -1,0 +1,267 @@
+{
+  "id": "ace:commerce:1",
+  "messages": [
+    {
+      "type": "ace:commerce:rfq:1",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "need": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "maxPrice": {
+            "type": "string",
+            "maxLength": 32
+          },
+          "currency": {
+            "type": "string",
+            "maxLength": 16
+          },
+          "expiresAt": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "need"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "ace:commerce:offer:1",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "price": {
+            "type": "string",
+            "maxLength": 32
+          },
+          "currency": {
+            "type": "string",
+            "maxLength": 16
+          },
+          "terms": {
+            "type": "string",
+            "maxLength": 4096
+          },
+          "expiresAt": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "price",
+          "currency"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "ace:commerce:accept:1",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "offerId": {
+            "type": "string",
+            "maxLength": 36
+          }
+        },
+        "required": [
+          "offerId"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "ace:commerce:reject:1",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "maxLength": 1024
+          }
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "ace:commerce:invoice:1",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "offerId": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "amount": {
+            "type": "string",
+            "maxLength": 32
+          },
+          "currency": {
+            "type": "string",
+            "maxLength": 16
+          },
+          "settlement": {
+            "type": "object",
+            "properties": {
+              "method": {
+                "type": "string",
+                "enum": [
+                  "stablecoin",
+                  "stripe-link"
+                ]
+              },
+              "asset": {
+                "type": "string",
+                "maxLength": 256
+              },
+              "recipient": {
+                "type": "string",
+                "maxLength": 256
+              },
+              "memo": {
+                "type": "string",
+                "maxLength": 256
+              },
+              "url": {
+                "type": "string",
+                "maxLength": 2048
+              }
+            },
+            "required": [
+              "method"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "offerId",
+          "amount",
+          "currency",
+          "settlement"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "ace:commerce:payment:1",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "referenceId": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "amount": {
+            "type": "string",
+            "maxLength": 32
+          },
+          "currency": {
+            "type": "string",
+            "maxLength": 16
+          },
+          "settlement": {
+            "type": "object",
+            "properties": {
+              "method": {
+                "type": "string",
+                "enum": [
+                  "stablecoin",
+                  "stripe-link"
+                ]
+              },
+              "proof": {
+                "type": "object",
+                "properties": {
+                  "txHash": {
+                    "type": "string",
+                    "maxLength": 256
+                  },
+                  "paymentId": {
+                    "type": "string",
+                    "maxLength": 256
+                  }
+                },
+                "required": [],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "method",
+              "proof"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "referenceId",
+          "amount",
+          "currency",
+          "settlement"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "ace:commerce:deliver:1",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "inline",
+              "reference"
+            ]
+          },
+          "content": {
+            "type": "string",
+            "maxLength": 1048576
+          },
+          "contentType": {
+            "type": "string",
+            "maxLength": 256
+          },
+          "uri": {
+            "type": "string",
+            "maxLength": 2048
+          },
+          "metadata": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "additionalProperties": false
+      }
+    },
+    {
+      "type": "ace:commerce:confirm:1",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "deliverId": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 4096
+          }
+        },
+        "required": [
+          "deliverId"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}
