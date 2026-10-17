@@ -341,3 +341,21 @@ def test_wake_uses_the_home_relay(relay, pair):
     assert relay.wakes[a] == {"gateway": "https://push.example/ace", "token": "w" * 32}
     alice.clear_wake()
     assert a not in relay.wakes
+
+
+def test_attempt_retries_a_pending_message_now(relay, pair):
+    alice, bob = pair
+    a, b = alice.identity.get_ace_id(), bob.identity.get_ace_id()
+    bob.connect(a, profile=TEXT.id)
+    alice.pull()
+    alice.accept(b)
+    bob.pull()
+    relay.inject.append(("/v1/send", 503, "unavailable", {}))  # the first attempt fails
+    mid = bob.send(a, "ace:text:1", {"message": "hi"})
+    assert bob.outbox.get(mid).code == "relay_unavailable"
+    sent = len(relay.sent)
+    entry = bob.attempt(mid)  # not due yet: attempted anyway
+    assert entry.status == "pending" and len(relay.sent) == sent + 1
+    assert bob.attempt("0" * 32) is None and bob.attempt("not-an-id") is None
+    bob.outbox.abandon(mid)
+    assert bob.attempt(mid).status == "expired" and len(relay.sent) == sent + 1  # final: as is

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
 
-from ._encoding import HANDLE_RE, is_ace_id, sha256_hex, unix_now
+from ._encoding import HANDLE_RE, is_ace_id, is_message_id, sha256_hex, unix_now
 from .descriptor import VerifiedAgent, create_published_agent, verify_published_agent
 from .errors import ACEError
 from .identity import ACEIdentity
@@ -30,7 +30,7 @@ from .limits import (
     MAX_PENDING_CONTACT_REQUESTS,
     PREKEY_ROTATION_SECONDS,
 )
-from .outbox import Attempt, Outbox
+from .outbox import Attempt, Outbox, OutboxEntry
 from .packet import PrivateMessage, create_packet, encode_content
 from .peers import PeerStore
 from .permit import create_permit, verify_permit
@@ -393,6 +393,14 @@ class NetworkClient:
     def flush(self) -> list[Attempt]:
         """Attempt every due Outbox entry."""
         return self.outbox.flush(self._attempt, self._resolve)
+
+    def attempt(self, message_id: str) -> OutboxEntry | None:
+        """One attempt of ``message_id`` now, due or not (TS ``outbox.attempt``): ``None`` for an
+        unknown message, a final entry as is, a pending one after the attempt."""
+        if not is_message_id(message_id) or self.outbox.get(message_id) is None:
+            return None
+        self.outbox.deliver(message_id, self._attempt, self._resolve, force=True)
+        return self.outbox.get(message_id)
 
     def _known(self, ace_id: str) -> None:
         """A cached descriptor (even expired or stale: attempts refresh it) suffices; otherwise
