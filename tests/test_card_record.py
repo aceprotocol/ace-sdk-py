@@ -264,6 +264,57 @@ def test_moving_home_keeps_the_old_binding_resolves_unknown_peer_and_never_reass
     assert bob.lookup_card(a).home == "https://relay-b.test"
 
 
+def test_lookup_card_pins_the_kel_before_trusting_the_card(world):
+    alice = world.agent(contact="open", pay=[SOL])
+    a = alice.identity.get_ace_id()
+    old = world.relay.cards[a]
+    # A new dlg replaces the signing key (say, stolen); the owner re-signs the card.
+    world.clock.now += 10
+    alice.identity.delegate(now=world.clock.now)
+    alice.maintain()
+    # A relay replays the record signed under the superseded delegation, with its KEL prefix.
+    world.relay.raw_responses[f"/v1/card/{a}"] = (200, json.dumps(old).encode(), "application/json")
+    bob = world.agent()
+    assert bob.peers.state(a) is None
+    with raises("stale_peer_binding"):
+        bob.lookup_card(a)
+    # The KEL was pinned from the descriptor lookup, before the card was checked.
+    assert len(bob.peers.state(a).events) == len(alice.identity.get_kel())
+
+
+def test_handle_resolving_to_a_new_ace_id_is_invalid_authorization(world):
+    alice = world.agent(contact="open", handle="alice")
+    mallory = world.agent(contact="open")
+    bob = world.agent()
+    m = mallory.identity.get_ace_id()
+    assert bob.lookup_card(f"@alice@{world.host}").ace_id == alice.identity.get_ace_id()
+    # The relay rebinds the handle to another identity (bindings are permanent: detectable).
+    world.relay.cards[m] = world.card(mallory, handle="alice", contact="open")
+    world.relay.handles["alice"] = m
+    with raises("invalid_authorization"):
+        bob.lookup_card(f"@alice@{world.host}")
+    with raises("invalid_authorization"):
+        bob.lookup(f"@alice@{world.host}")
+    # The reverse pin is durable.
+    again = NetworkClient.open(
+        bob.identity, bob.store, world.rc(), bob.vault, receive=False, clock=world.clock
+    )
+    with raises("invalid_authorization"):
+        again.lookup_card(f"@alice@{world.host}")
+    again.close()
+
+
+def test_refused_card_leaves_descriptor_unpublished(world):
+    world.agent(handle="alice")
+    late = world.agent(publish=False, handle="alice")
+    late_id = late.identity.get_ace_id()
+    with raises("relay_rejected") as info:
+        late.publish()
+    assert info.value.relay_code == "handle_taken"
+    assert late_id not in world.relay.cards
+    assert late_id not in world.relay.descriptors
+
+
 def test_a_new_dlg_re_signs_the_card_at_upkeep(world):
     alice = world.agent(contact="open", handle="alice")
     bob = world.agent()
