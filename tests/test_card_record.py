@@ -13,6 +13,7 @@ import pytest
 from ace import (
     CORE,
     TEXT,
+    ACEError,
     MemoryStore,
     NetworkClient,
     PrekeyVault,
@@ -30,6 +31,7 @@ from ace import (
 )
 from ace.limits import MAX_CARD_RECORD_BYTES
 from ace.profiles import CONTACT_TYPE
+from ace.store import write_record
 
 from .fake_relay import FakeRelay
 from .helpers import NOW, Clock, raises
@@ -344,6 +346,111 @@ def test_unparseable_pin_is_storage_failed(world):
                 bob.lookup_card(f"@alice@{world.host}")
         bob.store.write(key, good)
     assert bob.lookup_card(f"@alice@{world.host}").ace_id == a
+
+
+def reopened(world, client: NetworkClient) -> NetworkClient:
+    c = NetworkClient.open(
+        client.identity, client.store, world.rc(), client.vault, receive=False, clock=world.clock
+    )
+    world.clients.append(c)
+    return c
+
+
+def test_fallback_pinned_kel_stays_kel_live_false_on_later_lookups(world):
+    alice = world.agent(contact="open", handle="alice")
+    a = alice.identity.get_ace_id()
+    world.clock.now += 8 * 86400
+    bob = world.agent()
+    assert bob.lookup_card(a).kel_live is False
+    # The pin exists now, but no live descriptor ever confirmed it: every later lookup says so.
+    assert bob.lookup_card(a).kel_live is False
+    assert bob.lookup_card(f"@alice@{world.host}").kel_live is False
+    assert reopened(world, bob).lookup_card(a).kel_live is False
+
+
+def test_a_later_live_descriptor_confirms_a_fallback_pinned_kel(world):
+    alice = world.agent(contact="open", handle="alice")
+    a = alice.identity.get_ace_id()
+    world.clock.now += 8 * 86400
+    bob = world.agent()
+    assert bob.lookup_card(f"@alice@{world.host}").kel_live is False
+    # Alice comes back online: her new descriptor reconciles with the pin and confirms it.
+    alice.publish()
+    assert bob.lookup_card(f"@alice@{world.host}").kel_live is True
+    # Confirmed for good, durably: even after she goes offline again.
+    world.clock.now += 8 * 86400
+    assert bob.lookup_card(a).kel_live is True
+    assert reopened(world, bob).lookup_card(a).kel_live is True
+
+
+def test_transient_on_one_route_plus_unknown_peer_on_another_does_not_fall_back(world):
+    relay_b = FakeRelay(clock=world.clock)
+    try:
+        alice = world.agent(contact="open")
+        a = alice.identity.get_ace_id()
+        path = f"/v1/descriptor/{a}"
+        # Without a pin, an unreachable home relay is a failure, never "no live descriptor".
+        carol = world.agent()
+        world.relay.inject.append((path, 503, "internal_error", {}))
+        with pytest.raises(ACEError) as info:
+            carol.lookup_card(a)
+        assert info.value.is_transient
+        assert carol.peers.state(a) is None
+        # Alice's descriptor names relay B first; her home relay has lost it, so bob pins her
+        # card's KEL.
+        two_routes = create_published_agent(
+            alice.identity,
+            relays=[relay_b.url, world.relay.url],
+            prekey=alice.vault.current(world.clock.now),
+            profiles=alice.profiles.entries(),
+            now=world.clock.now,
+            allow_loopback_relays=True,
+        )
+        del world.relay.descriptors[a]
+        bob = world.agent(
+            relay_factory=lambda url: RelayClient(url, allow_loopback=True, clock=world.clock)
+        )
+        assert bob.lookup_card(a).kel_live is False
+        bob.import_agent(two_routes)  # shared out of band; it expires before bob looks again
+        world.clock.now += 8 * 86400
+        # Relay B is unreachable and the home relay answers unknown_peer: the lookup fails.
+        relay_b.inject.append((path, 503, "internal_error", {}))
+        with pytest.raises(ACEError) as info:
+            bob.lookup_card(a)
+        assert info.value.is_transient
+        # Both routes answering unknown_peer: no live descriptor, still not confirmed.
+        assert bob.lookup_card(a).kel_live is False
+    finally:
+        relay_b.close()
+
+
+def test_pin_missing_required_fields_is_storage_failed(world):
+    alice = world.agent(contact="open", handle="alice")
+    a = alice.identity.get_ace_id()
+    bob = world.agent()
+    seen = bob.lookup_card(f"@alice@{world.host}")
+    card_pin = f"network/handles/{sha256_hex(a)}.json"
+    owner_pin = f"network/handle-owners/{sha256_hex(f'{world.relay.url} alice')}.json"
+    full = {"home": world.relay.url, "handle": "alice", "issuedAt": seen.issued_at, "digest": "x"}
+    cases = [(card_pin, {})]
+    cases += [
+        (card_pin, {k: v for k, v in full.items() if k != m})
+        for m in ("issuedAt", "digest", "home")
+    ]
+    cases += [(owner_pin, {"home": world.relay.url, "handle": "alice"})]
+    for key, bad in cases:
+        good = bob.store.read(key)
+        write_record(bob.store, key, bad)
+        with raises("storage_failed"):
+            bob.lookup_card(f"@alice@{world.host}")
+        bob.store.write(key, good)
+    # The record of how a KEL pin was confirmed, without its flag.
+    world.clock.now += 8 * 86400
+    carol = world.agent()
+    assert carol.lookup_card(a).kel_live is False
+    write_record(carol.store, f"network/kel-provenance/{sha256_hex(a)}.json", {"aceId": a})
+    with raises("storage_failed"):
+        carol.lookup_card(a)
 
 
 def test_handle_resolving_to_a_new_ace_id_is_invalid_authorization(world):

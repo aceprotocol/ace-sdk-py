@@ -32,7 +32,7 @@ from .errors import ACEError
 from .identity import ACEIdentity
 from .inbox import Inbox, ReceiveOutcome, Reply
 from .invitation import verify_invitation
-from .kel import event_bytes
+from .kel import KelState, event_bytes
 from .limits import (
     CONTACT_REQUEST_TTL_SECONDS,
     DEFAULT_PAGE_LIMIT,
@@ -72,6 +72,62 @@ def _handle_owner_key(home: str, handle: str) -> str:
     """The reverse handle pin: the ACE ID ``@handle@home`` first resolved to. A binding is
     permanent, so a later other one is misbehavior."""
     return f"network/handle-owners/{sha256_hex(f'{home} {handle}')}.json"
+
+
+def _kel_provenance_key(ace_id: str) -> str:
+    """How a peer's KEL pin was confirmed: ``liveConfirmed`` False when a card lookup pinned the
+    bundle's own KEL because the identity had no live descriptor, until a live descriptor confirms
+    it. No record: pinned through a descriptor."""
+    return f"network/kel-provenance/{sha256_hex(ace_id)}.json"
+
+
+def _is_str(v: object) -> bool:
+    return isinstance(v, str)
+
+
+def _valid_card_pin(p: dict) -> bool:
+    at = p.get("issuedAt")
+    return (
+        isinstance(at, int)
+        and not isinstance(at, bool)
+        and _is_str(p.get("digest"))
+        and _is_str(p.get("home"))
+        and (p.get("handle") is None or _is_str(p["handle"]))
+    )
+
+
+def _valid_owner_pin(p: dict) -> bool:
+    return all(_is_str(p.get(k)) for k in ("aceId", "home", "handle"))
+
+
+def _valid_provenance(p: dict) -> bool:
+    return _is_str(p.get("aceId")) and isinstance(p.get("liveConfirmed"), bool)
+
+
+def _load_pin(store: ACEStore, key: str, valid: Callable[[dict], bool]) -> dict | None:
+    """A stored pin, None when absent; one that is not a record or lacks a required member is
+    ``storage_failed``, never no pin."""
+    pin = load_record(store, key)
+    if pin is not None and not valid(pin):
+        raise ACEError("storage_failed", f"{key} is invalid")
+    return pin
+
+
+def _first_served(urls: list[str], get: Callable[[str], Any]) -> Any:
+    """``get`` at the first of ``urls`` that serves it. ``unknown_peer`` only when every route
+    answered it; otherwise the first other failure (a transient one included), so an unreachable
+    route never reads as "not there"."""
+    unknown = ACEError("unknown_peer", "no route to the peer")
+    other: ACEError | None = None
+    for url in urls:
+        try:
+            return get(url)
+        except ACEError as exc:
+            if exc.code == "unknown_peer":
+                unknown = exc
+            elif other is None:
+                other = exc
+    raise other or unknown
 
 
 def _blocked_peer() -> ACEError:
@@ -343,17 +399,19 @@ class NetworkClient:
         resolution pins its ACE ID; a later resolution to another one is
         ``invalid_authorization``. Without a KEL pin for the identity, its descriptor is looked
         up first and its KEL pinned, so the card is verified under the current KEL, never one a
-        relay chose. When the identity has no live descriptor (``unknown_peer``: offline past its
-        lifetime), the card is verified under the bundle's own KEL instead, that KEL is pinned as
-        a descriptor's would be, and the result has ``kel_live`` False (04 § Card record)."""
+        relay chose. When every route answers ``unknown_peer`` (no live descriptor: offline past
+        its lifetime), the card is verified under the bundle's own KEL instead, that KEL is
+        pinned as a descriptor's would be, and the result has ``kel_live`` False (04 § Card
+        record). That pin is recorded as not confirmed live: later lookups look the descriptor up
+        again and report False until one confirms it."""
         if is_ace_id(target):
-            kel_live, card = self._pin_card_kel(
+            kel_live, card = self._card_kel(
                 target, lambda: self.agent(target), lambda: self._fetch_card(target)
             )
             bundle = (card or self._fetch_card(target)).bundle
             return self._check_card(bundle, kel_live=kel_live)
         card, relay, handle = self._card_by_handle(target)
-        kel_live, _ = self._pin_card_kel(
+        kel_live, _ = self._card_kel(
             card.ace_id, lambda: self._fetch(card.ace_id, [relay.base_url]), lambda: card
         )
         return self._check_card(card.bundle, (relay.base_url, handle), kel_live=kel_live)
@@ -363,34 +421,56 @@ class NetworkClient:
         return what it fetched; else None."""
         return fetch() if self.peers.state(ace_id) is None else None
 
-    def _pin_card_kel(
+    def _card_kel(
         self,
         ace_id: str,
         fetch: Callable[[], VerifiedAgent],
         card: Callable[[], VerifiedCard],
     ) -> tuple[bool, VerifiedCard | None]:
-        """``_pin_kel`` for a card lookup. Only when the descriptor lookup finds none
-        (``unknown_peer``) does the card's own bundle (``card``) pin the KEL: the bundle is
-        verified, its KEL adopted under the fork rules, and the card returned with False. Every
-        other failure propagates."""
-        try:
-            self._pin_kel(ace_id, fetch)
+        """The KEL a card lookup verifies under, and whether a live descriptor confirmed it. A
+        pin confirmed live is used as is. Otherwise the descriptor is looked up through ``fetch``
+        (pinning or reconciling the KEL): on success the pin is recorded as confirmed live. When
+        every route answers ``unknown_peer``, an unconfirmed pin stays unconfirmed, and without a
+        pin the card's own bundle (``card``) pins the KEL (``_pin_bundle_kel``). Every other
+        failure propagates."""
+        pinned = self.peers.state(ace_id)
+        key = _kel_provenance_key(ace_id)
+        provenance = _load_pin(self.store, key, _valid_provenance)
+        confirmed = provenance is None or provenance["liveConfirmed"]
+        if pinned is not None and confirmed:
             return True, None
+        try:
+            fetch()
         except ACEError as exc:
             if exc.code != "unknown_peer":
                 raise
+            return (False, None) if pinned is not None else self._pin_bundle_kel(ace_id, card())
+        if not confirmed:
+            with self.store.lock("peers"):
+                write_record(self.store, key, {"aceId": ace_id, "liveConfirmed": True})
+        return True, None
+
+    def _pin_bundle_kel(self, ace_id: str, card: VerifiedCard) -> tuple[bool, VerifiedCard]:
+        """Pin the verified KEL of ``card`` (no live descriptor), recorded as not confirmed live
+        with the pin, atomically (under the ``peers`` lock)."""
         v = verify_card_bundle(
-            card().bundle,
+            card.bundle,
             self._now(),
             allow_loopback_relays=self.peers.allow_loopback_relays,
             pinned=self.peers.state(ace_id),
         )
         if v.ace_id != ace_id:
             raise ACEError("invalid_authorization", "the card record names another identity")
-        pinned, _ = self.peers.pin(list(v.state.events), self._now())
-        # As for a descriptor: another path advanced the pin past the state the card verified under.
-        if pinned.last_hash != v.state.last_hash:
-            raise ACEError("stale_peer_binding", "the pin advanced past the card record")
+
+        def record(pinned: KelState) -> None:
+            # As for a descriptor: another path advanced the pin past the card's KEL state.
+            if pinned.last_hash != v.state.last_hash:
+                raise ACEError("stale_peer_binding", "the pin advanced past the card record")
+            write_record(
+                self.store, _kel_provenance_key(ace_id), {"aceId": ace_id, "liveConfirmed": False}
+            )
+
+        self.peers.pin(list(v.state.events), self._now(), then=record)
         return False, v
 
     def _check_card(
@@ -413,7 +493,9 @@ class NetworkClient:
         digest = sha256_hex(canonical_state_bytes({k: x for k, x in r.items() if k != "signature"}))
         with self.store.lock("network-handles"):
             owner_key = None if resolved is None else _handle_owner_key(*resolved)
-            owner = None if owner_key is None else load_record(self.store, owner_key)
+            owner = (
+                None if owner_key is None else _load_pin(self.store, owner_key, _valid_owner_pin)
+            )
             if owner is not None and owner.get("aceId") != ace_id:
                 raise ACEError(
                     "invalid_authorization", "the handle resolved to another identity than before"
@@ -430,8 +512,8 @@ class NetworkClient:
         """The card pin checks and update of ``_check_card``, under the ``network-handles``
         lock."""
         key = _handle_pin_key(v.ace_id)
-        pin = load_record(self.store, key)
-        if pin is not None and pin.get("issuedAt") is not None:
+        pin = _load_pin(self.store, key, _valid_card_pin)
+        if pin is not None:
             if v.issued_at < pin["issuedAt"]:
                 raise ACEError("stale_descriptor", "an older card record than one already verified")
             if v.issued_at == pin["issuedAt"]:
@@ -470,13 +552,7 @@ class NetworkClient:
         urls = [] if cached is None else cached.relays
         if self.relay.base_url not in urls:
             urls.append(self.relay.base_url)
-        error: ACEError | None = None
-        for url in urls:
-            try:
-                return self._relay_for(url).card(ace_id)
-            except ACEError as exc:
-                error = exc
-        raise error or ACEError("unknown_peer", "no route to the peer")
+        return _first_served(urls, lambda url: self._relay_for(url).card(ace_id))
 
     def agent(self, ace_id: str, *, refresh: bool = False) -> VerifiedAgent:
         """The peer's current descriptor: the pinned one while unexpired and bound to our
@@ -497,13 +573,9 @@ class NetworkClient:
 
     def _fetch(self, ace_id: str, urls: list[str]) -> VerifiedAgent:
         """Fetch and pin the peer's descriptor from the first of ``urls`` that serves it."""
-        error: ACEError | None = None
-        for url in urls:
-            try:
-                return self.peers.adopt(self._relay_for(url).descriptor(ace_id), self._now())
-            except ACEError as exc:
-                error = exc
-        raise error or ACEError("unknown_peer", "no route to the peer")
+        return _first_served(
+            urls, lambda url: self.peers.adopt(self._relay_for(url).descriptor(ace_id), self._now())
+        )
 
     def _target(self, target: str | dict | VerifiedAgent) -> VerifiedAgent:
         if isinstance(target, (VerifiedAgent, dict)):

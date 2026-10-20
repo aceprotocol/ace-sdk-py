@@ -158,13 +158,23 @@ class PeerStore:
             self._states[raw] = cached
         return cached
 
-    def pin(self, kel: list, now: int | None = None) -> tuple[KelState, str]:
-        """Adopt or extend the pinned log (fork rules); ``kel_conflict`` on a fork."""
+    def pin(
+        self,
+        kel: list,
+        now: int | None = None,
+        *,
+        then: Callable[[KelState], None] | None = None,
+    ) -> tuple[KelState, str]:
+        """Adopt or extend the pinned log (fork rules); ``kel_conflict`` on a fork. ``then`` runs
+        with the resulting pin still under the ``peers`` lock, so state derived from it is written
+        atomically with it (raising there leaves the pin as it was)."""
         t = self._now() if now is None else now
         with self._store.lock("peers"):
             cand = verify_kel(kel, t)
             pinned = self.state(cand.ace_id)
             state, outcome = reconcile_kel(pinned, cand)
+            if then is not None:
+                then(state)
             if outcome != "unchanged":
                 self._update(state.ace_id, kel=list(state.events))
             return state, outcome
