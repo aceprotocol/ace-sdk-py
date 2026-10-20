@@ -9,12 +9,14 @@ from ace import (
     PeerStore,
     create_permit,
     issue_delegation,
+    validate_card,
     verify_erc8004_registration,
     verify_kel,
     verify_permit,
     verify_published_agent,
 )
-from ace.limits import MAX_PERMIT_LIFETIME
+from ace.identity import sign_claims
+from ace.limits import MAX_DESCRIPTOR_LIFETIME, MAX_PERMIT_LIFETIME
 from tests.helpers import NOW, Clock, Party, raises
 
 
@@ -24,14 +26,9 @@ def p():
 
 
 def test_create_and_verify(p):
-    src = p.source(
-        profiles=[TEXT.descriptor()],
-        visibility="public",
-        handle="alice",
-        card={"name": "Alice", "tags": ["hosted", "-x"]},
-    )
+    src = p.source(profiles=[TEXT.descriptor()])
     a = verify_published_agent(src, now=NOW)
-    assert a.ace_id == p.id and a.prekey == p.vault.current() and a.handle == "alice"
+    assert a.ace_id == p.id and a.prekey == p.vault.current()
     assert set(src["descriptor"]) == {
         "aceId",
         "issuedAt",
@@ -39,32 +36,57 @@ def test_create_and_verify(p):
         "relays",
         "prekey",
         "profiles",
-        "visibility",
-        "handle",
-        "card",
         "signature",
     }
     with raises("invalid_authorization"):
-        verify_published_agent(src, now=NOW + 86400)  # expired
+        verify_published_agent(src, now=NOW + 86400)  # expired (the default lifetime)
     tampered = copy.deepcopy(src)
-    tampered["descriptor"]["card"]["name"] = "Mallory"
+    tampered["descriptor"]["expiresAt"] -= 1
     with raises("invalid_authorization"):
         verify_published_agent(tampered, now=NOW)
+
+
+def test_lifetime_is_at_most_seven_days(p):
+    src = p.source(lifetime=MAX_DESCRIPTOR_LIFETIME)
+    assert src["descriptor"]["expiresAt"] - src["descriptor"]["issuedAt"] == 604800
+    with raises("invalid_argument"):
+        p.source(lifetime=MAX_DESCRIPTOR_LIFETIME + 1)
+
+
+@pytest.mark.parametrize(
+    "member",
+    [{"visibility": "public"}, {"handle": "alice"}, {"card": {}}],
+)
+def test_retired_members_are_unknown(p, member):
+    """visibility, handle and card moved to the card record (04 § Card record)."""
+    d = {k: v for k, v in p.source()["descriptor"].items() if k != "signature"}
+    signed = sign_claims(p.identity, "agent-descriptor", {**d, **member})
+    with raises("invalid_authorization"):
+        verify_published_agent({"kel": p.identity.get_kel(), "descriptor": signed}, now=NOW)
+
+
+@pytest.mark.parametrize(
+    "card",
+    [
+        {"name": ""},
+        {"name": None},  # absent is fine, null is not a string
+        {"description": None},
+        {"image": "http://x.example/i.png"},
+        {"tags": ["UPPER"]},
+        {"extra": 1},
+    ],
+)
+def test_invalid_cards(card):
+    with raises("invalid_authorization"):
+        validate_card(card)
+    assert validate_card({"name": "Alice", "tags": ["hosted", "-x"]})
 
 
 @pytest.mark.parametrize(
     "kw",
     [
-        {"handle": "alice"},  # handle needs public
-        {"visibility": "public", "handle": "A"},
         {"relays": ["http://relay.example"]},
         {"relays": ["https://relay.example/"]},
-        {"card": {"name": ""}},
-        {"card": {"name": None}},  # absent is fine, null is not a string
-        {"card": {"description": None}},
-        {"card": {"image": "http://x.example/i.png"}},
-        {"card": {"tags": ["UPPER"]}},
-        {"card": {"extra": 1}},
         {"profiles": [{"id": "ace:core:1", "digest": "0" * 64}]},
         {"profiles": [TEXT.descriptor()], "ext": {"ace:text:1": {}}},  # text defines no ext
         {"profiles": [TEXT.descriptor()], "ext": {"urn:x:1": {}}},  # not announced
@@ -148,11 +170,11 @@ def test_permits(p):
 
 def test_descriptor_pinning_keeps_the_newest(p):
     peers = PeerStore(MemoryStore(), clock=p.clock)
-    new = p.source(now=NOW, card={"name": "new"})
-    old = p.source(now=NOW - 10, card={"name": "old"})
+    new = p.source(now=NOW, relays=["https://new.example"])
+    old = p.source(now=NOW - 10, relays=["https://old.example"])
     peers.adopt(new)
-    assert peers.adopt(old).card == {"name": "new"}  # an older descriptor is ignored
-    assert peers.agent(p.id).card == {"name": "new"}
+    assert peers.adopt(old).relays == ["https://new.example"]  # an older descriptor is ignored
+    assert peers.agent(p.id).relays == ["https://new.example"]
 
 
 def test_delegation_issuer_is_reconciled_with_its_pin():

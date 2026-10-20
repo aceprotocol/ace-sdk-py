@@ -1,5 +1,5 @@
-"""Delivery permits: the receiver (issuer) lets ``subject`` deliver to it and resolve its private
-descriptor, for at most 30 days. A permit is communication permission only."""
+"""Delivery permits: the receiver (issuer) lets ``subject`` deliver to it, for at most 30 days.
+A permit is communication permission only."""
 
 from __future__ import annotations
 

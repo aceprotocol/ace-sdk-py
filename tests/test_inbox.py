@@ -44,7 +44,7 @@ class World:
             self.b.peers,
             Profiles(),
             on_message=on_message or self.got.append,
-            public=public,
+            contact="open" if public else "closed",
             refresh=refresh or (lambda ace_id: self.refreshes.append(ace_id)),
             check_capacity=capacity,
             clock=self.clock,

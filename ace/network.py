@@ -1,6 +1,7 @@
 """NetworkClient: publish, discover, look up, connect / accept / reject / block, send, pull.
 
-It wires the core pieces together over relays: our descriptor (with prekey rotation), the
+It wires the core pieces together over relays: our descriptor (with prekey rotation) and card
+record (handle, card, pay, contact, listed; 04 § Card record), the
 PeerStore admission table, the Outbox (send + retry), the Inbox (receipts, permit renewal) and
 relay clients for foreign relays (SSRF-safe ``RelayClient``). Remote content (contacts,
 descriptors, messages) never changes local admission: only ``connect``, ``accept``, ``reject``,
@@ -16,7 +17,15 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
 
-from ._encoding import HANDLE_RE, is_ace_id, is_message_id, sha256_hex, unix_now
+from ._encoding import (
+    HANDLE_RE,
+    canonical_state_bytes,
+    is_ace_id,
+    is_message_id,
+    sha256_hex,
+    unix_now,
+)
+from .card_record import VerifiedCard, create_card_record, verify_card_bundle
 from .descriptor import VerifiedAgent, create_published_agent, verify_published_agent
 from .errors import ACEError
 from .identity import ACEIdentity
@@ -52,6 +61,11 @@ def _block_key(ace_id: str) -> str:
     return f"network/blocks/{sha256_hex(ace_id)}.json"
 
 
+def _handle_pin_key(ace_id: str) -> str:
+    """The ``{home, handle}`` first seen in a peer's card record (set once per home)."""
+    return f"network/handles/{sha256_hex(ace_id)}.json"
+
+
 def _blocked_peer() -> ACEError:
     return ACEError("not_permitted", "the peer is blocked; unblock it first")
 
@@ -81,9 +95,11 @@ class NetworkClient:
         *,
         profiles: Profiles | None = None,
         rules: list[ProfileRules] | tuple[ProfileRules, ...] = (),
-        visibility: str = "private",
         handle: str | None = None,
         card: dict | None = None,
+        pay: list[str] | None = None,
+        contact: str = "closed",
+        listed: bool = False,
         ext: dict | None = None,
         delegations: list[dict] | None = None,
         erc8004: list[dict] | None = None,
@@ -98,7 +114,9 @@ class NetworkClient:
         if any(self.profiles.get(p) is None for p in accept_profiles):
             raise ACEError("invalid_argument", "accept_profiles must name installed profiles")
         self.accept_profiles = tuple(accept_profiles)
-        self.visibility, self.handle, self.card, self.ext = visibility, handle, card or {}, ext
+        # the card record: handle is set once per home (it can never change or be dropped there)
+        self.handle, self.card, self.pay = handle, card or {}, pay
+        self.contact, self.listed, self.ext = contact, listed, ext
         self.delegations, self.erc8004 = delegations, erc8004
         # foreign relays come from untrusted descriptors: same loopback policy as the home relay
         self._factory = relay_factory or (
@@ -141,7 +159,7 @@ class NetworkClient:
                 on_receipt=c._user_on_receipt,
                 rules=c._rules,
                 outbox=c.outbox,
-                public=lambda: c.visibility == "public",
+                contact=c._own_contact,
                 refresh=lambda ace_id: c.agent(ace_id, refresh=True),
                 resolve=lambda ace_id: c.agent(ace_id),
                 clock=c._clock,
@@ -155,15 +173,27 @@ class NetworkClient:
     def _now(self) -> int:
         return unix_now(self._clock)
 
+    def _own_contact(self) -> str:
+        """05 § Receiver admission: strangers only while configured ``open`` and the published
+        card record says ``open`` (no record is ``closed``)."""
+        if self.contact != "open":
+            return "closed"
+        rec = load_record(self.store, _SELF_KEY)
+        card = None if rec is None else rec.get("card")
+        return "open" if card is not None and card["card"]["contact"] == "open" else "closed"
+
     def _relay_for(self, url: str) -> RelayClient:
         return self.relay if url == self.relay.base_url else self._factory(url)
 
     # --- our descriptor ---------------------------------------------------------------
 
     def publish(self, *, force: bool = False) -> dict:
-        """Publish our PublishedAgent (rotating the prekey every 24 h). An unchanged one with more
-        than an hour left is reused, and posted again only with ``force``. When the home relay
-        holds no registration or an older KEL, the current KEL is registered first."""
+        """Publish our PublishedAgent (rotating the prekey every 24 h), then our card record. An
+        unchanged descriptor with more than an hour left is reused, and posted again only with
+        ``force``. The card record is re-signed when its settings change or after a new ``dlg``
+        (its digest covers the KEL's last event), else reused (re-posted with ``force``). When
+        the home relay holds no registration or an older KEL, the current KEL is registered
+        first. Returns the PublishedAgent."""
         now = self._now()
         self.vault.prune(now)
         prekey = self.vault.current(now)
@@ -172,60 +202,95 @@ class NetworkClient:
             prekey = self.vault.rotate(now)
         with self.store.lock("network-self"):
             old = load_record(self.store, _SELF_KEY)
-            wanted = {
-                "relays": [self.relay.base_url],
-                "prekey": prekey.to_dict(),
-                "profiles": self.profiles.entries(),
-                "visibility": self.visibility,
+            rec = self._publish_descriptor(old, prekey, now, force)
+            if rec is not old:
+                write_record(self.store, _SELF_KEY, rec)
+            kel = self.identity.get_kel()
+            params = {
+                "home": self.relay.base_url,
                 "card": self.card,
-                **({"handle": self.handle} if self.handle else {}),
-                **({"ext": self.ext} if self.ext else {}),
-                **({"delegations": self.delegations} if self.delegations else {}),
-                **({"erc8004": self.erc8004} if self.erc8004 else {}),
+                "contact": self.contact,
+                "listed": self.listed,
+                **({"handle": self.handle} if self.handle is not None else {}),
+                **({"pay": self.pay} if self.pay is not None else {}),
             }
-            if old is not None:
-                src = old["source"]
-                d = src["descriptor"]
-                same = (
-                    src["kel"] == self.identity.get_kel()
-                    and all(d.get(k) == v for k, v in wanted.items())
-                    and all(
-                        k in wanted for k in ("handle", "ext", "delegations", "erc8004") if k in d
-                    )
+            digest = sha256_hex(
+                canonical_state_bytes(
+                    {"params": params, "lastHash": sha256_hex(event_bytes(kel[-1]))}
                 )
-                if same and d["expiresAt"] > now + 3600:
-                    if force:
-                        self._post_descriptor(src)
-                    return copy.deepcopy(src)
-            issued = now if old is None else max(now, old["source"]["descriptor"]["issuedAt"] + 1)
-            source = create_published_agent(
-                self.identity,
-                relays=[self.relay.base_url],
-                prekey=prekey,
-                profiles=self.profiles.entries(),
-                visibility=self.visibility,
-                handle=self.handle,
-                card=self.card,
-                ext=self.ext,
-                delegations=self.delegations,
-                erc8004=self.erc8004,
-                now=issued,
-                allow_loopback_relays=self.peers.allow_loopback_relays,
             )
-            self._post_descriptor(source)
-            write_record(self.store, _SELF_KEY, {"source": source})
-            return source
+            card = rec.get("card")
+            if card is not None and rec.get("cardParams") == digest:
+                if force:
+                    self._post_card(card)
+            else:
+                issued = now if card is None else max(now, card["card"]["issuedAt"] + 1)
+                card = create_card_record(
+                    self.identity,
+                    **params,
+                    now=issued,
+                    allow_loopback_relays=self.peers.allow_loopback_relays,
+                )
+                self._post_card(card)
+                write_record(self.store, _SELF_KEY, {**rec, "card": card, "cardParams": digest})
+            return copy.deepcopy(rec["source"])
+
+    def _publish_descriptor(self, old: dict | None, prekey, now: int, force: bool) -> dict:
+        """The self record holding the current descriptor: ``old`` itself when its descriptor is
+        reused, else a new record (the descriptor already posted)."""
+        wanted = {
+            "relays": [self.relay.base_url],
+            "prekey": prekey.to_dict(),
+            "profiles": self.profiles.entries(),
+            **({"ext": self.ext} if self.ext else {}),
+            **({"delegations": self.delegations} if self.delegations else {}),
+            **({"erc8004": self.erc8004} if self.erc8004 else {}),
+        }
+        if old is not None:
+            src = old["source"]
+            d = src["descriptor"]
+            same = (
+                src["kel"] == self.identity.get_kel()
+                and all(d.get(k) == v for k, v in wanted.items())
+                and all(k in wanted for k in ("ext", "delegations", "erc8004") if k in d)
+            )
+            if same and d["expiresAt"] > now + 3600:
+                if force:
+                    self._post_descriptor(src)
+                return old
+        issued = now if old is None else max(now, old["source"]["descriptor"]["issuedAt"] + 1)
+        source = create_published_agent(
+            self.identity,
+            relays=[self.relay.base_url],
+            prekey=prekey,
+            profiles=self.profiles.entries(),
+            ext=self.ext,
+            delegations=self.delegations,
+            erc8004=self.erc8004,
+            now=issued,
+            allow_loopback_relays=self.peers.allow_loopback_relays,
+        )
+        self._post_descriptor(source)
+        return {**(old or {}), "source": source}
 
     def _post_descriptor(self, source: dict) -> None:
-        """Post to the home relay, registering the current KEL first when the relay lacks it
-        (``not_registered``) or holds an older one (``kel_conflict``), then posting once more."""
+        """Post to the home relay, registering on demand (``_registered``)."""
+        self._registered(lambda: self.relay.publish(source))
+
+    def _post_card(self, bundle: dict) -> None:
+        """Post our card record to the home relay, registering on demand like the descriptor."""
+        self._registered(lambda: self.relay.publish_card(bundle))
+
+    def _registered(self, post: Callable[[], None]) -> None:
+        """Run ``post``; when the home relay lacks our registration (``not_registered``) or holds
+        an older KEL (``kel_conflict``), register the current KEL and post once more."""
         try:
-            self.relay.publish(source)
+            post()
         except ACEError as exc:
             if exc.code != "not_registered" and exc.relay_code != "kel_conflict":
                 raise
             self.relay.register(self.identity)
-            self.relay.publish(source)
+            post()
 
     # --- discovery --------------------------------------------------------------------
 
@@ -236,7 +301,8 @@ class NetworkClient:
         cursor: str | None = None,
         limit: int = DEFAULT_PAGE_LIMIT,
     ) -> tuple[list[VerifiedAgent], str | None]:
-        """The public directory of our relay (verified, not pinned)."""
+        """The public directory of our relay: identities whose card record is listed (verified,
+        not pinned)."""
         return self.relay.directory(profile=profile, cursor=cursor, limit=limit)
 
     def import_agent(self, source: dict | VerifiedAgent) -> VerifiedAgent:
@@ -244,46 +310,96 @@ class NetworkClient:
         return self.peers.adopt(source, self._now())
 
     def lookup(self, target: str) -> VerifiedAgent:
-        """An ACE ID (``agent(target)``) or ``@name@relay-host``: the verified, pinned public
-        descriptor holding that handle at that relay."""
+        """An ACE ID (``agent(target)``) or ``@name@relay-host`` (through its card record, checked
+        against the handle pin): the verified, pinned descriptor of that identity, fetched from
+        the relay that holds the handle."""
         if is_ace_id(target):
             return self.agent(target)
+        card, relay = self._card_by_handle(target)
+        self._check_card(card.bundle)
+        return self._fetch(card.ace_id, [relay.base_url])
+
+    def lookup_card(self, target: str) -> VerifiedCard:
+        """The verified card record of ``target`` (an ACE ID or ``@name@relay-host``). A handle
+        resolves only to a record whose ``home`` is the queried relay and whose ``handle`` is the
+        queried one (``unknown_peer``). A handle is set once per home: after a record with a
+        handle was seen for an identity, a record of it naming the same home with another or no
+        handle is ``invalid_authorization``; a record naming a new home re-pins."""
+        if is_ace_id(target):
+            card = self._fetch_card(target)
+        else:
+            card, _ = self._card_by_handle(target)
+        return self._check_card(card.bundle)
+
+    def _check_card(self, bundle: dict) -> VerifiedCard:
+        """Verify a fetched card record against the identity's KEL pin and its handle pin
+        (written on first sight of a handle at a home)."""
+        ace_id = bundle["card"]["aceId"]
+        v = verify_card_bundle(
+            bundle,
+            self._now(),
+            allow_loopback_relays=self.peers.allow_loopback_relays,
+            pinned=self.peers.state(ace_id),
+        )
+        key = _handle_pin_key(ace_id)
+        with self.store.lock("network-handles"):
+            pin = load_record(self.store, key)
+            if pin is not None and pin["home"] == v.home and pin["handle"] != v.handle:
+                raise ACEError(
+                    "invalid_authorization",
+                    "the card record does not carry the handle this identity set",
+                )
+            if v.handle is not None and (pin is None or pin["home"] != v.home):
+                write_record(self.store, key, {"home": v.home, "handle": v.handle})
+        return v
+
+    def _card_by_handle(self, target: object) -> tuple[VerifiedCard, RelayClient]:
         m = _HANDLE_RE.fullmatch(target) if isinstance(target, str) else None
         if m is None:
             raise ACEError("invalid_argument", "use an ACE ID or @name@relay-host")
         home = urlsplit(self.relay.base_url)
         url = self.relay.base_url if m[2] == home.netloc else "https://" + m[2]
-        return self.import_agent(self._relay_for(url).handle(m[1]))
+        relay = self._relay_for(url)
+        return relay.handle(m[1]), relay
+
+    def _fetch_card(self, ace_id: str) -> VerifiedCard:
+        """The peer's card record from the first route that serves it: its cached descriptor's
+        relays, then our relay."""
+        cached = self.peers.cached(ace_id)
+        urls = [] if cached is None else cached.relays
+        if self.relay.base_url not in urls:
+            urls.append(self.relay.base_url)
+        error: ACEError | None = None
+        for url in urls:
+            try:
+                return self._relay_for(url).card(ace_id)
+            except ACEError as exc:
+                error = exc
+        raise error or ACEError("unknown_peer", "no route to the peer")
 
     def agent(self, ace_id: str, *, refresh: bool = False) -> VerifiedAgent:
         """The peer's current descriptor: the pinned one while unexpired and bound to our
-        current pins (unless ``refresh``), else fetched from its relays (``resolve`` with the
-        permit it issued us, or the public lookup) and pinned. A failed refresh raises: a stale
-        descriptor is never used."""
+        current pins (unless ``refresh``), else fetched from its relays (``GET
+        /v1/descriptor``) and pinned. A failed refresh raises: a stale descriptor is never
+        used."""
         if not is_ace_id(ace_id):
             raise ACEError("invalid_argument", "invalid ACE ID")
         current, cached, kel_bound = self.peers.lookup_state(ace_id, self._now())
         if current is not None and not refresh:
             return current
-        # The permit is a bearer credential: present it only to relays named by a descriptor
-        # signed under the issuer's current pin (expired is fine). A descriptor from a superseded
-        # KEL state may name relays chosen by a compromised key: only anonymous public lookups
-        # there and at our relay; without a cached descriptor, only at our relay.
-        permit = self._their_permit(ace_id) if kel_bound else None
+        # A descriptor from a superseded KEL state may name relays chosen by a compromised key:
+        # our relay is asked too, as when nothing is cached.
         urls = [self.relay.base_url] if cached is None else cached.relays
         if cached is not None and not kel_bound and self.relay.base_url not in urls:
             urls.append(self.relay.base_url)
-        return self._fetch(ace_id, urls, permit)
+        return self._fetch(ace_id, urls)
 
-    def _fetch(self, ace_id: str, urls: list[str], permit: dict | None = None) -> VerifiedAgent:
-        """Fetch and pin the peer's descriptor from the first of ``urls`` that serves it
-        (``resolve`` with ``permit``, else the public lookup)."""
+    def _fetch(self, ace_id: str, urls: list[str]) -> VerifiedAgent:
+        """Fetch and pin the peer's descriptor from the first of ``urls`` that serves it."""
         error: ACEError | None = None
         for url in urls:
             try:
-                r = self._relay_for(url)
-                agent = r.resolve(ace_id, permit) if permit is not None else r.descriptor(ace_id)
-                return self.peers.adopt(agent, self._now())
+                return self.peers.adopt(self._relay_for(url).descriptor(ace_id), self._now())
             except ACEError as exc:
                 error = exc
         raise error or ACEError("unknown_peer", "no route to the peer")
@@ -301,7 +417,8 @@ class NetworkClient:
         """Invite one peer (ACE ID, ``@handle@host``, or its PublishedAgent shared out of band)
         to contact us: import it, record it ``admitted`` (an explicit local decision; clears a
         block) and return ``{agent, permit}``: our PublishedAgent and a permit issued to the
-        peer. Share it privately: the permit is a bearer credential."""
+        peer, which reaches us even while our contact is ``closed``. Share it privately: the
+        permit is a bearer credential."""
         if profile is not None and self.profiles.get(profile) is None:
             raise ACEError("invalid_argument", f"{profile} is not installed")
         agent = self._target(peer)
@@ -315,7 +432,7 @@ class NetworkClient:
 
     def import_invitation(self, value: object) -> VerifiedAgent:
         """Import an invitation ``{agent, permit}`` addressed to us: verify and pin the agent and
-        hold its permit (so ``connect`` reaches a private inviter). Never admits the inviter."""
+        hold its permit (so ``connect`` reaches a ``closed`` inviter). Never admits the inviter."""
         agent, permit = verify_invitation(
             value,
             self.identity.get_ace_id(),
@@ -473,19 +590,32 @@ class NetworkClient:
 
     def connect(self, target: str | dict | VerifiedAgent, *, profile: str, note: str = "") -> str:
         """Send a contact request for ``profile``; the peer becomes ``pending`` (a local decision).
-        A non-public target needs a permit it issued us. A blocked peer is ``not_permitted``:
-        only ``unblock`` (or an invitation) lifts a block (05 § Blocks)."""
+        Without a permit it issued us, the target's card record must be ``contact: open`` (no
+        record is ``closed``; 05 § Flow); our own ``contact`` does not matter. A blocked peer is
+        ``not_permitted``: only ``unblock`` (or an invitation) lifts a block (05 § Blocks)."""
         agent = self._target(target)
         installed = self.profiles.get(profile)
         if installed is None or installed.descriptor() not in agent.profiles:
             raise ACEError("invalid_argument", "no common profile with an equal digest")
         if self.peers.is_blocked(agent.ace_id):
             raise _blocked_peer()
-        if agent.visibility != "public" and self._their_permit(agent.ace_id) is None:
-            raise ACEError("not_permitted", "a private agent needs a permit it issued")
+        if self._their_permit(agent.ace_id) is None and self._contact_of(agent.ace_id) != "open":
+            raise ACEError(
+                "not_permitted",
+                "the peer takes contact requests only from peers it issued a permit",
+            )
         if self.peers.status(agent.ace_id) != "admitted":
             self.peers.set_status(agent.ace_id, "pending", profile)
         return self._send_contact(agent, self._contact("request", profile, note, agent.ace_id))
+
+    def _contact_of(self, ace_id: str) -> str:
+        """The peer's card record ``contact``; a peer without a card record is ``closed``."""
+        try:
+            return self.lookup_card(ace_id).contact
+        except ACEError as exc:
+            if exc.code == "unknown_peer":
+                return "closed"
+            raise
 
     def _held_requests(self) -> list[tuple[str, dict]]:
         """Unexpired held requests ``(key, record)``, oldest first; expired ones are deleted."""
@@ -539,16 +669,16 @@ class NetworkClient:
         try:
             agent = self.import_agent(req.source)
         except ACEError:
-            agent = self._refresh_source(ace_id, req.source, req.permit)
+            agent = self._refresh_source(ace_id, req.source)
         self._decide(ace_id, "admitted", req.profile, keep_block=True)
         self._hold_permit(agent.ace_id, req.permit)
         self._send_contact(agent, self._contact("accepted", req.profile, to=ace_id))
         self.store.delete(_incoming_key(ace_id))
 
-    def _refresh_source(self, ace_id: str, source: dict, permit: object) -> VerifiedAgent:
+    def _refresh_source(self, ace_id: str, source: dict) -> VerifiedAgent:
         """A held request (24 h) can outlive its source descriptor: pin the source's KEL (05 § Flow
-        step 3) and refresh the descriptor, from the source's routes with the requester's permit
-        while the source is bound to the pin, else by a normal lookup."""
+        step 3) and refresh the descriptor, from the source's routes while the source is bound
+        to the pin, else by a normal lookup."""
         try:
             state, _ = self.peers.pin(source["kel"], self._now())
             relays = list(source["descriptor"]["relays"])
@@ -560,11 +690,7 @@ class NetworkClient:
             bound = False
         if not bound:
             return self.agent(ace_id, refresh=True)
-        try:
-            held = verify_permit(permit, state, self.identity.get_ace_id(), now=self._now())
-        except ACEError:
-            held = None
-        return self._fetch(ace_id, relays, held)
+        return self._fetch(ace_id, relays)
 
     def reject(self, ace_id: str, note: str = "") -> None:
         """Decline a pending request (a ``rejected`` reply, best effort)."""

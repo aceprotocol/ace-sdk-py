@@ -14,6 +14,15 @@ from ._encoding import (
 )
 from ._signing import encode_payload, signing_message, verify_signature
 from .auth import create_auth_headers
+from .card_record import (
+    CardBundle,
+    CardRecord,
+    Contact,
+    VerifiedCard,
+    create_card_record,
+    is_caip10_account,
+    verify_card_bundle,
+)
 from .commerce import (
     CommerceRules,
     ThreadSnapshot,
@@ -88,7 +97,10 @@ __all__ = [
     "Attempt",
     "COMMERCE",
     "CORE",
+    "CardBundle",
+    "CardRecord",
     "CommerceRules",
+    "Contact",
     "ContactRequest",
     "FileStore",
     "Inbox",
@@ -124,6 +136,7 @@ __all__ = [
     "ThreadSnapshot",
     "ThreadStore",
     "VerifiedAgent",
+    "VerifiedCard",
     "canonical_state_bytes",
     "check_receipt_body",
     "check_stranger_source",
@@ -132,6 +145,7 @@ __all__ = [
     "compute_ace_id",
     "conversation_key",
     "create_auth_headers",
+    "create_card_record",
     "create_inception",
     "create_packet",
     "create_permit",
@@ -148,6 +162,7 @@ __all__ = [
     "from_base64",
     "generate_software_key",
     "is_ace_id",
+    "is_caip10_account",
     "is_message_id",
     "is_usable",
     "issue_delegation",
@@ -159,6 +174,7 @@ __all__ = [
     "validate_card",
     "validate_commerce_ext",
     "validate_erc8004",
+    "verify_card_bundle",
     "verify_delegation",
     "verify_erc8004_registration",
     "verify_kel",

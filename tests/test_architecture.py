@@ -171,7 +171,7 @@ def test_accept_after_the_source_descriptor_expired_pins_and_refreshes_with_the_
                 identity, MemoryStore(), rc, PrekeyVault(clock=clock), clock=clock, **kw
             )
 
-        alice, bob = client(visibility="public"), client()  # bob is private
+        alice, bob = client(contact="open", listed=True), client()  # bob is closed
         a, b = alice.identity.get_ace_id(), bob.identity.get_ace_id()
         alice.publish()
         first = bob.publish()
