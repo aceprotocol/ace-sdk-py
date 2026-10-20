@@ -11,6 +11,7 @@ descriptors, messages) never changes local admission: only ``connect``, ``accept
 from __future__ import annotations
 
 import copy
+import dataclasses
 import re
 import threading
 from dataclasses import dataclass
@@ -342,20 +343,59 @@ class NetworkClient:
         resolution pins its ACE ID; a later resolution to another one is
         ``invalid_authorization``. Without a KEL pin for the identity, its descriptor is looked
         up first and its KEL pinned, so the card is verified under the current KEL, never one a
-        relay chose."""
+        relay chose. When the identity has no live descriptor (``unknown_peer``: offline past its
+        lifetime), the card is verified under the bundle's own KEL instead, that KEL is pinned as
+        a descriptor's would be, and the result has ``kel_live`` False (04 § Card record)."""
         if is_ace_id(target):
-            self._pin_kel(target, lambda: self.agent(target))
-            return self._check_card(self._fetch_card(target).bundle)
+            kel_live, card = self._pin_card_kel(
+                target, lambda: self.agent(target), lambda: self._fetch_card(target)
+            )
+            bundle = (card or self._fetch_card(target)).bundle
+            return self._check_card(bundle, kel_live=kel_live)
         card, relay, handle = self._card_by_handle(target)
-        self._pin_kel(card.ace_id, lambda: self._fetch(card.ace_id, [relay.base_url]))
-        return self._check_card(card.bundle, (relay.base_url, handle))
+        kel_live, _ = self._pin_card_kel(
+            card.ace_id, lambda: self._fetch(card.ace_id, [relay.base_url]), lambda: card
+        )
+        return self._check_card(card.bundle, (relay.base_url, handle), kel_live=kel_live)
 
     def _pin_kel(self, ace_id: str, fetch: Callable[[], VerifiedAgent]) -> VerifiedAgent | None:
         """When ``ace_id`` has no KEL pin, pin it through ``fetch`` (a descriptor lookup) and
         return what it fetched; else None."""
         return fetch() if self.peers.state(ace_id) is None else None
 
-    def _check_card(self, bundle: dict, resolved: tuple[str, str] | None = None) -> VerifiedCard:
+    def _pin_card_kel(
+        self,
+        ace_id: str,
+        fetch: Callable[[], VerifiedAgent],
+        card: Callable[[], VerifiedCard],
+    ) -> tuple[bool, VerifiedCard | None]:
+        """``_pin_kel`` for a card lookup. Only when the descriptor lookup finds none
+        (``unknown_peer``) does the card's own bundle (``card``) pin the KEL: the bundle is
+        verified, its KEL adopted under the fork rules, and the card returned with False. Every
+        other failure propagates."""
+        try:
+            self._pin_kel(ace_id, fetch)
+            return True, None
+        except ACEError as exc:
+            if exc.code != "unknown_peer":
+                raise
+        v = verify_card_bundle(
+            card().bundle,
+            self._now(),
+            allow_loopback_relays=self.peers.allow_loopback_relays,
+            pinned=self.peers.state(ace_id),
+        )
+        if v.ace_id != ace_id:
+            raise ACEError("invalid_authorization", "the card record names another identity")
+        pinned, _ = self.peers.pin(list(v.state.events), self._now())
+        # As for a descriptor: another path advanced the pin past the state the card verified under.
+        if pinned.last_hash != v.state.last_hash:
+            raise ACEError("stale_peer_binding", "the pin advanced past the card record")
+        return False, v
+
+    def _check_card(
+        self, bundle: dict, resolved: tuple[str, str] | None = None, *, kel_live: bool = True
+    ) -> VerifiedCard:
         """Verify a fetched card record against the identity's KEL pin and its card pin (written
         on first sight, persisted in the store): no rollback first (an older ``issuedAt``, or an
         equal one with other claims, is ``stale_descriptor``), then the set-once handle per home
@@ -384,7 +424,7 @@ class NetworkClient:
                 write_record(
                     self.store, owner_key, {"home": home, "handle": handle, "aceId": ace_id}
                 )
-        return v
+        return dataclasses.replace(v, kel_live=kel_live)
 
     def _advance_card_pin(self, v: VerifiedCard, digest: str) -> None:
         """The card pin checks and update of ``_check_card``, under the ``network-handles``

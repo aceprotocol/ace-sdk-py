@@ -4,6 +4,7 @@ open/closed)."""
 
 from __future__ import annotations
 
+import copy
 import json
 from urllib.parse import urlsplit
 
@@ -23,7 +24,9 @@ from ace import (
     create_published_agent,
     encode_content,
     is_caip10_account,
+    sha256_hex,
     verify_card_bundle,
+    verify_kel,
 )
 from ace.limits import MAX_CARD_RECORD_BYTES
 from ace.profiles import CONTACT_TYPE
@@ -280,6 +283,67 @@ def test_lookup_card_pins_the_kel_before_trusting_the_card(world):
         bob.lookup_card(a)
     # The KEL was pinned from the descriptor lookup, before the card was checked.
     assert len(bob.peers.state(a).events) == len(alice.identity.get_kel())
+
+
+def test_lookup_card_falls_back_to_the_bundle_kel_when_no_live_descriptor(world):
+    alice = world.agent(contact="open", handle="alice", pay=[SOL])
+    a = alice.identity.get_ace_id()
+    # Alice is offline past her descriptor's lifetime: the relay serves her card but no descriptor.
+    world.clock.now += 8 * 86400
+    with raises("unknown_peer"):
+        world.rc().descriptor(a)
+    for target in (a, f"@alice@{world.host}"):
+        bob = world.agent()
+        v = bob.lookup_card(target)
+        assert v.kel_live is False
+        assert (v.ace_id, v.handle, v.pay) == (a, "alice", [SOL])
+        # The bundle's KEL is pinned, under the same rules as a descriptor's.
+        assert (
+            bob.peers.state(a).last_hash
+            == verify_kel(alice.identity.get_kel(), world.clock.now).last_hash
+        )
+        # The card pin still applies: a rollback is refused.
+        world.relay.cards[a] = world.card(
+            alice, handle="alice", contact="closed", now=v.issued_at - 1
+        )
+        with raises("stale_descriptor"):
+            bob.lookup_card(target)
+        world.relay.cards[a] = v.bundle
+    # Any other descriptor failure (here a tampered one) still fails the lookup, pinning nothing.
+    carol = world.agent()
+    tampered = copy.deepcopy(world.relay.descriptors[a])
+    tampered["descriptor"]["expiresAt"] = world.clock.now + 3600
+    world.relay.descriptors[a] = tampered
+    with raises("relay_protocol_error"):
+        carol.lookup_card(a)
+    assert carol.peers.state(a) is None
+
+
+def test_kel_live_is_true_with_a_live_descriptor(world):
+    alice = world.agent(contact="open", handle="alice")
+    bob = world.agent()
+    assert bob.lookup_card(alice.identity.get_ace_id()).kel_live is True
+    carol = world.agent()
+    assert carol.lookup_card(f"@alice@{world.host}").kel_live is True
+
+
+def test_unparseable_pin_is_storage_failed(world):
+    alice = world.agent(contact="open", handle="alice")
+    bob = world.agent()
+    a = alice.identity.get_ace_id()
+    bob.lookup_card(f"@alice@{world.host}")
+    # A damaged pin is a storage failure, never "no pin" (which would accept a rollback).
+    card_pin = f"network/handles/{sha256_hex(a)}.json"
+    owner_pin = f"network/handle-owners/{sha256_hex(f'{world.relay.url} alice')}.json"
+    for key in (card_pin, owner_pin):
+        good = bob.store.read(key)
+        assert good is not None
+        for bad in (b"not json", b"[]", b"null", b'"x"'):
+            bob.store.write(key, bad)
+            with raises("storage_failed"):
+                bob.lookup_card(f"@alice@{world.host}")
+        bob.store.write(key, good)
+    assert bob.lookup_card(f"@alice@{world.host}").ace_id == a
 
 
 def test_handle_resolving_to_a_new_ace_id_is_invalid_authorization(world):

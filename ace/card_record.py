@@ -66,11 +66,16 @@ class CardBundle(TypedDict):
 
 @dataclass(frozen=True)
 class VerifiedCard:
-    """A verified CardBundle (``record`` is ``bundle["card"]``)."""
+    """A verified CardBundle (``record`` is ``bundle["card"]``). ``kel_live``: whether the KEL it
+    verified under was confirmed by a live descriptor or an existing pin
+    (``NetworkClient.lookup_card``); False when only the bundle's own KEL vouches for it, as from
+    ``verify_card_bundle`` alone or a lookup of an identity with no live descriptor (04 § Card
+    record)."""
 
     ace_id: str
     state: KelState
     bundle: dict = field(hash=False)
+    kel_live: bool = False
 
     @property
     def record(self) -> dict:
