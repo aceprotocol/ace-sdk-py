@@ -1,5 +1,5 @@
-"""Relay HTTP client (07): registration, descriptors, directory, blocks, send, inbox / ack, SSE
-listen and wake hints.
+"""Relay HTTP client (07): registration, descriptors, card records and handles, directory, blocks,
+send, inbox / ack, SSE listen and wake hints.
 
 Every connection resolves the relay host once, refuses non-public addresses (loopback only with
 ``allow_loopback=True``, for local development) and connects to the vetted IP; plain HTTP is
@@ -31,6 +31,7 @@ from ._encoding import (
 from ._relay_url import is_canonical_relay_url, normalize_relay_url
 from ._signing import encode_payload
 from .auth import create_auth_headers
+from .card_record import VerifiedCard, verify_card_bundle
 from .descriptor import VerifiedAgent, verify_published_agent
 from .errors import ACEError, ACEErrorCode
 from .identity import ACEIdentity
@@ -86,8 +87,8 @@ def _loads(raw: bytes, what: str) -> object:
 
 
 def _contained(value: object) -> object:
-    """A packet or PublishedAgent inside a response is within ``MAX_JSON_DEPTH`` on its own;
-    otherwise the whole response is ``relay_protocol_error``, never a skipped entry."""
+    """A packet, PublishedAgent or CardBundle inside a response is within ``MAX_JSON_DEPTH`` on
+    its own; otherwise the whole response is ``relay_protocol_error``, never a skipped entry."""
     check_json_value(value, "relay_protocol_error")
     return value
 
@@ -324,38 +325,50 @@ class RelayClient:
         self._call("POST", "/v1/descriptor", body=source)
 
     def descriptor(self, ace_id: str) -> VerifiedAgent:
-        """``GET /v1/descriptor/{aceId}`` (public descriptors only)."""
-        if not is_ace_id(ace_id):
-            raise ACEError("invalid_argument", "invalid ACE ID")
-        agent = self._agent(
-            self._call("GET", "/v1/descriptor/" + urllib.parse.quote(ace_id, safe="")), ace_id
-        )
-        if agent.visibility != "public":
-            raise _protocol("anonymous lookup returned a private descriptor")
-        return agent
-
-    def resolve(self, ace_id: str, permit: dict) -> VerifiedAgent:
-        """``POST /v1/descriptor/resolve {aceId, permit}``: a private descriptor, with a permit
-        issued by that identity to the caller."""
+        """``GET /v1/descriptor/{aceId}``: anonymous; the unexpired descriptor of any registered
+        identity."""
         if not is_ace_id(ace_id):
             raise ACEError("invalid_argument", "invalid ACE ID")
         return self._agent(
-            self._call("POST", "/v1/descriptor/resolve", body={"aceId": ace_id, "permit": permit}),
-            ace_id,
+            self._call("GET", "/v1/descriptor/" + urllib.parse.quote(ace_id, safe="")), ace_id
         )
 
-    def handle(self, handle: str) -> VerifiedAgent:
-        """``GET /v1/handles/{handle}``: the public descriptor naming ``handle`` on this relay."""
+    # --- card records and handles ---
+
+    def publish_card(self, bundle: dict) -> None:
+        """``POST /v1/card``: publish our own CardBundle (its KEL must equal the registered KEL;
+        the handle is set once per home, 07 § Descriptors and cards)."""
+        verify_card_bundle(bundle, self._now(), allow_loopback_relays=self.allow_loopback)
+        self._call("POST", "/v1/card", body=bundle)
+
+    def _card(self, value: object, ace_id: str | None = None) -> VerifiedCard:
+        _contained(value)
+        try:
+            card = verify_card_bundle(value, self._now(), allow_loopback_relays=self.allow_loopback)
+        except ACEError as exc:
+            raise _protocol(f"relay served an invalid card record: {exc.message}") from None
+        if ace_id is not None and card.ace_id != ace_id:
+            raise _protocol("card record identity mismatch")
+        return card
+
+    def card(self, ace_id: str) -> VerifiedCard:
+        """``GET /v1/card/{aceId}``: anonymous; the stored card record of a registered identity."""
+        if not is_ace_id(ace_id):
+            raise ACEError("invalid_argument", "invalid ACE ID")
+        return self._card(
+            self._call("GET", "/v1/card/" + urllib.parse.quote(ace_id, safe="")), ace_id
+        )
+
+    def handle(self, handle: str) -> VerifiedCard:
+        """``GET /v1/handles/{handle}``: the card record of the identity the handle is bound to at
+        this relay. A record whose ``home`` is not this relay or whose ``handle`` differs is
+        ``unknown_peer`` (04 § Card record)."""
         if not is_handle(handle):
             raise ACEError("invalid_argument", "invalid handle")
-        agent = self._agent(self._call("GET", "/v1/handles/" + handle))
-        if (
-            agent.visibility != "public"
-            or agent.handle != handle
-            or agent.relays[0] != self.base_url
-        ):
-            raise _protocol("handle authority mismatch")
-        return agent
+        card = self._card(self._call("GET", "/v1/handles/" + handle))
+        if card.home != self.base_url or card.handle != handle:
+            raise ACEError("unknown_peer", "the record does not hold this handle at this relay")
+        return card
 
     def directory(
         self,
@@ -364,9 +377,9 @@ class RelayClient:
         cursor: str | None = None,
         limit: int = DEFAULT_PAGE_LIMIT,
     ) -> tuple[list[VerifiedAgent], str | None]:
-        """``GET /v1/descriptors``: the public directory. Each entry is verified on its own: one
-        that fails verification permanently, is not public or does not list ``profile`` is
-        skipped; the rest of the page is kept."""
+        """``GET /v1/descriptors``: the public directory (identities whose card record is
+        listed). Each entry is verified on its own: one that fails verification permanently or
+        does not list ``profile`` is skipped; the rest of the page is kept."""
         if type(limit) is not int or not 1 <= limit <= MAX_INBOX_PAGE:
             raise ACEError("invalid_argument", f"limit must be 1..{MAX_INBOX_PAGE}")
         page = self._object(
@@ -391,10 +404,8 @@ class RelayClient:
                 if exc.is_transient:
                     raise
                 continue
-            # public descriptors only, listing the exact profile ID when one was requested
-            if a.visibility == "public" and (
-                profile is None or any(p["id"] == profile for p in a.profiles)
-            ):
+            # listing the exact profile ID when one was requested
+            if profile is None or any(p["id"] == profile for p in a.profiles):
                 out.append(a)
         return out, self._cursor(page)
 

@@ -101,7 +101,7 @@ def test_beyond_horizon_dropped_without_receipt():
 
 def test_contact_request_accepted_after_hours(world):
     clock, _, net = world
-    alice, bob = net(visibility="public"), net()
+    alice, bob = net(contact="open", listed=True), net()
     a, b = alice.identity.get_ace_id(), bob.identity.get_ace_id()
     bob.connect(a, profile=TEXT.id)
     clock.now += 3 * 3600  # alice is offline for hours
@@ -115,7 +115,7 @@ def test_contact_request_accepted_after_hours(world):
 
 def test_pending_entry_expires_and_a_late_accepted_is_ignored(world):
     clock, _, net = world
-    alice, bob = net(visibility="public"), net()
+    alice, bob = net(contact="open", listed=True), net()
     a, b = alice.identity.get_ace_id(), bob.identity.get_ace_id()
     sent_at = clock.now
     bob.connect(a, profile=TEXT.id)
@@ -152,7 +152,7 @@ def test_backdated_after_not_after_dropped():
 
 def test_refresh_permits_retried_after_transient(world):
     clock, relay, net = world
-    alice, bob = net(visibility="public", accept_profiles=[TEXT.id]), net()
+    alice, bob = net(contact="open", listed=True, accept_profiles=[TEXT.id]), net()
     a, b = alice.identity.get_ace_id(), bob.identity.get_ace_id()
     bob.connect(a, profile=TEXT.id)
     alice.pull()
@@ -253,7 +253,7 @@ def test_on_receipt_follow_and_the_receipt_permit_counts_once_sent(world):
 
     _, relay, net = world
     seen: list = []
-    alice = net(visibility="public", accept_profiles=[TEXT.id])
+    alice = net(contact="open", listed=True, accept_profiles=[TEXT.id])
     bob = net(on_receipt=lambda frm, body, entry: seen.append((frm, body["outcome"], entry)))
     a, b = alice.identity.get_ace_id(), bob.identity.get_ace_id()
     bob.connect(a, profile=TEXT.id)
@@ -302,7 +302,7 @@ def test_the_default_foreign_relay_factory_honors_the_loopback_policy():
 def test_maintain_keeps_a_delivered_entry_visible_for_the_offline_window(world):
 
     clock, _, net = world
-    alice, bob = net(visibility="public", accept_profiles=[TEXT.id]), net()
+    alice, bob = net(contact="open", listed=True, accept_profiles=[TEXT.id]), net()
     a = alice.identity.get_ace_id()
     bob.connect(a, profile=TEXT.id)
     alice.pull()
@@ -357,7 +357,7 @@ def test_stale_fetch_attempt_counters_are_reclaimed():
 
 
 def _admitted_clients(net, **alice_kw):
-    alice = net(visibility="public", accept_profiles=[TEXT.id], **alice_kw)
+    alice = net(contact="open", listed=True, accept_profiles=[TEXT.id], **alice_kw)
     bob = net()
     bob.connect(alice.identity.get_ace_id(), profile=TEXT.id)
     alice.pull()
@@ -472,7 +472,7 @@ def test_refresh_permits_uses_a_profile_the_peer_still_lists(world):
 
     clock, relay, net = world
     both = Profiles((TEXT, COMMERCE))
-    alice = net(visibility="public", accept_profiles=[COMMERCE.id], profiles=both)
+    alice = net(contact="open", listed=True, accept_profiles=[COMMERCE.id], profiles=both)
     bob = net(profiles=Profiles((TEXT, COMMERCE)))
     a, b = alice.identity.get_ace_id(), bob.identity.get_ace_id()
     bob.connect(a, profile=COMMERCE.id)

@@ -15,6 +15,7 @@ from ace import (
     PrekeyVault,
     RelayClient,
     SoftwareIdentity,
+    create_card_record,
     create_packet,
     create_permit,
     create_published_agent,
@@ -28,7 +29,7 @@ SSE = "text/event-stream"
 
 
 class Agent:
-    def __init__(self, relay, visibility="public", handle=None):
+    def __init__(self, relay, contact="open", handle=None, listed=True):
         self.identity = SoftwareIdentity.generate()
         self.id = self.identity.get_ace_id()
         self.vault = PrekeyVault()
@@ -39,16 +40,23 @@ class Agent:
             relays=[relay.url],
             prekey=self.vault.current(),
             profiles=[TEXT.descriptor()],
-            visibility=visibility,
-            handle=handle,
             allow_loopback_relays=True,
         )
         self.client.publish(self.source)
+        self.card = create_card_record(
+            self.identity,
+            home=relay.url,
+            handle=handle,
+            contact=contact,
+            listed=listed,
+            allow_loopback_relays=True,
+        )
+        self.client.publish_card(self.card)
 
 
 @pytest.fixture
 def pair(relay):
-    return Agent(relay, handle="alice"), Agent(relay, visibility="private")
+    return Agent(relay, handle="alice"), Agent(relay, contact="closed", listed=False)
 
 
 def text_packet(sender, recipient, msg="hi"):
@@ -75,21 +83,31 @@ def test_descriptor_lookups_directory_and_handles(relay, pair):
     alice, bob = pair
     c = alice.client
     assert c.descriptor(alice.id).ace_id == alice.id
-    with raises("unknown_peer"):
-        c.descriptor(bob.id)  # private: absent from every public surface
+    assert c.descriptor(bob.id).ace_id == bob.id  # every registered identity resolves by ACE ID
     assert c.handle("alice").ace_id == alice.id
+    assert c.card(bob.id).contact == "closed" and c.card(bob.id).handle is None
+    with raises("unknown_peer"):
+        c.handle("nobody")
+    # the directory lists identities whose card record is listed
     agents, cursor = c.directory()
     assert [a.ace_id for a in agents] == [alice.id] and cursor is None
     assert c.directory(profile="ace:commerce:1")[0] == []
-    # a permit issued by bob resolves his private descriptor
-    permit = create_permit(bob.identity, alice.id)
-    assert c.resolve(bob.id, permit).visibility == "private"
-    with raises("unknown_peer"):
-        c.resolve(bob.id, create_permit(alice.identity, bob.id))  # wrong issuer
     # a relay serving another identity's descriptor is a protocol error
-    relay.descriptors["ace:sha256:" + "1" * 64] = alice.source
+    other = "ace:sha256:" + "1" * 64
+    relay.raw_responses[f"/v1/descriptor/{other}"] = (
+        200,
+        json.dumps(alice.source).encode(),
+        "application/json",
+    )
     with raises("relay_protocol_error"):
-        c.descriptor("ace:sha256:" + "1" * 64)
+        c.descriptor(other)
+    relay.raw_responses[f"/v1/card/{other}"] = (
+        200,
+        json.dumps(alice.card).encode(),
+        "application/json",
+    )
+    with raises("relay_protocol_error"):
+        c.card(other)
 
 
 def test_send_inbox_ack_and_blocks(relay, pair):
@@ -102,7 +120,7 @@ def test_send_inbox_ack_and_blocks(relay, pair):
     assert page.cursor == page.entries[-1].stream_id
     alice.client.ack(alice.identity, page.cursor)
     assert alice.client.inbox(alice.identity).entries == []
-    # bob is private: alice needs his permit
+    # bob is closed: alice needs his permit
     with raises("not_permitted"):
         alice.client.send(text_packet(alice, bob))
     permit = create_permit(bob.identity, alice.id)
@@ -248,13 +266,12 @@ def _nest(n):
 
 
 def _deep_agent(relay, n):
-    """A public PublishedAgent whose ext value (at depth 3) holds ``n`` more levels."""
+    """A PublishedAgent whose ext value (at depth 3) holds ``n`` more levels."""
     return create_published_agent(
         SoftwareIdentity.generate(),
         relays=[relay.url],
         prekey=PrekeyVault().current(),
         profiles=[{"id": "x:deep:1", "digest": "a" * 64}],
-        visibility="public",
         ext={"x:deep:1": _nest(n)},
         allow_loopback_relays=True,
     )

@@ -32,7 +32,7 @@ def client(relay, **kw):
 
 @pytest.fixture
 def pair(relay):
-    alice = client(relay, visibility="public", handle="alice")
+    alice = client(relay, contact="open", listed=True, handle="alice")
     bob = client(relay)
     yield alice, bob
     alice.close()
@@ -54,7 +54,7 @@ def test_contact_flow_messages_and_receipts(relay, pair):
     assert alice.peers.status(b) == "admitted"
     bob.pull()
     assert bob.peers.status(a) == "admitted" and bob.peers.permit_from(a) is not None
-    # bob is private: alice reaches him with his permit
+    # bob is closed: alice reaches him with his permit
     mid = alice.send(b, "ace:text:1", {"message": "hello bob"})
     assert alice.outbox.get(mid).status == "pending"
     bob.pull()  # delivers and sends the receipt
@@ -73,7 +73,7 @@ def test_a_retry_without_a_valid_permit_is_not_permitted_never_permit_less(relay
     import time
 
     now = [int(time.time())]
-    alice = client(relay, visibility="public", clock=lambda: now[0])
+    alice = client(relay, contact="open", listed=True, clock=lambda: now[0])
     bob = client(relay, clock=lambda: now[0])
     a, b = alice.identity.get_ace_id(), bob.identity.get_ace_id()
     bob.connect(a, profile=TEXT.id)
@@ -196,13 +196,12 @@ def test_invitation_pairs_two_private_agents_and_import_never_admits(relay):
 
 
 def test_enqueue_without_any_resolvable_descriptor_is_unknown_peer(relay):
-    alice, bob = client(relay), client(relay)
-    b = bob.identity.get_ace_id()
+    alice = client(relay)
+    b = SoftwareIdentity.generate().get_ace_id()  # never published anywhere
     with raises("unknown_peer"):
         alice.outbox.enqueue(b, "ace:text:1", {"message": "x"})
     assert alice.outbox.entries() == []
     alice.close()
-    bob.close()
 
 
 def test_connect_never_clears_a_block_only_unblock_does(relay, pair):
@@ -267,7 +266,7 @@ def test_pending_requests_one_slot_per_sender_ttl_and_oldest_evicted(relay, pair
 
 
 def test_signing_key_change_pushes_fresh_permits_to_admitted_peers(relay, pair):
-    alice, bob = pair  # alice public, bob private
+    alice, bob = pair  # alice open, bob closed
     a, b = alice.identity.get_ace_id(), bob.identity.get_ace_id()
     alice.accept_profiles = (TEXT.id,)
     bob.connect(a, profile=TEXT.id)

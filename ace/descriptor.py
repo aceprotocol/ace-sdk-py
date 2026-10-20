@@ -1,4 +1,6 @@
-"""Signed descriptors: ``PublishedAgent = {kel, descriptor}`` (self-declared, <= 24 hours).
+"""Signed descriptors: ``PublishedAgent = {kel, descriptor}`` (self-declared, at most
+``MAX_DESCRIPTOR_LIFETIME``; 24 hours by default). Handle, card, payment accounts and contact
+live in the card record (``card_record``).
 
 The descriptor is signed with action ``agent-descriptor``, ``aceId``, ``issuedAt`` and payload
 ``canonicalStateBytes(claims)``. Expired delegation entries are
@@ -18,7 +20,6 @@ from ._encoding import (
     check_json_value,
     decode_fixed_b64,
     is_ace_id,
-    is_handle,
     is_https_url,
     is_namespaced_id,
     is_sha256_hex,
@@ -30,6 +31,7 @@ from .errors import ACEError
 from .identity import ACEIdentity, sign_claims
 from .kel import KelState, is_usable, reconcile_kel, verify_kel
 from .limits import (
+    DEFAULT_DESCRIPTOR_LIFETIME,
     KEM_PUBLIC_KEY_SIZE,
     MAX_DESCRIPTOR_DELEGATIONS,
     MAX_DESCRIPTOR_ERC8004,
@@ -50,11 +52,9 @@ _REQUIRED = {
     "relays",
     "prekey",
     "profiles",
-    "visibility",
-    "card",
     "signature",
 }
-_OPTIONAL = {"handle", "ext", "delegations", "erc8004"}
+_OPTIONAL = {"ext", "delegations", "erc8004"}
 _TAG_CHARS = set("abcdefghijklmnopqrstuvwxyz0123456789-")
 
 
@@ -81,24 +81,12 @@ class VerifiedAgent:
         return copy.deepcopy(self.descriptor["profiles"])
 
     @property
-    def visibility(self) -> str:
-        return self.descriptor["visibility"]
-
-    @property
-    def handle(self) -> str | None:
-        return self.descriptor.get("handle")
-
-    @property
     def issued_at(self) -> int:
         return self.descriptor["issuedAt"]
 
     @property
     def expires_at(self) -> int:
         return self.descriptor["expiresAt"]
-
-    @property
-    def card(self) -> dict:
-        return copy.deepcopy(self.descriptor["card"])
 
     @property
     def ext(self) -> dict:
@@ -114,7 +102,8 @@ def validate_relay_route(value: object, *, allow_loopback: bool = False) -> str:
 
 
 def validate_card(card: object) -> dict:
-    """Closed ``{name?, description?, image?, tags?}`` (tag ``hosted``: keys held by a host)."""
+    """A card record's closed ``card``: ``{name?, description?, image?, tags?}`` (tag ``hosted``:
+    keys held by a host)."""
     if type(card) is not dict or not set(card) <= {"name", "description", "image", "tags"}:
         raise bad("card permits only name, description, image and tags")
 
@@ -254,8 +243,6 @@ def verify_published_agent(
         type(d) is not dict
         or not _REQUIRED <= set(d) <= _REQUIRED | _OPTIONAL
         or not is_ace_id(d["aceId"])
-        or d["visibility"] not in ("private", "public")
-        or ("handle" in d and (not is_handle(d["handle"]) or d["visibility"] != "public"))
     ):
         raise bad("invalid descriptor")
     routes = d["relays"]
@@ -269,7 +256,6 @@ def verify_published_agent(
         validate_relay_route(route, allow_loopback=allow_loopback_relays)
     prekey = _check_prekey(d["prekey"])
     profiles = _check_profiles(d["profiles"])
-    validate_card(d["card"])
     if "ext" in d:
         _check_ext(d["ext"], {p["id"] for p in profiles})
     if "erc8004" in d:
@@ -316,20 +302,17 @@ def create_published_agent(
     relays: list[str],
     prekey: Prekey,
     profiles: list[dict] | None = None,
-    visibility: str = "private",
-    handle: str | None = None,
-    card: dict | None = None,
     ext: dict | None = None,
     delegations: list[dict] | None = None,
     erc8004: list[dict] | None = None,
     now: int | None = None,
-    lifetime: int = MAX_DESCRIPTOR_LIFETIME,
+    lifetime: int = DEFAULT_DESCRIPTOR_LIFETIME,
     allow_loopback_relays: bool = False,
 ) -> dict:
     """Build and sign a PublishedAgent (verified before it is returned)."""
     t = resolve_now(now)
     if type(lifetime) is not int or not 0 < lifetime <= MAX_DESCRIPTOR_LIFETIME:
-        raise ACEError("invalid_argument", "lifetime must be in (0, 86400]")
+        raise ACEError("invalid_argument", f"lifetime must be in (0, {MAX_DESCRIPTOR_LIFETIME}]")
     if not isinstance(prekey, Prekey):
         raise ACEError("invalid_argument", "prekey must be a Prekey")
     claims: dict = {
@@ -339,11 +322,7 @@ def create_published_agent(
         "relays": list(relays),
         "prekey": prekey.to_dict(),
         "profiles": copy.deepcopy(profiles or []),
-        "visibility": visibility,
-        "card": copy.deepcopy(card or {}),
     }
-    if handle is not None:
-        claims["handle"] = handle
     if ext:
         claims["ext"] = copy.deepcopy(ext)
     if delegations:

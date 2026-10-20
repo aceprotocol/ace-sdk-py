@@ -29,7 +29,7 @@ CONTACT_DIGEST = CORE.messages["ace:contact:1"].digest
 
 @pytest.fixture
 def pair(relay):
-    alice, bob = client(relay, visibility="public", handle="alice"), client(relay)
+    alice, bob = client(relay, contact="open", listed=True, handle="alice"), client(relay)
     yield alice, bob
     alice.close()
     bob.close()
@@ -56,14 +56,12 @@ def test_relay_send_refuses_a_permit_for_another_packet():
 def test_lookup_never_presents_a_permit_without_the_issuers_descriptor(relay, pair):
     alice, bob = pair
     bob.peers.save_permit(create_permit(alice.identity, bob.identity.get_ace_id()))
-    seen = []
-    orig = RelayClient.resolve
-    RelayClient.resolve = lambda self, *a, **k: seen.append(a) or orig(self, *a, **k)
-    try:
-        bob.lookup(alice.identity.get_ace_id())  # public lookup at the home relay only
-    finally:
-        RelayClient.resolve = orig
-    assert seen == []
+    # descriptors resolve anonymously by ACE ID: a permit is never presented for resolution
+    assert not hasattr(RelayClient, "resolve")
+    a = alice.identity.get_ace_id()
+    assert bob.lookup(a).ace_id == a
+    assert bob.agent(a, refresh=True).ace_id == a
+    assert all(path != "/v1/descriptor/resolve" for _, path in relay.requests)
 
 
 def test_unpinned_admitted_peer_contact_is_authenticated_by_its_source():
@@ -174,7 +172,7 @@ def test_packet_naming_an_older_delegation_than_the_pin_is_dropped_without_refre
 
 
 def test_stranger_contact_is_checked_against_an_existing_pin():
-    w = World(admitted=False, public=True)
+    w = World(admitted=False, contact="open")
 
     def request():
         body = {
@@ -253,7 +251,7 @@ def test_a_rotated_holders_older_issued_descriptor_replaces_the_superseded_keys_
 
 
 def test_a_kel_adopted_elsewhere_makes_the_cached_descriptor_stale(relay, pair):
-    alice, bob = pair  # alice public, bob private
+    alice, bob = pair  # alice open, bob closed
     a, b = alice.identity.get_ace_id(), bob.identity.get_ace_id()
     alice.accept_profiles = (TEXT.id,)
     bob.connect(a, profile=TEXT.id)
@@ -309,7 +307,7 @@ def test_a_delegation_issuer_key_change_makes_the_cached_descriptor_stale():
 def test_a_kel_stale_descriptors_relays_never_receive_the_permit(relay, pair):
     from ace import create_published_agent
 
-    alice, bob = pair  # alice public, bob private: alice holds bob's permit
+    alice, bob = pair  # alice open, bob closed: alice holds bob's permit
     a, b = alice.identity.get_ace_id(), bob.identity.get_ace_id()
     alice.accept_profiles = (TEXT.id,)
     bob.connect(a, profile=TEXT.id)
@@ -332,10 +330,6 @@ def test_a_kel_stale_descriptors_relays_never_receive_the_permit(relay, pair):
 
     class Recorder:
         base_url = evil_relay
-
-        def resolve(self, ace_id, permit):
-            calls.append(("resolve", permit))
-            raise ACEError("unknown_peer", "nope")
 
         def descriptor(self, ace_id):
             calls.append(("descriptor", None))
@@ -367,7 +361,7 @@ def test_an_expired_newer_descriptor_is_never_rolled_back_under_the_same_kel():
 
 
 def test_a_permit_from_the_issuers_superseded_key_is_never_presented(relay, pair):
-    alice, bob = pair  # alice public, bob private: alice holds bob's permit
+    alice, bob = pair  # alice open, bob closed: alice holds bob's permit
     a, b = alice.identity.get_ace_id(), bob.identity.get_ace_id()
     alice.accept_profiles = (TEXT.id,)
     bob.connect(a, profile=TEXT.id)
@@ -380,7 +374,7 @@ def test_a_permit_from_the_issuers_superseded_key_is_never_presented(relay, pair
     alice.import_agent(bob.publish(force=True))
     assert alice.peers.agent(b) is not None
     calls = []
-    for name in ("resolve", "send", "descriptor"):
+    for name in ("send", "descriptor"):
         real = getattr(alice.relay, name)
 
         def spy(first, *permit, _name=name, _real=real):
@@ -392,8 +386,8 @@ def test_a_permit_from_the_issuers_superseded_key_is_never_presented(relay, pair
         alice.send(b, "ace:text:1", {"message": "hi"})
     mid = alice.outbox.enqueue(b, "ace:text:1", {"message": "hi"})  # queued before the change
     alice.outbox.deliver(mid, alice._post, alice._resolve)
-    with pytest.raises(ACEError):
-        alice.agent(b, refresh=True)
+    # the refresh is the anonymous lookup (bob is resolvable by ACE ID), never with the permit
+    assert alice.agent(b, refresh=True).ace_id == b
     assert calls == [("send", None), ("descriptor",)], calls  # never the permit
 
 

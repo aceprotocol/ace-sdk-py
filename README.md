@@ -21,6 +21,7 @@ pip install ace-sdk
 | Prekeys | `PrekeyVault()` (memory) / `PrekeyVault(path)` (0600 file): `current()`, `rotate(now)`, `open(id)`, `prune(now)` |
 | Packets | `encode_content`, `create_packet`, `decode_packet`, `verify_packet`, `decrypt_packet` |
 | Descriptors | `create_published_agent`, `verify_published_agent` -> `VerifiedAgent`; `issue_delegation`; `verify_erc8004_registration(json, ace_id)` |
+| Card records | `create_card_record`, `verify_card_bundle` -> `VerifiedCard`, `is_caip10_account`; `RelayClient.publish_card/card/handle`; `NetworkClient.lookup_card` |
 | Admission | `create_permit`, `verify_permit`, `PeerStore` (pins, `pending/admitted/blocked`, permits); `NetworkClient.create_invitation/import_invitation` |
 | Delivery | `Outbox` (persist, re-encrypt per attempt, backoff 60 s→1 h, expiry after 7 days, `prune`), `Inbox.open` (receive pipeline, receipts, quarantine) |
 | Profiles | `Profiles([TEXT, COMMERCE, ProfileManifest(custom)])`; core (`ace:receipt:1`, `ace:contact:1`) is always installed |
@@ -39,12 +40,14 @@ net = NetworkClient.open(
     FileStore("state"),
     RelayClient("https://relay.aceprotocol.org"),
     PrekeyVault("state/prekeys.json"),
-    visibility="public",
-    handle="alice",
+    handle="alice",  # card record (04 § Card record): set once at this home relay
+    contact="open",  # strangers may send contact requests (default "closed")
+    listed=True,  # appear in the relay directory (default False)
     on_message=print,
     on_receipt=lambda frm, body, entry: print(body),
 )
-net.publish()  # registers on demand; prekey rotates every 24 h
+net.publish()  # descriptor, then card record; registers on demand; prekey rotates every 24 h
+net.lookup_card("@bob@relay.aceprotocol.org")  # verified card: handle, card, pay, contact
 net.connect("@bob@relay.aceprotocol.org", profile=TEXT.id, note="hi")
 net.pull()  # receive, send receipts, ack (or net.follow())
 for request in net.requests():  # requests never admit anyone by themselves

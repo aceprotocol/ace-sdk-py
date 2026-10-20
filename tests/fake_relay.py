@@ -18,6 +18,7 @@ from ace import (
     is_usable,
     sha256_hex,
     signing_message,
+    verify_card_bundle,
     verify_kel,
     verify_operational_signature,
     verify_permit,
@@ -48,6 +49,8 @@ class FakeRelay:
         self.clock = clock or (lambda: int(time.time()))
         self.identities: dict[str, dict] = {}  # aceId -> {aceId, kel, registeredAt}
         self.descriptors: dict[str, dict] = {}  # aceId -> PublishedAgent
+        self.cards: dict[str, dict] = {}  # aceId -> CardBundle
+        self.handles: dict[str, str] = {}  # handle -> aceId (permanent, set once)
         self.states: dict[str, KelState] = {}  # aceId -> verified log state
         self.request_digests: dict[str, str] = {}
         self.streams: dict[str, list[tuple[str, dict]]] = {}
@@ -211,6 +214,8 @@ class FakeRelay:
             body = json.loads(raw) if raw else None
             if method == "GET" and path.startswith("/v1/descriptor/"):
                 return self._get_v1_descriptor(h, path[len("/v1/descriptor/") :])
+            if method == "GET" and path.startswith("/v1/card/"):
+                return self._get_v1_card(h, path[len("/v1/card/") :])
             if method == "GET" and path.startswith("/v1/handles/"):
                 return self._get_v1_handles(h, path[len("/v1/handles/") :])
             handler = getattr(self, f"_{method.lower()}_{path.strip('/').replace('/', '_')}", None)
@@ -284,6 +289,7 @@ class FakeRelay:
         ace_id = self._auth(h, "unregister", query)
         del self.identities[ace_id]
         self.descriptors.pop(ace_id, None)
+        self.cards.pop(ace_id, None)  # the handle stays bound
         self.streams.pop(ace_id, None)
         self._reply(h, 200, {"ok": True})
 
@@ -305,50 +311,83 @@ class FakeRelay:
             or (old["descriptor"]["issuedAt"] == agent.issued_at and old != body)
         ):
             raise _HTTPError(409, "stale_descriptor")
-        if agent.handle is not None and agent.relays[0] == self.url:
-            for other, src in self.descriptors.items():
-                if other != agent.ace_id and src["descriptor"].get("handle") == agent.handle:
-                    raise _HTTPError(409, "handle_taken")
         self.descriptors[agent.ace_id] = body
         self._reply(h, 200, {"ok": True})
 
-    def _public(self, ace_id: str) -> dict | None:
+    def _live(self, ace_id: str) -> dict | None:
+        """The unexpired descriptor of a registered identity."""
         src = self.descriptors.get(ace_id)
-        if src is None:
+        if src is None or ace_id not in self.identities:
             return None
-        d = src["descriptor"]
-        if d["visibility"] != "public" or d["expiresAt"] <= self.clock():
+        return src if src["descriptor"]["expiresAt"] > self.clock() else None
+
+    def _card(self, ace_id: str | None) -> dict | None:
+        """The stored card record of a registered identity; a record whose KEL is not the
+        current registered KEL is absent (07 § Descriptors and cards)."""
+        c = self.cards.get(ace_id) if ace_id is not None else None
+        state = self.states.get(ace_id) if ace_id is not None else None
+        if c is None or state is None or ace_id not in self.identities:
             return None
-        return src
+        last = verify_kel(c["kel"], self.clock()).last_hash
+        return c if last == state.last_hash else None
+
+    def _handle_of(self, ace_id: str) -> str | None:
+        return next((h for h, owner in self.handles.items() if owner == ace_id), None)
 
     def _get_v1_descriptor(self, h, ace_id):
-        src = self._public(urllib.parse.unquote(ace_id))
+        src = self._live(urllib.parse.unquote(ace_id))
         if src is None:
             raise _HTTPError(404, "unknown_peer")
         self._reply(h, 200, src)
 
-    def _post_v1_descriptor_resolve(self, h, query, body):
-        target = body.get("aceId") if isinstance(body, dict) else None
-        state, src = self.states.get(target), self.descriptors.get(target)
+    def _post_v1_card(self, h, query, body):
         try:
-            if state is None or src is None or src["descriptor"]["expiresAt"] <= self.clock():
-                raise ACEError("unknown_peer")
-            permit = body["permit"]
-            verify_permit(permit, state, permit.get("subject"), now=self.clock())
-            if self.blocks.get((target, permit["subject"]), (False, 0))[0]:
-                raise ACEError("unknown_peer")
-        except (ACEError, KeyError, TypeError, AttributeError):
-            raise _HTTPError(404, "unknown_peer") from None
-        self._reply(h, 200, src)
+            v = verify_card_bundle(body, self.clock(), allow_loopback_relays=True)
+        except ACEError as exc:
+            raise _HTTPError(401, "invalid_authorization") from exc
+        state = self.states.get(v.ace_id)
+        if state is None or v.ace_id not in self.identities:
+            raise _HTTPError(403, "not_registered")
+        if state.last_hash != v.state.last_hash:
+            raise _HTTPError(409, "kel_conflict")
+        old = self.cards.get(v.ace_id)
+        if old is not None and (
+            old["card"]["issuedAt"] > v.issued_at
+            or (old["card"]["issuedAt"] == v.issued_at and old["card"] != body["card"])
+        ):
+            raise _HTTPError(409, "stale_descriptor")
+        # Set once per identity at this home; a record naming another home claims nothing here.
+        bound = self._handle_of(v.ace_id)
+        if v.home != self.url:
+            pass
+        elif bound is not None:
+            if v.handle != bound:
+                raise _HTTPError(400, "invalid_argument")
+        elif v.handle is not None:
+            if v.handle in self.handles:
+                raise _HTTPError(409, "handle_taken")
+            self.handles[v.handle] = v.ace_id
+        self.cards[v.ace_id] = body
+        self._reply(h, 200, {"ok": True})
+
+    def _get_v1_card(self, h, ace_id):
+        c = self._card(urllib.parse.unquote(ace_id))
+        if c is None:
+            raise _HTTPError(404, "unknown_peer")
+        self._reply(h, 200, c)
 
     def _get_v1_handles(self, h, handle):
-        for ace_id, src in self.descriptors.items():
-            if src["descriptor"].get("handle") == handle and self._public(ace_id):
-                return self._reply(h, 200, src)
-        raise _HTTPError(404, "unknown_peer")
+        c = self._card(self.handles.get(handle))
+        if c is None or c["card"]["home"] != self.url:
+            raise _HTTPError(404, "unknown_peer")
+        self._reply(h, 200, c)
 
     def _get_v1_descriptors(self, h, query, body):
-        agents = [s for a in sorted(self.descriptors) if (s := self._public(a))]
+        agents = [
+            s
+            for a in sorted(self.descriptors)
+            if (c := self._card(a)) is not None and c["card"]["listed"] and (s := self._live(a))
+        ]
         profile = query.get("profile")
         if profile:
             agents = [
@@ -398,8 +437,10 @@ class FakeRelay:
                 verify_permit(body["permit"], state, p.from_id, now=now)
             except ACEError:
                 raise _HTTPError(403, "not_permitted") from None
-        elif self._public(p.to_id) is None:
-            raise _HTTPError(403, "not_permitted")
+        else:
+            c = self._card(p.to_id)
+            if c is None or c["card"]["contact"] != "open" or self._live(p.to_id) is None:
+                raise _HTTPError(403, "not_permitted")
         self.sent.append(body)
         self.enqueue_raw(p.to_id, body["packet"])
         self._reply(h, 200, {"ok": True})

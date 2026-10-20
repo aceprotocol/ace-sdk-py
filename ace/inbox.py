@@ -5,7 +5,8 @@ any) first and acknowledges the relay entry only when ``outcome.ack`` is true. O
 
  1. packet shape (closed object, ``ace == "1"``, addressed to us)
  2. admission: blocked senders are dropped; strangers are dropped without any network query or
-    pin write unless we are ``public``, then they continue only as contact candidates
+    pin write unless our card record is ``contact: open``, then they continue only as contact
+    candidates
  3. sender KEL pin (refreshed at most once per sender per ``PIN_REFRESH_INTERVAL_SECONDS`` when
     the packet names a newer delegation; otherwise the packet continues as a contact candidate)
  4. operational signature (delegation ``seq``, signed while live, signer usable now)
@@ -165,7 +166,7 @@ class Inbox:
         on_receipt: Callable[[str, dict, Any], None] | None = None,
         rules: list[ProfileRules] | tuple[ProfileRules, ...] = (),
         outbox: Any = None,
-        public: bool | Callable[[], bool] = False,
+        contact: str | Callable[[], str] = "closed",
         refresh: Callable[[str], Any] | None = None,
         resolve: Callable[[str], Any] | None = None,
         check_capacity: Callable[[PrivateMessage], None] | None = None,
@@ -187,7 +188,8 @@ class Inbox:
         self._on_receipt = on_receipt
         self._rules = check_rules(list(rules))
         self._outbox = outbox
-        self._public = public if callable(public) else (lambda: bool(public))
+        # 05 § Receiver admission: strangers only while our card record is open (none is closed)
+        self._contact = contact if callable(contact) else (lambda: contact)
         self._refresh = refresh
         self._resolve = resolve
         self._check_capacity = check_capacity
@@ -459,8 +461,8 @@ class Inbox:
         when the packet names a newer delegation. Suppressed or transient refresh: retry. When
         no refresh is wired, the refresh fails permanently or it still does not reach the
         packet's delegation, ``None``: the packet continues only as a contact candidate
-        authenticated by its ``source`` against the pin (a private peer after a signing-key
-        change cannot be refreshed with the permits it issued earlier, 05 § Delivery permits)."""
+        authenticated by its ``source`` against the pin (e.g. a peer after a signing-key change
+        that has not republished its descriptor yet)."""
         if state.signing is not None and p.signature["seq"] <= state.signing.seq:
             return state
         if self._refresh is None:
@@ -484,8 +486,9 @@ class Inbox:
         return fresh
 
     def _stranger(self, p: Packet, now: int) -> ReceiveOutcome:
-        """A sender outside the admission table: only a contact request, only while public."""
-        if not self._public():
+        """A sender outside the admission table: only a contact request, only while our card
+        record is ``open``."""
+        if self._contact() != "open":
             raise _Drop(ACEError("not_permitted", "sender is not admitted"))
         return self._candidate(p, now, stranger=True)
 

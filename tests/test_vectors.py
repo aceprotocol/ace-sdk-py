@@ -44,6 +44,7 @@ from ace import (
     from_base64,
     is_usable,
     signing_message,
+    verify_card_bundle,
     verify_delegation,
     verify_erc8004_registration,
     verify_kel,
@@ -383,6 +384,25 @@ def test_descriptor_against_the_pin(c):
         )
 
 
+@pytest.mark.parametrize("c", V["cardRecords"]["valid"], ids=ids(V["cardRecords"]["valid"]))
+def test_card_record_valid(c):
+    v = verify_card_bundle(c["bundle"], c["now"])
+    got = {
+        "aceId": v.ace_id,
+        "home": v.home,
+        "handle": v.handle,
+        "pay": v.pay,
+        "contact": v.contact,
+        "listed": v.listed,
+    }
+    assert got == c["expect"]
+
+
+@pytest.mark.parametrize("c", V["cardRecords"]["invalid"], ids=ids(V["cardRecords"]["invalid"]))
+def test_card_record_invalid(c):
+    assert code_of(lambda: verify_card_bundle(c["bundle"], c["now"])) == c["error"]
+
+
 def test_delegation_permit_and_erc8004():
     for c in V["delegation"]["cases"]:
 
@@ -577,7 +597,7 @@ def test_receive_pipeline(c):
         peers,
         Profiles(),
         on_message=lambda m: None,
-        public=c["public"],
+        contact=c["contact"],
         capacity=c["capacity"],
         clock=lambda: clock["t"],
     )
