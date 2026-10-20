@@ -62,7 +62,8 @@ def _block_key(ace_id: str) -> str:
 
 
 def _handle_pin_key(ace_id: str) -> str:
-    """The ``{home, handle}`` first seen in a peer's card record (set once per home)."""
+    """A peer's card pin: the newest verified record's ``issuedAt`` and claims digest (no
+    rollback), and the ``{home, handle}`` it holds (set once per home)."""
     return f"network/handles/{sha256_hex(ace_id)}.json"
 
 
@@ -332,8 +333,10 @@ class NetworkClient:
         return self._check_card(card.bundle)
 
     def _check_card(self, bundle: dict) -> VerifiedCard:
-        """Verify a fetched card record against the identity's KEL pin and its handle pin
-        (written on first sight of a handle at a home)."""
+        """Verify a fetched card record against the identity's KEL pin and its card pin (written
+        on first sight, persisted in the store): no rollback first (an older ``issuedAt``, or an
+        equal one with other claims, is ``stale_descriptor``), then the set-once handle per home
+        (a record naming the pinned home must carry the pinned handle; a new home re-pins)."""
         ace_id = bundle["card"]["aceId"]
         v = verify_card_bundle(
             bundle,
@@ -341,16 +344,37 @@ class NetworkClient:
             allow_loopback_relays=self.peers.allow_loopback_relays,
             pinned=self.peers.state(ace_id),
         )
+        r = v.record
+        digest = sha256_hex(canonical_state_bytes({k: x for k, x in r.items() if k != "signature"}))
         key = _handle_pin_key(ace_id)
         with self.store.lock("network-handles"):
             pin = load_record(self.store, key)
-            if pin is not None and pin["home"] == v.home and pin["handle"] != v.handle:
+            if pin is not None and pin.get("issuedAt") is not None:
+                if v.issued_at < pin["issuedAt"]:
+                    raise ACEError(
+                        "stale_descriptor", "an older card record than one already verified"
+                    )
+                if v.issued_at == pin["issuedAt"]:
+                    if digest != pin.get("digest"):
+                        raise ACEError(
+                            "stale_descriptor", "another card record with the same issuedAt"
+                        )
+                    return v
+            pinned_handle = None if pin is None else pin.get("handle")
+            if pinned_handle is not None and pin["home"] == v.home and pinned_handle != v.handle:
                 raise ACEError(
                     "invalid_authorization",
                     "the card record does not carry the handle this identity set",
                 )
-            if v.handle is not None and (pin is None or pin["home"] != v.home):
-                write_record(self.store, key, {"home": v.home, "handle": v.handle})
+            # The handle pin is unchanged (same home: equal by the check above), set on first
+            # claim, or re-pinned by a handle at a new home; a record without a handle at another
+            # home keeps the earlier home's handle pin.
+            keep = pinned_handle is not None and (v.handle is None or pin["home"] == v.home)
+            if keep:
+                held = {"home": pin["home"], "handle": pinned_handle}
+            else:
+                held = {"home": v.home, **({"handle": v.handle} if v.handle is not None else {})}
+            write_record(self.store, key, {**held, "issuedAt": v.issued_at, "digest": digest})
         return v
 
     def _card_by_handle(self, target: object) -> tuple[VerifiedCard, RelayClient]:

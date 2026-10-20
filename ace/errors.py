@@ -31,6 +31,8 @@ ACEErrorCode = Literal[
     "blocked_address",
     "delivery_rejected",
     "expired",
+    # no rollback of descriptors and card records (04, 07)
+    "stale_descriptor",
     # profile-rule codes of the official commerce profile
     "transition_not_allowed",
     "wrong_role",

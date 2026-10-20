@@ -25,7 +25,7 @@ CONTACT_DIGEST = CORE.messages["ace:contact:1"].digest
 
 class World:
     def __init__(
-        self, *, public=False, admitted=True, refresh=None, on_message=None, capacity=None
+        self, *, contact="closed", admitted=True, refresh=None, on_message=None, capacity=None
     ):
         self.clock = Clock()
         self.a, self.b = Party(self.clock), Party(self.clock)
@@ -44,7 +44,7 @@ class World:
             self.b.peers,
             Profiles(),
             on_message=on_message or self.got.append,
-            contact="open" if public else "closed",
+            contact=contact,
             refresh=refresh or (lambda ace_id: self.refreshes.append(ace_id)),
             check_capacity=capacity,
             clock=self.clock,
@@ -162,10 +162,10 @@ def contact(w, kind="request", profile=TEXT, permit=True, ts=None):
     return w.packet("ace:contact:1", body, CONTACT_DIGEST, ts=ts)
 
 
-def test_stranger_contacts_only_while_public_and_never_admit():
+def test_stranger_contacts_only_while_open_and_never_admit():
     private = World(admitted=False)
     assert private.inbox.receive(wire(contact(private))).kind == "dropped"
-    w = World(admitted=False, public=True)
+    w = World(admitted=False, contact="open")
     out = w.inbox.receive(wire(contact(w)))
     assert out.kind == "delivered" and out.receipt is None  # contacts are never receipted
     assert w.got[0].type == "ace:contact:1"
@@ -176,7 +176,7 @@ def test_stranger_contacts_only_while_public_and_never_admit():
         contact(w, ts=w.clock.now - OFFLINE_WINDOW_SECONDS - 1),
     ):
         assert w.inbox.receive(wire(bad)).kind == "dropped"
-    # a non-contact from a stranger is dropped even while public
+    # a non-contact from a stranger is dropped even while open
     assert w.inbox.receive(wire(w.packet())).kind == "dropped"
 
 

@@ -277,6 +277,57 @@ def test_a_new_dlg_re_signs_the_card_at_upkeep(world):
     assert after.handle == "alice"
 
 
+def test_older_card_is_rejected_after_a_newer_one(world):
+    alice = world.agent(contact="open", handle="alice")
+    bob = world.agent()
+    a = alice.identity.get_ace_id()
+    seen = bob.lookup_card(a)
+    # A relay rolling back to an older record (contact closed) is refused on every path.
+    world.relay.cards[a] = world.card(
+        alice, handle="alice", pay=[SOL], contact="closed", now=seen.issued_at - 1
+    )
+    with raises("stale_descriptor"):
+        bob.lookup_card(a)
+    with raises("stale_descriptor"):
+        bob.lookup_card(f"@alice@{world.host}")
+    with raises("stale_descriptor"):
+        bob.lookup(f"@alice@{world.host}")
+
+
+def test_equal_issued_at_with_different_claims_is_rejected(world):
+    alice = world.agent(contact="open", handle="alice")
+    bob = world.agent()
+    a = alice.identity.get_ace_id()
+    seen = bob.lookup_card(a)
+    assert bob.lookup_card(a).record == seen.record  # the identical record again is fine
+    world.relay.cards[a] = world.card(
+        alice, handle="alice", contact="open", listed=True, now=seen.issued_at
+    )
+    with raises("stale_descriptor"):
+        bob.lookup_card(a)
+
+
+def test_newer_card_updates_the_pin(world):
+    alice = world.agent(contact="open", handle="alice")
+    bob = world.agent()
+    a = alice.identity.get_ace_id()
+    first = world.relay.cards[a]
+    bob.lookup_card(a)
+    world.relay.cards[a] = world.card(
+        alice, handle="alice", pay=[SOL], contact="closed", now=first["card"]["issuedAt"] + 5
+    )
+    assert bob.lookup_card(a).contact == "closed"
+    # the pin moved to the newer record and persists in the store: the first one is now a rollback
+    world.relay.cards[a] = first
+    with raises("stale_descriptor"):
+        bob.lookup_card(a)
+    again = NetworkClient.open(
+        bob.identity, bob.store, world.rc(), bob.vault, receive=False, clock=world.clock
+    )
+    with raises("stale_descriptor"):
+        again.lookup_card(a)
+
+
 def test_no_card_means_closed(world):
     # Bob is configured open but has published only a descriptor, no card record.
     bob = world.agent(contact="open", publish=False)

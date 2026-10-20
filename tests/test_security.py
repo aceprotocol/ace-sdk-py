@@ -172,7 +172,7 @@ def test_packet_naming_an_older_delegation_than_the_pin_is_dropped_without_refre
 
 
 def test_stranger_contact_is_checked_against_an_existing_pin():
-    w = World(admitted=False, public=True)
+    w = World(admitted=False, contact="open")
 
     def request():
         body = {
@@ -330,10 +330,6 @@ def test_a_kel_stale_descriptors_relays_never_receive_the_permit(relay, pair):
 
     class Recorder:
         base_url = evil_relay
-
-        def resolve(self, ace_id, permit):
-            calls.append(("resolve", permit))
-            raise ACEError("unknown_peer", "nope")
 
         def descriptor(self, ace_id):
             calls.append(("descriptor", None))
