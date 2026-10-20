@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 from typing import Literal, TypedDict
+from urllib.parse import urlsplit
 
 from ._documents import bad, verify_claims
 from ._encoding import (
@@ -156,6 +157,8 @@ def verify_card_bundle(
     validate_relay_route(r["home"], allow_loopback=allow_loopback_relays)
     if "handle" in r and not is_handle(r["handle"]):
         raise bad("handle must match [a-z][a-z0-9_-]{2,31}")
+    if "handle" in r and urlsplit(r["home"]).path:
+        raise bad("a handle needs a home without a path (it resolves at https://host)")
     validate_card(r["card"])
     if "pay" in r:
         pay = r["pay"]
