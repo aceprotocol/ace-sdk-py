@@ -1,6 +1,7 @@
 """Regression tests for the 2026-10-13 security review fixes."""
 
 import json
+import threading
 
 import pytest
 
@@ -27,12 +28,155 @@ from tests.test_network import client
 CONTACT_DIGEST = CORE.messages["ace:contact:1"].digest
 
 
+def _pause_decision_lock(monkeypatch, store):
+    """Stop just before the receiving thread takes the shared admission-decision lock."""
+    ready, resume = threading.Event(), threading.Event()
+    real = store.lock
+
+    def lock(name, timeout=10.0):
+        if name == "network-blocks" and threading.current_thread().name == "contact-race":
+            ready.set()
+            assert resume.wait(10)
+        return real(name, timeout)
+
+    monkeypatch.setattr(store, "lock", lock)
+    return ready, resume
+
+
 @pytest.fixture
 def pair(relay):
     alice, bob = client(relay, contact="open", listed=True, handle="alice"), client(relay)
     yield alice, bob
     alice.close()
     bob.close()
+
+
+@pytest.mark.parametrize("kind", ["accepted", "rejected", "request"])
+def test_contact_cannot_undo_a_block_completed_by_another_client(relay, pair, monkeypatch, kind):
+    alice, bob = pair
+    a, b = alice.identity.get_ace_id(), bob.identity.get_ace_id()
+    source = alice.publish()
+    bob.import_agent(source)
+    bob.peers.set_status(a, "pending", TEXT.id)
+    body = {"kind": kind, "profile": TEXT.id, "note": "", "source": source}
+    if kind != "rejected":
+        body["permit"] = create_permit(alice.identity, b)
+    packet = create_packet(
+        alice.identity,
+        b,
+        bob.vault.current(),
+        encode_content("ace:contact:1", CONTACT_DIGEST, body),
+        timestamp=bob._now(),
+    )
+    actor = NetworkClient.open(bob.identity, bob.store, bob.relay, bob.vault, receive=False)
+    ready, resume = _pause_decision_lock(monkeypatch, bob.store)
+    outcomes, errors = [], []
+
+    def receive():
+        try:
+            outcomes.append(bob.inbox.receive(wire(packet)))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=receive, name="contact-race")
+    worker.start()
+    try:
+        assert ready.wait(10)
+        actor.block(a)
+        assert bob.peers.is_blocked(a)
+    finally:
+        resume.set()
+        worker.join(10)
+        actor.close()
+    assert not worker.is_alive() and not errors
+    assert outcomes[0].ack
+    assert bob.peers.is_blocked(a)
+    assert bob.requests() == [] and bob.peers.permit_from(a) is None
+
+
+def test_connect_rechecks_a_block_after_resolving_the_contact(relay, pair, monkeypatch):
+    alice, bob = pair
+    a = alice.identity.get_ace_id()
+    actor = NetworkClient.open(bob.identity, bob.store, bob.relay, bob.vault, receive=False)
+    ready, resume = _pause_decision_lock(monkeypatch, bob.store)
+    errors = []
+
+    def connect():
+        try:
+            bob.connect(a, profile=TEXT.id)
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=connect, name="contact-race")
+    worker.start()
+    try:
+        assert ready.wait(10)
+        actor.block(a)
+    finally:
+        resume.set()
+        worker.join(10)
+        actor.close()
+    assert not worker.is_alive()
+    assert len(errors) == 1 and isinstance(errors[0], ACEError)
+    assert errors[0].code == "not_permitted" and bob.peers.is_blocked(a)
+
+
+def test_receipt_failures_share_persistent_fetch_budget_and_release_the_queue(relay, pair):
+    alice, bob = pair
+    a = alice.identity.get_ace_id()
+    alice.accept_profiles = (TEXT.id,)
+    bob.connect(a, profile=TEXT.id)
+    alice.pull()
+    bob.pull()
+    first = bob.send(a, "ace:text:1", {"message": "first"})
+    second = bob.send(a, "ace:text:1", {"message": "second"})
+    attempts = []
+
+    def reply(out):
+        attempts.append(out)
+        if len(attempts) <= 3:
+            raise ACEError("relay_unavailable", "sender relay unreachable")
+
+    alice._reply = reply
+    assert [o.kind for o in alice.pull()] == ["retry"]
+    assert len(alice.store.list("inbox/attempts/")) == 1
+    received = alice.received
+    alice.close()
+    restarted = NetworkClient.open(
+        alice.identity, alice.store, alice.relay, alice.vault, on_message=received.append
+    )
+    restarted._reply = reply
+    try:
+        assert [o.kind for o in restarted.pull()] == ["retry"]
+        assert len(relay.streams[a]) == 2
+        assert [o.kind for o in restarted.pull()] == ["quarantined", "delivered"]
+        assert restarted.relay.inbox(restarted.identity).entries == []
+        assert len(restarted.inbox.quarantined()) == 1
+        assert restarted.store.list("inbox/attempts/") == []
+        assert [m.message_id for m in received if m.type == "ace:text:1"] == [first, second]
+    finally:
+        restarted.close()
+
+
+def test_successful_receipt_clears_previous_transport_failures(relay, pair):
+    alice, bob = pair
+    a = alice.identity.get_ace_id()
+    alice.accept_profiles = (TEXT.id,)
+    bob.connect(a, profile=TEXT.id)
+    alice.pull()
+    bob.pull()
+    bob.send(a, "ace:text:1", {"message": "hi"})
+    real = alice._reply
+
+    def fail(out):
+        raise ACEError("relay_unavailable", "temporary")
+
+    alice._reply = fail
+    assert alice.pull()[0].kind == "retry"
+    alice._reply = real
+    assert alice.pull()[0].kind == "duplicate"
+    assert alice.store.list("inbox/attempts/") == []
+    assert alice.inbox.quarantined() == []
 
 
 def test_relay_send_refuses_a_permit_for_another_packet():

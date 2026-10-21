@@ -317,10 +317,16 @@ class Inbox:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def receive(self, raw: bytes) -> ReceiveOutcome:
-        """Process one packet given as its raw JSON bytes."""
+    def receive(
+        self, raw: bytes, *, send_receipt: Callable[[Reply], None] | None = None
+    ) -> ReceiveOutcome:
+        """Process one packet given as its raw JSON bytes. When supplied, ``send_receipt``
+        completes step 11 before deciding the disposition, so its transient failures share
+        the durable fetch-attempt limit. Without it the caller sends ``outcome.receipt``."""
         if not isinstance(raw, (bytes, bytearray, memoryview)):
             raise ACEError("invalid_argument", "raw must be the packet bytes")
+        if send_receipt is not None and not callable(send_receipt):
+            raise ACEError("invalid_argument", "send_receipt must be callable")
         raw = bytes(raw)
         with self._mutex:
             if self._closed:
@@ -328,6 +334,12 @@ class Inbox:
             fp = sha256_hex(raw)
             try:
                 out = self._receive(raw)
+                if out.receipt is not None and send_receipt is not None:
+                    try:
+                        send_receipt(out.receipt)
+                    except ACEError as exc:
+                        if exc.is_transient:
+                            raise
             except _Retry as r:
                 out = self._failed(fp, raw, r.error)
             except _Drop as d:

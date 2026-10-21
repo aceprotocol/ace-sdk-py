@@ -23,11 +23,14 @@ from ._encoding import (
     HANDLE_RE,
     canonical_state_bytes,
     is_ace_id,
+    is_handle,
     is_message_id,
+    is_sha256_hex,
     sha256_hex,
     unix_now,
     wire_int,
 )
+from ._relay_url import is_canonical_relay_url
 from .card_record import Contact, VerifiedCard, create_card_record, verify_card_bundle
 from .descriptor import VerifiedAgent, create_published_agent, verify_published_agent
 from .errors import ACEError
@@ -66,7 +69,7 @@ def _block_key(ace_id: str) -> str:
 
 def _handle_pin_key(ace_id: str) -> str:
     """A peer's card pin: the newest verified record's ``issuedAt`` and claims digest (no
-    rollback), and the ``{home, handle}`` it holds (set once per home)."""
+    rollback), plus all permanent home-to-handle bindings and the legacy ``{home, handle}``."""
     return f"network/handles/{sha256_hex(ace_id)}.json"
 
 
@@ -77,11 +80,27 @@ def _handle_owner_key(home: str, handle: str) -> str:
 
 
 def _valid_card_pin(p: dict) -> bool:
-    return (
+    valid = (
         wire_int(p.get("issuedAt")) is not None
-        and isinstance(p.get("digest"), str)
-        and isinstance(p.get("home"), str)
-        and (p.get("handle") is None or isinstance(p["handle"], str))
+        and is_sha256_hex(p.get("digest"))
+        and is_canonical_relay_url(p.get("home"), allow_loopback=True)
+        and (
+            "handle" not in p
+            or (is_handle(p["handle"]) and not urlsplit(p["home"]).path)
+        )
+    )
+    if not valid or "handles" not in p:
+        return valid
+    handles = p["handles"]
+    return (
+        isinstance(handles, dict)
+        and all(
+            is_canonical_relay_url(home, allow_loopback=True)
+            and not urlsplit(home).path
+            and is_handle(handle)
+            for home, handle in handles.items()
+        )
+        and handles.get(p["home"]) == p.get("handle")
     )
 
 
@@ -392,7 +411,8 @@ class NetworkClient:
         resolves only to a record whose ``home`` is the queried relay and whose ``handle`` is the
         queried one (``unknown_peer``). A handle is set once per home: after a record with a
         handle was seen for an identity, a record of it naming the same home with another or no
-        handle is ``invalid_authorization``; a record naming a new home re-pins. A handle's first
+        handle is ``invalid_authorization``; a new home adds a binding without forgetting earlier
+        homes. A handle's first
         resolution pins its ACE ID; a later resolution to another one is
         ``invalid_authorization``. Without a KEL pin for the identity, its descriptor is looked
         up first and its KEL pinned, so the card is verified under the current KEL, never one a
@@ -453,7 +473,7 @@ class NetworkClient:
         """Verify a fetched card record against the identity's KEL pin and its card pin (written
         on first sight, persisted in the store): no rollback first (an older ``issuedAt``, or an
         equal one with other claims, is ``stale_descriptor``), then the set-once handle per home
-        (a record naming the pinned home must carry the pinned handle; a new home re-pins). A
+        (a record naming any previously pinned home must carry that home's pinned handle). A
         record ``resolved`` from ``(home, handle)`` must name the ACE ID that handle first
         resolved to (``invalid_authorization``)."""
         ace_id = bundle["card"]["aceId"]
@@ -488,28 +508,39 @@ class NetworkClient:
         lock."""
         key = _handle_pin_key(v.ace_id)
         pin = _load_pin(self.store, key, _valid_card_pin)
+        # Older records remember one home. Import that known binding and preserve every home
+        # seen from now on, atomically alongside the card's revision (no second write to tear).
+        handles = {} if pin is None else dict(pin.get("handles", {}))
+        if pin is not None and pin.get("handle") is not None:
+            handles[pin["home"]] = pin["handle"]
         if pin is not None:
             if v.issued_at < pin["issuedAt"]:
                 raise ACEError("stale_descriptor", "an older card record than one already verified")
             if v.issued_at == pin["issuedAt"]:
                 if digest != pin["digest"]:
                     raise ACEError("stale_descriptor", "another card record with the same issuedAt")
+                if "handles" not in pin:
+                    write_record(self.store, key, {**pin, "handles": handles})
                 return
         pinned_handle = None if pin is None else pin.get("handle")
-        if pinned_handle is not None and pin["home"] == v.home and pinned_handle != v.handle:
+        if v.home in handles and handles[v.home] != v.handle:
             raise ACEError(
                 "invalid_authorization",
                 "the card record does not carry the handle this identity set",
             )
-        # The handle pin is unchanged (same home: equal by the check above, so taking the
-        # record's is the same), set on first claim, or re-pinned by a handle at a new home; a
-        # record without a handle at another home keeps the earlier home's handle pin.
+        if v.handle is not None:
+            handles[v.home] = v.handle
+        # Keep the legacy fields readable, while handles retains all permanent bindings.
         keep = pinned_handle is not None and v.handle is None
         if keep:
             held = {"home": pin["home"], "handle": pinned_handle}
         else:
             held = {"home": v.home, **({"handle": v.handle} if v.handle is not None else {})}
-        write_record(self.store, key, {**held, "issuedAt": v.issued_at, "digest": digest})
+        write_record(
+            self.store,
+            key,
+            {**held, "handles": handles, "issuedAt": v.issued_at, "digest": digest},
+        )
 
     def _card_by_handle(self, target: object) -> tuple[VerifiedCard, RelayClient, str]:
         m = _HANDLE_RE.fullmatch(target) if isinstance(target, str) else None
@@ -761,8 +792,14 @@ class NetworkClient:
                     "not_permitted",
                     "the peer takes contact requests only from peers it issued a permit",
                 )
-        if self.peers.status(agent.ace_id) != "admitted":
-            self.peers.set_status(agent.ace_id, "pending", profile)
+        # Resolution/card lookup may have raced a block in another client sharing the store.
+        # Every network-driven admission mutation uses the same lock as block/unblock.
+        with self.store.lock("network-blocks"):
+            status = self.peers.status(agent.ace_id)
+            if status == "blocked":
+                raise _blocked_peer()
+            if status != "admitted":
+                self.peers.set_status(agent.ace_id, "pending", profile)
         return self._send_contact(agent, self._contact("request", profile, note, agent.ace_id))
 
     def _card_or_none(self, ace_id: str) -> VerifiedCard | None:
@@ -894,26 +931,38 @@ class NetworkClient:
         if kind == "request":
             # 05 § Flow: one slot per sender (replaced), TTL, and the oldest evicted when full.
             key = _incoming_key(sender)
-            with self.store.lock("network-incoming"):
-                held = [k for k, _ in self._held_requests() if k != key]
-                while len(held) >= MAX_PENDING_CONTACT_REQUESTS:
-                    self.store.delete(held.pop(0))
-                write_record(self.store, key, {"message": m.to_dict(), "receivedAt": self._now()})
+            with self.store.lock("network-blocks"):
+                if self.peers.is_blocked(sender):
+                    return
+                with self.store.lock("network-incoming"):
+                    held = [k for k, _ in self._held_requests() if k != key]
+                    while len(held) >= MAX_PENDING_CONTACT_REQUESTS:
+                        self.store.delete(held.pop(0))
+                    write_record(
+                        self.store, key, {"message": m.to_dict(), "receivedAt": self._now()}
+                    )
             return
         status, rec = self.peers.status(sender), self.peers.get(sender)
         refresh = status == "admitted" and kind == "accepted"
         if not refresh and (status != "pending" or rec is None or rec.profile != m.body["profile"]):
             return  # replies count only for our own unexpired pending request
-        if kind != "accepted":
-            self.peers.set_status(sender, None)
-            return
-        agent = self.import_agent(m.body["source"])
-        expected = "admitted" if refresh else "pending"
-        self._hold_permit(
-            agent.ace_id, m.body["permit"], when=lambda r: r is not None and r.status == expected
-        )
-        if not refresh:  # a permit refresh (05 § Delivery permits) changes only the permit
-            self.peers.set_status(sender, "admitted", m.body["profile"])
+        if kind == "accepted":
+            self.import_agent(m.body["source"])
+        with self.store.lock("network-blocks"):
+            # The source verification above may overlap a local block or a different pending
+            # request. Re-read under the decision lock before retaining permits or changing state.
+            status, rec = self.peers.status(sender), self.peers.get(sender)
+            refresh = status == "admitted" and kind == "accepted"
+            if not refresh and (
+                status != "pending" or rec is None or rec.profile != m.body["profile"]
+            ):
+                return
+            if kind != "accepted":
+                self.peers.set_status(sender, None)
+                return
+            self._hold_permit(sender, m.body["permit"])
+            if not refresh:
+                self.peers.set_status(sender, "admitted", m.body["profile"])
 
     def _auto_accept(self) -> None:
         for r in self.requests():
@@ -936,13 +985,7 @@ class NetworkClient:
 
     def _consume(self, inbox: Inbox, entry: RelayEntry) -> tuple[ReceiveOutcome, bool]:
         """Process one entry and send its receipt; whether it reached a final disposition."""
-        out = inbox.receive(entry.packet)
-        if out.receipt is not None:
-            try:
-                self._reply(out.receipt)
-            except ACEError as exc:
-                if exc.is_transient:
-                    return out, False  # 06 step 11: retried on the next fetch
+        out = inbox.receive(entry.packet, send_receipt=self._reply)
         return out, out.ack
 
     def pull(self, *, limit: int = MAX_INBOX_PAGE) -> list[ReceiveOutcome]:

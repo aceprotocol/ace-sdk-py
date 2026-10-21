@@ -225,10 +225,12 @@ class ThreadStore:
         return next_state, t
 
     def apply(self, e: MessageEvent, body: dict) -> str:
-        """Idempotent per ``message_id``; returns the resulting state."""
+        """Idempotent per ``(from_id, message_id)``; returns the resulting state."""
         with self._store.lock("commerce"):
             t = self.get(e.conversation, e.thread_id or "")
-            if t is not None and any(h["messageId"] == e.message_id for h in t.history):
+            if t is not None and any(
+                h["from"] == e.from_id and h["messageId"] == e.message_id for h in t.history
+            ):
                 return t.state
             next_state, t = self.decide(e, body)
             entry = {

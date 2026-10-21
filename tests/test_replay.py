@@ -95,3 +95,33 @@ def test_from_state_validation():
             ReplayDetector.from_state(json.loads(json.dumps(state)))
     floaty = ReplayDetector.from_state({**good, "horizon": 10.0, "entries": [[mid(2), B, 11.0]]})
     assert floaty.export_state()["entries"] == [[mid(2), B, 11]]
+
+
+def test_lazy_indexes_stay_bounded_without_changing_replay_semantics():
+    det = ReplayDetector(capacity=16, horizon=0)
+    oracle = ReplayDetector(capacity=16, horizon=0)
+    assert det.commit(mid(1), B, 1, 0)
+    assert oracle.commit(mid(1), B, 1, 0)
+    for i in range(2, 2002):
+        # The old entry from B prevents stale entries for A from reaching the global heap head.
+        assert det.commit(mid(i), A, i, 0) == oracle.commit(mid(i), A, i, 0)
+        expected = oracle.export_state()
+        assert det.export_state() == expected
+        oracle = ReplayDetector.from_state(expected, capacity=16)
+        assert len(det._global) <= 2 * len(det._live) + 64
+        assert sum(map(len, det._per_sender.values())) == det._sender_heap_size
+        assert det._sender_heap_size <= 2 * len(det._live) + 64
+        assert len(det._sh_heap) <= 2 * len(det._sh) + 64
+    assert det.seen(mid(1), B)
+    assert det.accepts(mid(3000), B, 2)
+    assert det.covered(A, 2000) and not det.covered(A, 2001)
+    # A later floor and horizon compaction must still work after repeated index rebuilding.
+    for i in range(2002, 2050):
+        sender = f"ace:sha256:{i:064x}"
+        for j in range(2):
+            ts = i * 2 + j
+            assert det.commit(mid(ts), sender, ts, 3000) == oracle.commit(
+                mid(ts), sender, ts, 3000
+            )
+        assert det.export_state() == oracle.export_state()
+        oracle = ReplayDetector.from_state(oracle.export_state(), capacity=16)

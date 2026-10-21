@@ -58,6 +58,7 @@ class ReplayDetector:
         self._live: dict[tuple[str, str], int] = {}  # (sender, id) -> ts
         self._global: list[tuple[int, str, str]] = []  # lazy (ts, sender, id)
         self._per_sender: dict[str, list[tuple[int, str]]] = {}  # lazy (ts, id)
+        self._sender_heap_size = 0  # includes stale entries, unlike _counts
         self._counts: dict[str, int] = {}
         self._lock = threading.RLock()
 
@@ -191,6 +192,7 @@ class ReplayDetector:
         self._live[(s, mid)] = ts
         heapq.heappush(self._global, (ts, s, mid))
         heapq.heappush(self._per_sender.setdefault(s, []), (ts, mid))
+        self._sender_heap_size += 1
         self._counts[s] = self._counts.get(s, 0) + 1
 
     def _remove(self, s: str, mid: str) -> None:
@@ -200,7 +202,7 @@ class ReplayDetector:
             self._counts[s] = c
         else:
             del self._counts[s]
-            self._per_sender.pop(s, None)
+            self._sender_heap_size -= len(self._per_sender.pop(s, []))
 
     def _peek_global(self) -> tuple[int, str, str] | None:
         g = self._global
@@ -212,9 +214,12 @@ class ReplayDetector:
         h = self._per_sender.get(s)
         while h and self._live.get((s, h[0][1])) != h[0][0]:
             heapq.heappop(h)
+            self._sender_heap_size -= 1
         return h[0] if h else None
 
     def _set_sh(self, s: str, h: int) -> None:
+        if self._sh.get(s) == h:
+            return
         self._sh[s] = h
         heapq.heappush(self._sh_heap, (h, s))
 
@@ -249,13 +254,26 @@ class ReplayDetector:
 
     def _compact(self) -> None:
         self._drop_covered_sh()
-        if len(self._sh) <= self._capacity:
-            return
-        excess = len(self._sh) - self._capacity // 2
-        for s, h in sorted(self._sh.items(), key=lambda kv: (kv[1], kv[0]))[:excess]:
-            del self._sh[s]
-            self._horizon = max(self._horizon, h)
-        self._purge_global()
-        self._drop_covered_sh()
-        self._sh_heap = [(h, s) for s, h in self._sh.items()]
-        heapq.heapify(self._sh_heap)
+        if len(self._sh) > self._capacity:
+            excess = len(self._sh) - self._capacity // 2
+            for s, h in sorted(self._sh.items(), key=lambda kv: (kv[1], kv[0]))[:excess]:
+                del self._sh[s]
+                self._horizon = max(self._horizon, h)
+            self._purge_global()
+            self._drop_covered_sh()
+        # Lazy deletion can leave entries behind a long-lived minimum forever. Bound the
+        # physical indexes independently of the protocol's live-entry / horizon limits.
+        # Rebuilding indexes never raises a horizon or changes which messages are accepted.
+        limit = 2 * len(self._live) + 64
+        if len(self._global) > limit or self._sender_heap_size > limit:
+            self._global = [(ts, s, mid) for (s, mid), ts in self._live.items()]
+            heapq.heapify(self._global)
+            self._per_sender = {}
+            for (s, mid), ts in self._live.items():
+                self._per_sender.setdefault(s, []).append((ts, mid))
+            for heap in self._per_sender.values():
+                heapq.heapify(heap)
+            self._sender_heap_size = len(self._live)
+        if len(self._sh_heap) > 2 * len(self._sh) + 64:
+            self._sh_heap = [(h, s) for s, h in self._sh.items()]
+            heapq.heapify(self._sh_heap)

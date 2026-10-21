@@ -484,7 +484,12 @@ def test_pin_missing_required_fields_is_storage_failed(world):
     seen = bob.lookup_card(f"@alice@{world.host}")
     card_pin = f"network/handles/{sha256_hex(a)}.json"
     owner_pin = f"network/handle-owners/{sha256_hex(f'{world.relay.url} alice')}.json"
-    full = {"home": world.relay.url, "handle": "alice", "issuedAt": seen.issued_at, "digest": "x"}
+    full = {
+        "home": world.relay.url,
+        "handle": "alice",
+        "issuedAt": seen.issued_at,
+        "digest": sha256_hex("card claims"),
+    }
     cases = [(card_pin, {})]
     cases += [
         (card_pin, {k: v for k, v in full.items() if k != m})
@@ -527,6 +532,103 @@ def test_handle_resolving_to_a_new_ace_id_is_invalid_authorization(world):
     with raises("invalid_authorization"):
         again.lookup_card(f"@alice@{world.host}")
     again.close()
+
+
+@pytest.mark.parametrize("return_handle", ["charlie", None])
+def test_handle_bindings_survive_home_migration_and_restart(world, return_handle):
+    alice, bob = world.agent(handle="alice"), world.agent()
+    a, home = alice.identity.get_ace_id(), world.relay.url
+    bob.lookup_card(a)
+    key = f"network/handles/{sha256_hex(a)}.json"
+    # Simulate a record written by the previous SDK; its known binding must be migrated.
+    old = load_record(bob.store, key)
+    old.pop("handles")
+    write_record(bob.store, key, old)
+    world.clock.now += 1
+    world.relay.cards[a] = world.card(alice, home="https://other.example", handle="bob")
+    assert bob.lookup_card(a).handle == "bob"
+    assert load_record(bob.store, key)["handles"] == {home: "alice", "https://other.example": "bob"}
+    again = NetworkClient.open(
+        bob.identity, bob.store, world.rc(), bob.vault, receive=False, clock=world.clock
+    )
+    try:
+        world.clock.now += 2
+        world.relay.cards[a] = world.card(alice, handle=return_handle)
+        with raises("invalid_authorization"):
+            again.lookup_card(a)
+        world.relay.cards[a] = world.card(alice, handle="alice")
+        assert again.lookup_card(a).handle == "alice"
+        world.clock.now += 2
+        world.relay.cards[a] = world.card(alice, home="https://other.example", handle="charlie")
+        with raises("invalid_authorization"):
+            again.lookup_card(a)
+    finally:
+        again.close()
+
+
+def test_equal_card_revision_migrates_a_legacy_pin_without_losing_it(world):
+    alice, bob = world.agent(handle="alice"), world.agent()
+    a = alice.identity.get_ace_id()
+    seen = bob.lookup_card(a)
+    key = f"network/handles/{sha256_hex(a)}.json"
+    old = load_record(bob.store, key)
+    old.pop("handles")
+    write_record(bob.store, key, old)
+    assert bob.lookup_card(a).issued_at == seen.issued_at
+    assert load_record(bob.store, key)["handles"] == {world.relay.url: "alice"}
+
+
+@pytest.mark.parametrize(
+    "handles",
+    [
+        None,
+        [],
+        {},
+        {"https://invalid.example": "Bad"},
+        {"not a home": "alice"},
+        {"https://other.example/path": "alice"},
+    ],
+)
+def test_malformed_or_conflicting_handle_history_is_storage_failed(world, handles):
+    alice, bob = world.agent(handle="alice"), world.agent()
+    a = alice.identity.get_ace_id()
+    bob.lookup_card(a)
+    key = f"network/handles/{sha256_hex(a)}.json"
+    pin = load_record(bob.store, key)
+    if isinstance(handles, dict) and handles:
+        handles = {world.relay.url: "alice", **handles}
+    write_record(bob.store, key, {**pin, "handles": handles})
+    with raises("storage_failed"):
+        bob.lookup_card(a)
+
+
+def test_handle_history_conflicting_with_legacy_fields_is_storage_failed(world):
+    alice, bob = world.agent(handle="alice"), world.agent()
+    a = alice.identity.get_ace_id()
+    bob.lookup_card(a)
+    key = f"network/handles/{sha256_hex(a)}.json"
+    pin = load_record(bob.store, key)
+    write_record(bob.store, key, {**pin, "handles": {world.relay.url: "bob"}})
+    with raises("storage_failed"):
+        bob.lookup_card(a)
+
+
+@pytest.mark.parametrize("mutation", ["missing_handle", "null_handle", "invalid_digest"])
+def test_handle_pin_legacy_fields_must_agree_with_history(world, mutation):
+    alice, bob = world.agent(handle="alice"), world.agent()
+    a = alice.identity.get_ace_id()
+    bob.lookup_card(a)
+    key = f"network/handles/{sha256_hex(a)}.json"
+    pin = load_record(bob.store, key)
+    if mutation == "missing_handle":
+        del pin["handle"]
+    elif mutation == "null_handle":
+        pin["handle"] = None
+    else:
+        pin["digest"] = "not a sha256 digest"
+    write_record(bob.store, key, pin)
+    with raises("storage_failed"):
+        bob.lookup_card(a)
 
 
 def test_refused_card_leaves_descriptor_unpublished(world):

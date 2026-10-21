@@ -122,6 +122,30 @@ def test_full_flow_with_stablecoin_settlement():
     assert accept
 
 
+def test_opposite_parties_can_reuse_a_message_id_without_skipping_the_transition():
+    from ace import create_packet, encode_content
+
+    m = Market()
+    b, s = m.buyer, m.seller
+    try:
+        mid, _ = m.send(b, s, RFQ, {"need": "translate"})
+        plaintext = encode_content(
+            OFFER, COMMERCE.messages[OFFER].digest, {"price": "10", "currency": "USDC"}, "t1"
+        )
+        packet = create_packet(
+            s.identity, b.id, b.vault.current(), plaintext, timestamp=m.clock.now, message_id=mid
+        )
+        assert m.receive(s, b, packet).kind == "delivered"
+        assert m.state(b) == "offered"
+        history = m.rules[b.id].threads.list()[0].history
+        assert [(h["from"], h["messageId"]) for h in history] == [(b.id, mid), (s.id, mid)]
+        assert m.receive(s, b, packet).kind == "duplicate"
+        assert len(m.rules[b.id].threads.list()[0].history) == 2
+    finally:
+        for inbox in m.inbox.values():
+            inbox.close()
+
+
 def test_send_side_checks_and_receive_rejections():
     m = Market()
     b, s = m.buyer, m.seller
