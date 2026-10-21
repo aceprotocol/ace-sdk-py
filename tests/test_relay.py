@@ -20,8 +20,9 @@ from ace import (
     create_permit,
     create_published_agent,
     encode_content,
+    is_canonical_relay_url,
+    normalize_relay_url,
 )
-from ace._relay_url import normalize_relay_url
 
 from .helpers import raises
 
@@ -77,6 +78,15 @@ def test_normalize_url():
     for bad in ("ftp://x", "https://u:p@x", "https://x?q=1", 5):
         with raises("invalid_argument"):
             normalize_relay_url(bad)
+    # Public, as in sdk-ts and sdk-swift: the normalization, in the ACE HTTPS host grammar.
+    assert is_canonical_relay_url("https://relay.example.com", allow_loopback=False)
+    for bad in (
+        "https://Relay.example.com",
+        "https://relay.example.com.",
+        "http://relay.example.com",
+        "https://[::1]",
+    ):
+        assert not is_canonical_relay_url(bad, allow_loopback=False), bad
 
 
 def test_descriptor_lookups_directory_and_handles(relay, pair):

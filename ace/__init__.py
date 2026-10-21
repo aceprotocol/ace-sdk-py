@@ -12,6 +12,7 @@ from ._encoding import (
     sha256_hex,
     to_base64,
 )
+from ._relay_url import is_canonical_relay_url, normalize_relay_url
 from ._signing import encode_payload, signing_message, verify_signature
 from .auth import create_auth_headers
 from .card_record import (
@@ -163,10 +164,12 @@ __all__ = [
     "generate_software_key",
     "is_ace_id",
     "is_caip10_account",
+    "is_canonical_relay_url",
     "is_message_id",
     "is_usable",
     "issue_delegation",
     "key_digest",
+    "normalize_relay_url",
     "prekey_id",
     "sha256_hex",
     "signing_message",
