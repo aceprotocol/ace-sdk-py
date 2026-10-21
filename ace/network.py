@@ -11,13 +11,14 @@ descriptors, messages) never changes local admission: only ``connect``, ``accept
 from __future__ import annotations
 
 import copy
-import dataclasses
+import functools
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
 
+from ._documents import claims
 from ._encoding import (
     HANDLE_RE,
     canonical_state_bytes,
@@ -25,8 +26,9 @@ from ._encoding import (
     is_message_id,
     sha256_hex,
     unix_now,
+    wire_int,
 )
-from .card_record import VerifiedCard, create_card_record, verify_card_bundle
+from .card_record import Contact, VerifiedCard, create_card_record, verify_card_bundle
 from .descriptor import VerifiedAgent, create_published_agent, verify_published_agent
 from .errors import ACEError
 from .identity import ACEIdentity
@@ -81,27 +83,21 @@ def _kel_provenance_key(ace_id: str) -> str:
     return f"network/kel-provenance/{sha256_hex(ace_id)}.json"
 
 
-def _is_str(v: object) -> bool:
-    return isinstance(v, str)
-
-
 def _valid_card_pin(p: dict) -> bool:
-    at = p.get("issuedAt")
     return (
-        isinstance(at, int)
-        and not isinstance(at, bool)
-        and _is_str(p.get("digest"))
-        and _is_str(p.get("home"))
-        and (p.get("handle") is None or _is_str(p["handle"]))
+        wire_int(p.get("issuedAt")) is not None
+        and isinstance(p.get("digest"), str)
+        and isinstance(p.get("home"), str)
+        and (p.get("handle") is None or isinstance(p["handle"], str))
     )
 
 
 def _valid_owner_pin(p: dict) -> bool:
-    return all(_is_str(p.get(k)) for k in ("aceId", "home", "handle"))
+    return all(isinstance(p.get(k), str) for k in ("aceId", "home", "handle"))
 
 
 def _valid_provenance(p: dict) -> bool:
-    return _is_str(p.get("aceId")) and isinstance(p.get("liveConfirmed"), bool)
+    return isinstance(p.get("aceId"), str) and isinstance(p.get("liveConfirmed"), bool)
 
 
 def _load_pin(store: ACEStore, key: str, valid: Callable[[dict], bool]) -> dict | None:
@@ -162,7 +158,7 @@ class NetworkClient:
         handle: str | None = None,
         card: dict | None = None,
         pay: list[str] | None = None,
-        contact: str = "closed",
+        contact: Contact = "closed",
         listed: bool = False,
         ext: dict | None = None,
         delegations: list[dict] | None = None,
@@ -383,12 +379,26 @@ class NetworkClient:
         """An ACE ID (``agent(target)``) or ``@name@relay-host`` (through its card record, checked
         against the handle pin): the verified, pinned descriptor of that identity, fetched from
         the relay that holds the handle."""
+        return self._resolve_target(target)[0]
+
+    def lookup_with_card(self, target: str) -> tuple[VerifiedAgent, VerifiedCard | None]:
+        """``lookup`` plus the peer's verified card record (None: it has none, ``unknown_peer`` at
+        every route). By handle, the card record the handle resolved through; by ACE ID,
+        ``lookup_card``."""
+        agent, card = self._resolve_target(target)
+        return agent, (card if card is not None else self._card_or_none(agent.ace_id))
+
+    def _resolve_target(self, target: str) -> tuple[VerifiedAgent, VerifiedCard | None]:
+        """``lookup``, with the card record verified on the way when ``target`` is a handle."""
         if is_ace_id(target):
-            return self.agent(target)
+            return self.agent(target), None
         card, relay, handle = self._card_by_handle(target)
-        pinned = self._pin_kel(card.ace_id, lambda: self._fetch(card.ace_id, [relay.base_url]))
-        self._check_card(card.bundle, (relay.base_url, handle))
-        return pinned if pinned is not None else self._fetch(card.ace_id, [relay.base_url])
+        provenance = _load_pin(self.store, _kel_provenance_key(card.ace_id), _valid_provenance)
+        # The descriptor first: it pins or advances the KEL, so the card verifies under the
+        # current KEL.
+        agent = self._fetch(card.ace_id, [relay.base_url])
+        self._confirm_live(card.ace_id, provenance)
+        return agent, self._check_card(card.bundle, (relay.base_url, handle))
 
     def lookup_card(self, target: str) -> VerifiedCard:
         """The verified card record of ``target`` (an ACE ID or ``@name@relay-host``). A handle
@@ -405,28 +415,21 @@ class NetworkClient:
         record). That pin is recorded as not confirmed live: later lookups look the descriptor up
         again and report False until one confirms it."""
         if is_ace_id(target):
-            kel_live, card = self._card_kel(
-                target, lambda: self.agent(target), lambda: self._fetch_card(target)
-            )
-            bundle = (card or self._fetch_card(target)).bundle
-            return self._check_card(bundle, kel_live=kel_live)
+            fetch_card = functools.cache(lambda: self._fetch_card(target))
+            kel_live = self._card_kel(target, lambda: self.agent(target), fetch_card)
+            return self._check_card(fetch_card().bundle, kel_live=kel_live)
         card, relay, handle = self._card_by_handle(target)
-        kel_live, _ = self._card_kel(
+        kel_live = self._card_kel(
             card.ace_id, lambda: self._fetch(card.ace_id, [relay.base_url]), lambda: card
         )
         return self._check_card(card.bundle, (relay.base_url, handle), kel_live=kel_live)
-
-    def _pin_kel(self, ace_id: str, fetch: Callable[[], VerifiedAgent]) -> VerifiedAgent | None:
-        """When ``ace_id`` has no KEL pin, pin it through ``fetch`` (a descriptor lookup) and
-        return what it fetched; else None."""
-        return fetch() if self.peers.state(ace_id) is None else None
 
     def _card_kel(
         self,
         ace_id: str,
         fetch: Callable[[], VerifiedAgent],
         card: Callable[[], VerifiedCard],
-    ) -> tuple[bool, VerifiedCard | None]:
+    ) -> bool:
         """The KEL a card lookup verifies under, and whether a live descriptor confirmed it. A
         pin confirmed live is used as is. Otherwise the descriptor is looked up through ``fetch``
         (pinning or reconciling the KEL): on success the pin is recorded as confirmed live. When
@@ -434,44 +437,52 @@ class NetworkClient:
         pin the card's own bundle (``card``) pins the KEL (``_pin_bundle_kel``). Every other
         failure propagates."""
         pinned = self.peers.state(ace_id)
-        key = _kel_provenance_key(ace_id)
-        provenance = _load_pin(self.store, key, _valid_provenance)
-        confirmed = provenance is None or provenance["liveConfirmed"]
-        if pinned is not None and confirmed:
-            return True, None
+        provenance = _load_pin(self.store, _kel_provenance_key(ace_id), _valid_provenance)
+        if pinned is not None and (provenance is None or provenance["liveConfirmed"]):
+            return True
         try:
             fetch()
         except ACEError as exc:
             if exc.code != "unknown_peer":
                 raise
-            return (False, None) if pinned is not None else self._pin_bundle_kel(ace_id, card())
-        if not confirmed:
-            with self.store.lock("peers"):
-                write_record(self.store, key, {"aceId": ace_id, "liveConfirmed": True})
-        return True, None
+            if pinned is None:
+                self._pin_bundle_kel(card())
+            return False
+        self._confirm_live(ace_id, provenance)
+        return True
 
-    def _pin_bundle_kel(self, ace_id: str, card: VerifiedCard) -> tuple[bool, VerifiedCard]:
-        """Pin the verified KEL of ``card`` (no live descriptor), recorded as not confirmed live
-        with the pin, atomically (under the ``peers`` lock)."""
-        v = verify_card_bundle(
-            card.bundle,
-            self._now(),
-            allow_loopback_relays=self.peers.allow_loopback_relays,
-            pinned=self.peers.state(ace_id),
+    def _mark_unconfirmed(self, ace_id: str) -> None:
+        """Record ``ace_id``'s KEL pin as not confirmed live (pinned without a live descriptor);
+        called under the ``peers`` lock, with the pin."""
+        write_record(
+            self.store, _kel_provenance_key(ace_id), {"aceId": ace_id, "liveConfirmed": False}
         )
-        if v.ace_id != ace_id:
-            raise ACEError("invalid_authorization", "the card record names another identity")
 
-        def record(pinned: KelState) -> None:
+    def _confirm_live(self, ace_id: str, provenance: dict | None) -> None:
+        """After a live descriptor was reconciled with ``ace_id``'s pin: a pin recorded (in
+        ``provenance``, read before the descriptor lookup) as not confirmed live is now
+        confirmed."""
+        if provenance is not None and not provenance["liveConfirmed"]:
+            with self.store.lock("peers"):
+                write_record(
+                    self.store,
+                    _kel_provenance_key(ace_id),
+                    {"aceId": ace_id, "liveConfirmed": True},
+                )
+
+    def _pin_bundle_kel(self, card: VerifiedCard) -> None:
+        """Pin the KEL of ``card`` (already verified for the looked-up identity; no live
+        descriptor), recorded as not confirmed live with the pin, atomically (under the ``peers``
+        lock). ``peers.pin`` reconciles it with any pin written since; ``_check_card`` then
+        re-verifies the record under the pin."""
+
+        def record(pinned: KelState, _outcome: str) -> None:
             # As for a descriptor: another path advanced the pin past the card's KEL state.
-            if pinned.last_hash != v.state.last_hash:
+            if pinned.last_hash != card.state.last_hash:
                 raise ACEError("stale_peer_binding", "the pin advanced past the card record")
-            write_record(
-                self.store, _kel_provenance_key(ace_id), {"aceId": ace_id, "liveConfirmed": False}
-            )
+            self._mark_unconfirmed(card.ace_id)
 
-        self.peers.pin(list(v.state.events), self._now(), then=record)
-        return False, v
+        self.peers.pin(list(card.state.events), self._now(), then=record)
 
     def _check_card(
         self, bundle: dict, resolved: tuple[str, str] | None = None, *, kel_live: bool = True
@@ -489,24 +500,25 @@ class NetworkClient:
             allow_loopback_relays=self.peers.allow_loopback_relays,
             pinned=self.peers.state(ace_id),
         )
-        r = v.record
-        digest = sha256_hex(canonical_state_bytes({k: x for k, x in r.items() if k != "signature"}))
+        digest = sha256_hex(canonical_state_bytes(claims(v.record)))
         with self.store.lock("network-handles"):
-            owner_key = None if resolved is None else _handle_owner_key(*resolved)
-            owner = (
-                None if owner_key is None else _load_pin(self.store, owner_key, _valid_owner_pin)
-            )
-            if owner is not None and owner.get("aceId") != ace_id:
-                raise ACEError(
-                    "invalid_authorization", "the handle resolved to another identity than before"
-                )
-            self._advance_card_pin(v, digest)
-            if owner_key is not None and owner is None:
-                home, handle = resolved
-                write_record(
-                    self.store, owner_key, {"home": home, "handle": handle, "aceId": ace_id}
-                )
-        return dataclasses.replace(v, kel_live=kel_live)
+            if resolved is None:
+                self._advance_card_pin(v, digest)
+            else:
+                owner_key = _handle_owner_key(*resolved)
+                owner = _load_pin(self.store, owner_key, _valid_owner_pin)
+                if owner is not None and owner["aceId"] != ace_id:
+                    raise ACEError(
+                        "invalid_authorization",
+                        "the handle resolved to another identity than before",
+                    )
+                self._advance_card_pin(v, digest)
+                if owner is None:
+                    home, handle = resolved
+                    write_record(
+                        self.store, owner_key, {"home": home, "handle": handle, "aceId": ace_id}
+                    )
+        return replace(v, kel_live=kel_live)
 
     def _advance_card_pin(self, v: VerifiedCard, digest: str) -> None:
         """The card pin checks and update of ``_check_card``, under the ``network-handles``
@@ -517,7 +529,7 @@ class NetworkClient:
             if v.issued_at < pin["issuedAt"]:
                 raise ACEError("stale_descriptor", "an older card record than one already verified")
             if v.issued_at == pin["issuedAt"]:
-                if digest != pin.get("digest"):
+                if digest != pin["digest"]:
                     raise ACEError("stale_descriptor", "another card record with the same issuedAt")
                 return
         pinned_handle = None if pin is None else pin.get("handle")
@@ -526,10 +538,10 @@ class NetworkClient:
                 "invalid_authorization",
                 "the card record does not carry the handle this identity set",
             )
-        # The handle pin is unchanged (same home: equal by the check above), set on first
-        # claim, or re-pinned by a handle at a new home; a record without a handle at another
-        # home keeps the earlier home's handle pin.
-        keep = pinned_handle is not None and (v.handle is None or pin["home"] == v.home)
+        # The handle pin is unchanged (same home: equal by the check above, so taking the
+        # record's is the same), set on first claim, or re-pinned by a handle at a new home; a
+        # record without a handle at another home keeps the earlier home's handle pin.
+        keep = pinned_handle is not None and v.handle is None
         if keep:
             held = {"home": pin["home"], "handle": pinned_handle}
         else:
@@ -561,13 +573,14 @@ class NetworkClient:
         used."""
         if not is_ace_id(ace_id):
             raise ACEError("invalid_argument", "invalid ACE ID")
-        current, cached, kel_bound = self.peers.lookup_state(ace_id, self._now())
+        current, cached, bound = self.peers.lookup_state(ace_id, self._now())
         if current is not None and not refresh:
             return current
-        # A descriptor from a superseded KEL state may name relays chosen by a compromised key:
+        # A descriptor no longer bound to our current pins (the subject's KEL or a delegation
+        # issuer's moved on) may name relays chosen by a superseded, possibly compromised key:
         # our relay is asked too, as when nothing is cached.
         urls = [self.relay.base_url] if cached is None else cached.relays
-        if cached is not None and not kel_bound and self.relay.base_url not in urls:
+        if cached is not None and not bound and self.relay.base_url not in urls:
             urls.append(self.relay.base_url)
         return self._fetch(ace_id, urls)
 
@@ -766,28 +779,34 @@ class NetworkClient:
         Without a permit it issued us, the target's card record must be ``contact: open`` (no
         record is ``closed``; 05 § Flow); our own ``contact`` does not matter. A blocked peer is
         ``not_permitted``: only ``unblock`` (or an invitation) lifts a block (05 § Blocks)."""
-        agent = self._target(target)
+        if isinstance(target, (VerifiedAgent, dict)):
+            agent, card = self.import_agent(target), None
+        else:
+            agent, card = self._resolve_target(target)
         installed = self.profiles.get(profile)
         if installed is None or installed.descriptor() not in agent.profiles:
             raise ACEError("invalid_argument", "no common profile with an equal digest")
         if self.peers.is_blocked(agent.ace_id):
             raise _blocked_peer()
-        if self._their_permit(agent.ace_id) is None and self._contact_of(agent.ace_id) != "open":
-            raise ACEError(
-                "not_permitted",
-                "the peer takes contact requests only from peers it issued a permit",
-            )
+        if self._their_permit(agent.ace_id) is None:
+            card = card if card is not None else self._card_or_none(agent.ace_id)
+            if card is None or card.contact != "open":
+                raise ACEError(
+                    "not_permitted",
+                    "the peer takes contact requests only from peers it issued a permit",
+                )
         if self.peers.status(agent.ace_id) != "admitted":
             self.peers.set_status(agent.ace_id, "pending", profile)
         return self._send_contact(agent, self._contact("request", profile, note, agent.ace_id))
 
-    def _contact_of(self, ace_id: str) -> str:
-        """The peer's card record ``contact``; a peer without a card record is ``closed``."""
+    def _card_or_none(self, ace_id: str) -> VerifiedCard | None:
+        """The peer's verified card record; None when it has none (``unknown_peer``: closed,
+        unlisted)."""
         try:
-            return self.lookup_card(ace_id).contact
+            return self.lookup_card(ace_id)
         except ACEError as exc:
             if exc.code == "unknown_peer":
-                return "closed"
+                return None
             raise
 
     def _held_requests(self) -> list[tuple[str, dict]]:
@@ -839,9 +858,9 @@ class NetworkClient:
         req = self._request(ace_id)
         if self.peers.is_blocked(ace_id):
             raise _blocked_peer()
-        try:
+        if req.source["descriptor"]["expiresAt"] > self._now():
             agent = self.import_agent(req.source)
-        except ACEError:
+        else:
             agent = self._refresh_source(ace_id, req.source)
         self._decide(ace_id, "admitted", req.profile, keep_block=True)
         self._hold_permit(agent.ace_id, req.permit)
@@ -851,19 +870,25 @@ class NetworkClient:
     def _refresh_source(self, ace_id: str, source: dict) -> VerifiedAgent:
         """A held request (24 h) can outlive its source descriptor: pin the source's KEL (05 § Flow
         step 3) and refresh the descriptor, from the source's routes while the source is bound
-        to the pin, else by a normal lookup."""
-        try:
-            state, _ = self.peers.pin(source["kel"], self._now())
-            relays = list(source["descriptor"]["relays"])
-            # bound: the source's kel ends at the pin (the pin did not move past it)
-            bound = state.ace_id == ace_id and state.last_hash == sha256_hex(
-                event_bytes(source["kel"][-1])
-            )
-        except (ACEError, KeyError, TypeError, IndexError):
-            bound = False
-        if not bound:
-            return self.agent(ace_id, refresh=True)
-        return self._fetch(ace_id, relays)
+        to the pin, else by a normal lookup. A KEL pinned (or advanced) from the source alone is
+        not confirmed live, as a card bundle's own KEL is not, until the refreshed descriptor
+        confirms it (04 § Card record)."""
+
+        def record(state: KelState, outcome: str) -> None:
+            if outcome != "unchanged":
+                self._mark_unconfirmed(state.ace_id)
+
+        # A pin failure (a fork: kel_conflict) fails the accept, never passed over by a lookup.
+        state, _ = self.peers.pin(source["kel"], self._now(), then=record)
+        relays = list(source["descriptor"]["relays"])
+        # bound: the source's kel ends at the pin (the pin did not move past it)
+        bound = state.ace_id == ace_id and state.last_hash == sha256_hex(
+            event_bytes(source["kel"][-1])
+        )
+        provenance = _load_pin(self.store, _kel_provenance_key(ace_id), _valid_provenance)
+        agent = self._fetch(ace_id, relays) if bound else self.agent(ace_id, refresh=True)
+        self._confirm_live(ace_id, provenance)
+        return agent
 
     def reject(self, ace_id: str, note: str = "") -> None:
         """Decline a pending request (a ``rejected`` reply, best effort)."""

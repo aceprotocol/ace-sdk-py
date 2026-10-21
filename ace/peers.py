@@ -163,18 +163,18 @@ class PeerStore:
         kel: list,
         now: int | None = None,
         *,
-        then: Callable[[KelState], None] | None = None,
+        then: Callable[[KelState, str], None] | None = None,
     ) -> tuple[KelState, str]:
         """Adopt or extend the pinned log (fork rules); ``kel_conflict`` on a fork. ``then`` runs
-        with the resulting pin still under the ``peers`` lock, so state derived from it is written
-        atomically with it (raising there leaves the pin as it was)."""
+        with the resulting pin and outcome still under the ``peers`` lock, so state derived from
+        it is written atomically with it (raising there leaves the pin as it was)."""
         t = self._now() if now is None else now
         with self._store.lock("peers"):
             cand = verify_kel(kel, t)
             pinned = self.state(cand.ace_id)
             state, outcome = reconcile_kel(pinned, cand)
             if then is not None:
-                then(state)
+                then(state, outcome)
             if outcome != "unchanged":
                 self._update(state.ace_id, kel=list(state.events))
             return state, outcome
@@ -315,14 +315,15 @@ class PeerStore:
     ) -> tuple[VerifiedAgent | None, VerifiedAgent | None, bool]:
         """``(current, cached, bound)`` from one read: the descriptor to encrypt to (04 § Caching:
         bound to our current pins, unexpired, and the subject usable at ``now``, 01 § Verifier
-        rules 5: never send to an unusable identity), else None; plus ``binding(ace_id)`` for a
-        refresh."""
+        rules 5: never send to an unusable identity), else None; plus, for a refresh, the cached
+        descriptor and whether it is bound to our current pins (``agent``: the subject's KEL and
+        its delegation issuers')."""
         t = self._now() if now is None else now
-        cached, bound = self.binding(ace_id)
-        agent = self._bound_agent(cached, bound)
+        cached, kel_bound = self.binding(ace_id)
+        agent = self._bound_agent(cached, kel_bound)
         # a bound descriptor's state is the pin, so the subject's usability is read off it
         usable = agent is not None and agent.expires_at > t and is_usable(agent.state, t)
-        return (agent if usable else None), cached, bound
+        return (agent if usable else None), cached, agent is not None
 
     # --- admission ---
 

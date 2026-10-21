@@ -7,7 +7,7 @@ import copy
 import re
 
 from ._documents import bad, check_lifetime, verify_claims
-from ._encoding import CAIP10_RE, is_ace_id, loads_json, resolve_now, wire_int
+from ._encoding import is_ace_id, is_caip10_account, loads_json, resolve_now, wire_int
 from .errors import ACEError
 from .identity import ACEIdentity, sign_claims
 from .kel import KelState, reconcile_kel, verify_kel
@@ -87,8 +87,7 @@ def validate_erc8004(entry: object) -> dict:
     if (
         type(entry) is not dict
         or set(entry) != {"agentRegistry", "agentId"}
-        or not isinstance(entry["agentRegistry"], str)
-        or CAIP10_RE.fullmatch(entry["agentRegistry"]) is None
+        or not is_caip10_account(entry["agentRegistry"])
         or not isinstance(entry["agentId"], str)
     ):
         raise bad("erc8004 entry must be {agentRegistry: CAIP-10, agentId}")

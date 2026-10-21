@@ -53,6 +53,11 @@ def is_sha256_hex(value: object) -> bool:
     return isinstance(value, str) and SHA256_HEX_RE.fullmatch(value) is not None
 
 
+def is_caip10_account(value: object) -> bool:
+    """A CAIP-10 account id (``namespace:reference:address``)."""
+    return isinstance(value, str) and CAIP10_RE.fullmatch(value) is not None
+
+
 def is_handle(value: object) -> bool:
     return isinstance(value, str) and HANDLE_RE.fullmatch(value) is not None
 

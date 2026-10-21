@@ -1,10 +1,11 @@
-"""Shared rules for signed JSON documents (descriptor, permit, delegation credential). Internal."""
+"""Shared rules for signed JSON documents (descriptor, card record, permit, delegation credential).
+Internal."""
 
 from __future__ import annotations
 
 from ._encoding import canonical_state_bytes, wire_int
 from .errors import ACEError
-from .kel import KelState, verify_operational_signature
+from .kel import KelState, is_usable, reconcile_kel, verify_kel, verify_operational_signature
 from .limits import TIMESTAMP_WINDOW_SECONDS
 
 
@@ -14,6 +15,16 @@ def bad(message: str) -> ACEError:
 
 def claims(document: dict) -> dict:
     return {k: v for k, v in document.items() if k != "signature"}
+
+
+def check_size(value: object, limit: int, what: str) -> None:
+    """``canonical(value)`` is at most ``limit`` bytes."""
+    try:
+        n = len(canonical_state_bytes(value))
+    except (TypeError, ValueError):
+        raise bad(f"{what} is not JSON") from None
+    if n > limit:
+        raise bad(f"{what} exceeds {limit} bytes")
 
 
 def check_lifetime(document: dict, now: int, maximum: int, *, allow_expired: bool = False) -> None:
@@ -51,3 +62,20 @@ def verify_claims(state: KelState, action: str, document: dict, now: int) -> Non
         if exc.code == "stale_peer_binding":
             raise
         raise bad(f"{action}: {exc.message}") from None
+
+
+def verify_signed(
+    kel: object, document: dict, action: str, now: int, pinned: KelState | None
+) -> KelState:
+    """The KEL usable at ``now`` (``invalid_kel`` / ``invalid_signature``) naming
+    ``document["aceId"]``, reconciled with ``pinned`` when given, and ``document`` signed under it
+    (``verify_claims``). Returns the state it verified under."""
+    state = verify_kel(kel, now)
+    if not is_usable(state, now):
+        raise ACEError("invalid_kel", "identity has no live signing delegation")
+    if state.ace_id != document["aceId"]:
+        raise bad("aceId does not match the kel")
+    if pinned is not None:
+        state, _ = reconcile_kel(pinned, state)
+    verify_claims(state, action, document, now)
+    return state

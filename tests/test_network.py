@@ -9,9 +9,12 @@ from ace import (
     PrekeyVault,
     RelayClient,
     SoftwareIdentity,
+    create_published_agent,
+    issue_delegation,
 )
 
-from .helpers import raises, retained
+from .fake_relay import FakeRelay
+from .helpers import Clock, raises, retained
 
 
 def client(relay, **kw):
@@ -358,3 +361,127 @@ def test_attempt_retries_a_pending_message_now(relay, pair):
     assert bob.attempt("0" * 32) is None and bob.attempt("not-an-id") is None
     bob.outbox.abandon(mid)
     assert bob.attempt(mid).status == "expired" and len(relay.sent) == sent + 1  # final: as is
+
+
+# --- descriptor routes -----------------------------------------------------------------------
+
+
+@pytest.fixture
+def routes():
+    """A home relay and a relay B sharing one settable clock."""
+    clock = Clock()
+    home, relay_b = FakeRelay(clock=clock), FakeRelay(clock=clock)
+    clients: list[NetworkClient] = []
+
+    def rc(url: str) -> RelayClient:
+        return RelayClient(url, allow_loopback=True, clock=clock)
+
+    def peer(*, publish: bool = True) -> NetworkClient:
+        identity = SoftwareIdentity.generate(now=clock.now - 10)
+        c = NetworkClient.open(
+            identity,
+            MemoryStore(),
+            rc(home.url),
+            PrekeyVault(clock=clock),
+            receive=False,
+            relay_factory=rc,
+            clock=clock,
+        )
+        clients.append(c)
+        if publish:
+            c.publish()
+        return c
+
+    yield clock, home, relay_b, rc, peer
+    for c in clients:
+        c.close()
+    home.close()
+    relay_b.close()
+
+
+def _descriptor_gets(relay: FakeRelay, since: int) -> list[str]:
+    return [p for m, p in relay.requests[since:] if p.startswith("/v1/descriptor/")]
+
+
+def test_a_route_replaying_an_older_descriptor_does_not_block_the_next(routes):
+    """Every route is tried: one replaying an older descriptor (``stale_peer_binding``, a
+    permanent code) never blocks a lookup the next route serves."""
+    clock, home, relay_b, rc, peer = routes
+    alice = peer()
+    a = alice.identity.get_ace_id()
+
+    def descriptor(relays: list[str], lifetime: int = 7 * 86400) -> dict:
+        clock.now += 1
+        return create_published_agent(
+            alice.identity,
+            relays=relays,
+            prekey=alice.vault.current(clock.now),
+            profiles=alice.profiles.entries(),
+            now=clock.now,
+            lifetime=lifetime,
+            allow_loopback_relays=True,
+        )
+
+    # Relay B keeps serving an older revision; the home relay serves the newest.
+    old = descriptor([relay_b.url, home.url])
+    rc(relay_b.url).register(alice.identity)
+    rc(relay_b.url).publish(old)
+    held = descriptor([relay_b.url, home.url], lifetime=60)
+    newest = descriptor([home.url])
+    rc(home.url).publish(newest)
+    bob = peer()
+    bob.import_agent(held)
+    clock.now += 120  # the held one expired: refreshed from its routes, relay B first
+    assert bob.lookup(a).source == newest
+    assert _descriptor_gets(relay_b, 0) == [f"/v1/descriptor/{a}"]
+
+
+def test_a_stale_cached_descriptor_is_refreshed_from_its_relays_and_the_home_relay(routes):
+    """A cached descriptor no longer bound to the current pins (here a delegation issuer's pin
+    advanced past the key that signed its entry) is refreshed from its relays and the home
+    relay; a bound one from its relays alone."""
+    clock, home, relay_b, rc, peer = routes
+    alice = peer()
+    a = alice.identity.get_ace_id()
+    dave = SoftwareIdentity.generate(now=clock.now - 10)
+    prekey = alice.vault.current(clock.now)
+
+    def descriptor(relays: list[str], **kw) -> dict:
+        clock.now += 1
+        return create_published_agent(
+            alice.identity,
+            relays=relays,
+            prekey=prekey,
+            profiles=alice.profiles.entries(),
+            now=clock.now,
+            allow_loopback_relays=True,
+            **kw,
+        )
+
+    delegated = descriptor(
+        [relay_b.url], delegations=[issue_delegation(dave, a, now=clock.now + 1)]
+    )
+    bob = peer()
+    bob.peers.pin(dave.get_kel(), clock.now)
+    bob.import_agent(delegated)
+    clock.now += 1
+    dave.delegate(now=clock.now)
+    bob.peers.pin(dave.get_kel(), clock.now)
+    assert bob.peers.current(a) is None  # stale: no longer bound to dave's pin
+    # Relay B, the cached route, does not serve it: the home relay is asked too.
+    current = descriptor([relay_b.url, home.url])
+    rc(home.url).publish(current)
+    assert bob.agent(a).source == current
+    assert _descriptor_gets(relay_b, 0) == [f"/v1/descriptor/{a}"]
+    # Bound now: a refresh asks its relays alone (relay B first, then the home relay it names),
+    # and a bound descriptor naming relay B alone never asks the home relay.
+    only_b = descriptor([relay_b.url])
+    rc(relay_b.url).register(alice.identity)
+    rc(relay_b.url).publish(only_b)
+    assert bob.agent(a, refresh=True).source == only_b
+    home_asked = len(home.requests)
+    assert bob.agent(a, refresh=True).source == only_b
+    relay_b.inject.append((f"/v1/descriptor/{a}", 503, "internal_error", {}))
+    with raises("relay_unavailable"):
+        bob.agent(a, refresh=True)
+    assert _descriptor_gets(home, home_asked) == []

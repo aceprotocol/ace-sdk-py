@@ -329,6 +329,54 @@ def test_kel_live_is_true_with_a_live_descriptor(world):
     assert carol.lookup_card(f"@alice@{world.host}").kel_live is True
 
 
+def test_a_handle_lookup_reuses_the_card_record_it_resolved_through(world):
+    alice = world.agent(contact="open", handle="alice")
+    bob = world.agent()
+    del world.relay.requests[:]
+    agent, card = bob.lookup_with_card(f"@alice@{world.host}")
+    assert agent.ace_id == alice.identity.get_ace_id()
+    assert card.contact == "open" and card.kel_live is True
+    bob.connect(f"@alice@{world.host}", profile=TEXT.id)
+    paths = [p for _, p in world.relay.requests]
+    assert [p for p in paths if p.startswith("/v1/card/")] == []
+    assert len([p for p in paths if p.startswith("/v1/handles/")]) == 2
+    # By ACE ID, the card record is looked up after the descriptor.
+    assert bob.lookup_with_card(alice.identity.get_ace_id())[1].handle == "alice"
+
+
+def test_a_relay_serving_an_unverifiable_document_is_relay_protocol_error(world):
+    # Never a verdict on the peer: a conformant relay refused it on input.
+    alice = world.agent(contact="open", handle="alice")
+    a = alice.identity.get_ace_id()
+    world.relay.cards[a] = with_record(world.relay.cards[a], listed=True)  # signature broken
+    with raises("relay_protocol_error"):
+        world.rc().card(a)
+    with raises("relay_protocol_error"):
+        world.rc().handle("alice")
+
+
+def test_accepting_an_expired_source_pins_its_kel_unconfirmed_until_a_descriptor_confirms(world):
+    alice = world.agent(contact="open")
+    bob = world.agent(publish=False)
+    b = bob.identity.get_ace_id()
+    world.clock.now = bob.publish()["descriptor"]["expiresAt"] - 3601
+    bob.connect(alice.identity.get_ace_id(), profile=TEXT.id)
+    alice.pull()
+    assert [r.from_id for r in alice.requests()] == [b]
+    # Bob goes offline past his descriptor's lifetime: the held request outlives its source.
+    world.clock.now += 7200
+    del world.relay.descriptors[b]
+    with raises("unknown_peer"):
+        alice.accept(b)
+    assert alice.peers.state(b) is not None
+    assert alice.lookup_card(b).kel_live is False
+    # Bob republishes: the next card lookup sees a live descriptor and confirms the pin, durably.
+    bob.publish()
+    assert alice.lookup_card(b).kel_live is True
+    del world.relay.descriptors[b]
+    assert alice.lookup_card(b).kel_live is True
+
+
 def test_unparseable_pin_is_storage_failed(world):
     alice = world.agent(contact="open", handle="alice")
     bob = world.agent()

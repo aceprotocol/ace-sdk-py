@@ -15,7 +15,7 @@ import socket
 import threading
 import time
 import urllib.parse
-from typing import Any, Callable, Iterator, NamedTuple
+from typing import Any, Callable, Iterator, NamedTuple, TypeVar
 
 from . import _net
 from ._encoding import (
@@ -56,6 +56,8 @@ _RETRY_AFTER_RE = re.compile(r"[0-9]+")
 _WAKE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{22,512}")
 
 _sleep = time.sleep  # patched by tests
+
+_Doc = TypeVar("_Doc", VerifiedAgent, VerifiedCard)
 
 
 class RelayEntry(NamedTuple):
@@ -285,17 +287,25 @@ class RelayClient:
             raise _protocol("cursor must be a string or null")
         return c
 
-    def _agent(self, value: object, ace_id: str | None = None) -> VerifiedAgent:
-        _contained(value)
+    def _verified(
+        self, value: object, verify: Callable[..., _Doc], what: str, ace_id: str | None
+    ) -> _Doc:
+        """A relay response verified by ``verify``, of identity ``ace_id`` when given. Any failure
+        is ``relay_protocol_error``: a conformant relay refused the document on input, so serving
+        it is the relay's fault, never a verdict on the peer (a permanent code would let one bad
+        route end a lookup the next route serves)."""
+        _contained(value)  # never a skipped entry
         try:
-            agent = verify_published_agent(
-                value, now=self._now(), allow_loopback_relays=self.allow_loopback
-            )
-        except ACEError as exc:
-            raise _protocol(f"relay served an invalid descriptor: {exc.message}") from None
-        if ace_id is not None and agent.ace_id != ace_id:
-            raise _protocol("descriptor identity mismatch")
-        return agent
+            doc = verify(value, now=self._now(), allow_loopback_relays=self.allow_loopback)
+        except Exception as exc:
+            detail = f": {exc.message}" if isinstance(exc, ACEError) else ""
+            raise _protocol(f"relay served an invalid {what}{detail}") from exc
+        if ace_id is not None and doc.ace_id != ace_id:
+            raise _protocol(f"{what} identity mismatch")
+        return doc
+
+    def _agent(self, value: object, ace_id: str | None = None) -> VerifiedAgent:
+        return self._verified(value, verify_published_agent, "descriptor", ace_id)
 
     # --- identity ---
 
@@ -342,14 +352,7 @@ class RelayClient:
         self._call("POST", "/v1/card", body=bundle)
 
     def _card(self, value: object, ace_id: str | None = None) -> VerifiedCard:
-        _contained(value)
-        try:
-            card = verify_card_bundle(value, self._now(), allow_loopback_relays=self.allow_loopback)
-        except ACEError as exc:
-            raise _protocol(f"relay served an invalid card record: {exc.message}") from None
-        if ace_id is not None and card.ace_id != ace_id:
-            raise _protocol("card record identity mismatch")
-        return card
+        return self._verified(value, verify_card_bundle, "card record", ace_id)
 
     def card(self, ace_id: str) -> VerifiedCard:
         """``GET /v1/card/{aceId}``: anonymous; the stored card record of a registered identity."""

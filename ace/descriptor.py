@@ -13,7 +13,7 @@ import copy
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from ._documents import bad, check_lifetime, verify_claims
+from ._documents import bad, check_lifetime, check_size, verify_signed
 from ._encoding import (
     CONTROL_CHAR_RE,
     canonical_state_bytes,
@@ -29,7 +29,7 @@ from ._relay_url import is_canonical_relay_url
 from .delegation import validate_erc8004, verify_delegation
 from .errors import ACEError
 from .identity import ACEIdentity, sign_claims
-from .kel import KelState, is_usable, reconcile_kel, verify_kel
+from .kel import KelState
 from .limits import (
     DEFAULT_DESCRIPTOR_LIFETIME,
     KEM_PUBLIC_KEY_SIZE,
@@ -233,11 +233,7 @@ def verify_published_agent(
     if type(value) is not dict or set(value) != {"kel", "descriptor"}:
         raise bad("published agent must be {kel, descriptor}")
     check_json_value(value, "invalid_authorization")  # depth counts from the agent's root
-    try:
-        if len(canonical_state_bytes(value)) > MAX_PUBLISHED_AGENT_BYTES:
-            raise bad("published agent exceeds 1048576 bytes")
-    except (TypeError, ValueError):
-        raise bad("published agent is not JSON") from None
+    check_size(value, MAX_PUBLISHED_AGENT_BYTES, "published agent")
     d = value["descriptor"]
     if (
         type(d) is not dict
@@ -267,14 +263,7 @@ def verify_published_agent(
         if len({(x["agentRegistry"], x["agentId"]) for x in e}) != len(e):
             raise bad("duplicate erc8004 entry")
     check_lifetime(d, t, MAX_DESCRIPTOR_LIFETIME)
-    state = verify_kel(value["kel"], t)
-    if not is_usable(state, t):
-        raise ACEError("invalid_kel", "identity has no live signing delegation")
-    if state.ace_id != d["aceId"]:
-        raise bad("aceId does not match the kel")
-    if pinned is not None:
-        state, _ = reconcile_kel(pinned, state)
-    verify_claims(state, "agent-descriptor", d, t)
+    state = verify_signed(value["kel"], d, "agent-descriptor", t, pinned)
     live: list[str] = []
     if "delegations" in d:
         dl = d["delegations"]

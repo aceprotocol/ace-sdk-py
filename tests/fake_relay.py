@@ -358,15 +358,14 @@ class FakeRelay:
             raise _HTTPError(409, "stale_descriptor")
         # Set once per identity at this home; a record naming another home claims nothing here.
         bound = self._handle_of(v.ace_id)
-        if v.home != self.url:
-            pass
-        elif bound is not None:
-            if v.handle != bound:
-                raise _HTTPError(400, "invalid_argument")
-        elif v.handle is not None:
-            if v.handle in self.handles:
-                raise _HTTPError(409, "handle_taken")
-            self.handles[v.handle] = v.ace_id
+        if v.home == self.url:
+            if bound is not None:
+                if v.handle != bound:
+                    raise _HTTPError(400, "invalid_argument")
+            elif v.handle is not None:
+                if v.handle in self.handles:
+                    raise _HTTPError(409, "handle_taken")
+                self.handles[v.handle] = v.ace_id
         self.cards[v.ace_id] = body
         self._reply(h, 200, {"ok": True})
 

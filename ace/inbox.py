@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
 from ._encoding import is_message_id, is_sha256_hex, loads_json, sha256_hex, unix_now, wire_int
+from .card_record import Contact
 from .descriptor import check_stranger_source, verify_published_agent
 from .errors import ACEError, is_outcome_code
 from .identity import ACEIdentity
@@ -166,7 +167,7 @@ class Inbox:
         on_receipt: Callable[[str, dict, Any], None] | None = None,
         rules: list[ProfileRules] | tuple[ProfileRules, ...] = (),
         outbox: Any = None,
-        contact: str | Callable[[], str] = "closed",
+        contact: Contact | Callable[[], Contact] = "closed",
         refresh: Callable[[str], Any] | None = None,
         resolve: Callable[[str], Any] | None = None,
         check_capacity: Callable[[PrivateMessage], None] | None = None,
