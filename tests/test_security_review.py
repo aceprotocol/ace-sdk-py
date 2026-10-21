@@ -42,6 +42,7 @@ from ace._relay_url import is_canonical_relay_url
 from ace._xwing import CIPHERTEXT_SIZE, DecapsulationKey, _combiner, encapsulate
 from ace.kel import reconcile_kel
 from ace.keys import generate_software_key, key_digest
+from ace.limits import MAX_FETCH_ATTEMPTS
 from ace.packet import parse_packet
 from ace.relay import _SSE_FRAME_LIMIT, _SSELines, map_relay_response
 
@@ -124,7 +125,7 @@ def test_a_receipt_beyond_the_replay_horizon_is_dropped():
     assert out.kind == "dropped" and out.error.code == "replay_horizon"
 
 
-# --- C3: a processed packet whose receipt cannot be sent is acked without quarantine ----------
+# --- C3: a delivered packet whose receipt cannot be sent is acked without quarantine ----------
 
 
 def test_receipt_send_exhausting_the_budget_acks_without_quarantine():
@@ -138,6 +139,20 @@ def test_receipt_send_exhausting_the_budget_acks_without_quarantine():
     assert kinds == ["retry", "retry", "duplicate"]
     assert w.inbox.quarantined() == [] and w.b.store.list("inbox/attempts/") == []
     assert len(w.got) == 1
+
+
+def test_rejected_receipt_send_exhausting_the_budget_quarantines():
+    w = World()
+    raw = wire(w.packet(body={"message": 5}))  # invalid_body: rejected, never delivered
+
+    def unreachable(reply):
+        raise ACEError("relay_unavailable", "sender relay unreachable")
+
+    outs = [w.inbox.receive(raw, send_receipt=unreachable) for _ in range(MAX_FETCH_ATTEMPTS)]
+    assert [o.kind for o in outs] == ["retry"] * (MAX_FETCH_ATTEMPTS - 1) + ["quarantined"]
+    assert outs[-1].ack and outs[-1].error.code == "relay_unavailable"
+    assert len(w.inbox.quarantined()) == 1 and w.b.store.list("inbox/attempts/") == []
+    assert w.got == []
 
 
 # --- C4: relay error strings lose control characters ------------------------------------------

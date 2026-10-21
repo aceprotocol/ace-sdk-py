@@ -24,8 +24,8 @@ any) first and acknowledges the relay entry only when ``outcome.ack`` is true. O
 
 Capacity backpressure leaves the packet on the relay. Any other failure is retried; a packet
 fetched ``MAX_FETCH_ATTEMPTS`` times without a final disposition is quarantined and acked. A
-packet already processed whose receipt send exhausts that budget is acked without a quarantine
-record (the sender's retry is a duplicate and gets a receipt).
+packet already delivered whose receipt send exhausts that budget is acked without a quarantine
+record (the sender's retry is a duplicate and gets a receipt); a rejected packet's is quarantined.
 """
 
 from __future__ import annotations
@@ -343,9 +343,11 @@ class Inbox:
                     try:
                         send_receipt(out.receipt)
                     except ACEError as exc:
-                        if exc.is_transient:
+                        # only a delivered message is never quarantined: a rejected
+                        # packet's receipt failures share the budget like any other
+                        if exc.is_transient and out.kind in ("delivered", "duplicate"):
                             processed = out
-                            raise
+                        raise
             except _Retry as r:
                 out = self._failed(fp, raw, r.error)
             except _Drop as d:
@@ -374,8 +376,8 @@ class Inbox:
     ) -> ReceiveOutcome:
         """Count a fetch without a final disposition (persisted, so a restart does not reset
         it); the ``MAX_FETCH_ATTEMPTS``-th quarantines the packet and acks it. ``processed``: the
-        outcome of a packet whose only failure was sending its receipt; its last fetch is acked
-        as that outcome, without a quarantine record."""
+        ``delivered``/``duplicate`` outcome of a packet whose only failure was sending its
+        receipt; its last fetch is acked as that outcome, without a quarantine record."""
         try:
             rec = load_record(self._store, _attempts_key(fp))
             n = (wire_int(rec.get("attempts")) or 0 if rec else 0) + 1
