@@ -507,17 +507,21 @@ class Inbox:
                 raise ACEError("not_permitted", "a stranger may only send a contact request")
             if stranger:
                 check_stranger_source(m.body["source"])
-            self._check_contact(p, m, now)
+            self._check_contact(p, m, now, stranger=stranger)
         except ACEError as exc:
             if exc.category != "permanent":
                 raise
             raise _Drop(exc) from None
         return self._commit(m, now, receipt=False)
 
-    def _check_contact(self, p: Packet, m: PrivateMessage, now: int) -> None:
+    def _check_contact(
+        self, p: Packet, m: PrivateMessage, now: int, *, stranger: bool = False
+    ) -> None:
         """Core contact rules: the note is bounded (checked first, it costs nothing); the source
         authenticates the packet; request/accepted carry a reply permit (rejected none); the
-        profile is installed on both ends with one digest."""
+        profile is installed on both ends with one digest. A peer in the admission table then
+        has its source's KEL pinned (06 § Contact candidates: it extends or recovers the pin); a
+        stranger's never is."""
         if len(m.body["note"].encode("utf-8")) > MAX_NOTE_BYTES:
             raise ACEError("invalid_body", "contact note exceeds 512 bytes")
         agent = verify_published_agent(
@@ -543,6 +547,8 @@ class Inbox:
             raise ACEError(
                 "unsupported_schema", "contact profile is not shared with an equal digest"
             )
+        if not stranger:
+            self._peers.pin(m.body["source"]["kel"], now)
 
     def _apply_receipt(self, m: PrivateMessage, state: KelState, now: int) -> ReceiveOutcome:
         """Core receipt rules: ``code`` exactly when rejected (outcome-code grammar); a renewal

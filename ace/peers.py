@@ -34,9 +34,9 @@ class PeerRecord:
     issued_permit: dict | None  # {expiresAt, seq} of the newest permit we sent the peer
     profile: str | None
     updated_at: int | None = None  # when ``status`` was last set (a pending entry's TTL)
-    # Whether a live descriptor vouched for the pinned KEL: False once a KEL alone (a card
-    # bundle's, a held request's source) pinned or advanced it, until a descriptor is adopted
-    # under it (04 § Card record).
+    # Whether a live descriptor served by a relay vouched for the pinned KEL: False once anything
+    # else (a card bundle's KEL, an imported or contact source, which a holder of a superseded key
+    # can sign) pinned or advanced it, until a relay's descriptor confirms it (04 § Card record).
     kel_live: bool = True
 
     def to_dict(self) -> dict[str, Any]:
@@ -198,11 +198,14 @@ class PeerStore:
                     pins[who] = st
         return pins
 
-    def adopt(self, agent: VerifiedAgent | dict, now: int | None = None) -> VerifiedAgent:
-        """Pin the agent's KEL (fork rules; ``kel_live`` when the pin is the descriptor's own KEL:
-        the descriptor is live) and its descriptor. The descriptor must verify under the
-        KEL state that ends up pinned (a descriptor carrying an older prefix of the pin and signed
-        by a superseded delegation is ``stale_peer_binding``). It replaces the pinned one only
+    def adopt(
+        self, agent: VerifiedAgent | dict, now: int | None = None, *, live: bool = False
+    ) -> VerifiedAgent:
+        """Pin the agent's KEL (fork rules) and its descriptor. ``live``: a relay served it
+        (``kel_live`` when the pin is its own KEL); otherwise a pin it moves is not ``kel_live``.
+        The descriptor must verify under the KEL state that ends up pinned (a descriptor carrying
+        an older prefix of the pin and signed by a superseded delegation is
+        ``stale_peer_binding``). It replaces the pinned one only
         when its ``issuedAt`` is newer (or equal with identical claims); an older one is ignored
         and the pinned agent returned, unless the subject's KEL state moved on since the cached one
         was verified: then it is replaced unconditionally (a descriptor signed by a superseded key
@@ -228,11 +231,11 @@ class PeerStore:
             )
             state = verified.state
             kel = list(state.events)
-            # A live descriptor vouches only for its own KEL, not for a pin that has moved past it
-            # (that pin is left as it was, and so is its flag).
-            kel_live = state.last_hash == sha256_hex(event_bytes(source["kel"][-1])) or (
-                rec is not None and rec.kel_live
-            )
+            # A relay's descriptor vouches only for its own KEL, not for a pin that has moved past
+            # it; an unchanged pin keeps its flag.
+            own = state.last_hash == sha256_hex(event_bytes(source["kel"][-1]))
+            unchanged = pinned is not None and pinned.last_hash == state.last_hash
+            kel_live = (live and own) or (unchanged and rec.kel_live)
             old = None if rec is None else rec.agent
             if (
                 old is not None

@@ -549,7 +549,10 @@ class NetworkClient:
     def _fetch(self, ace_id: str, urls: list[str]) -> VerifiedAgent:
         """Fetch and pin the peer's descriptor from the first of ``urls`` that serves it."""
         return _first_served(
-            urls, lambda url: self.peers.adopt(self._relay_for(url).descriptor(ace_id), self._now())
+            urls,
+            lambda url: self.peers.adopt(
+                self._relay_for(url).descriptor(ace_id), self._now(), live=True
+            ),
         )
 
     def _target(self, target: str | dict | VerifiedAgent) -> VerifiedAgent:

@@ -405,3 +405,21 @@ def test_a_cached_descriptor_never_reports_an_expired_delegation():
     clock.now = NOW + 55  # the credential expired; the descriptor has not
     cached = viewer.peers.agent(alice.id)
     assert cached is not None and cached.delegations == () and cached.source == src
+
+
+def test_an_admitted_peers_contact_source_extends_the_pin_but_does_not_confirm_it_live():
+    w = World()
+    w.a.identity.delegate(now=w.clock.now)  # signed under a newer delegation than b's pin
+    body = {
+        "kind": "request",
+        "profile": "ace:text:1",
+        "note": "",
+        "source": w.a.source(profiles=[TEXT.descriptor()]),
+        "permit": create_permit(w.a.identity, w.b.id, now=w.clock.now),
+    }
+    # The refresh does not reach the packet's delegation: the contact authenticates by its source.
+    out = w.inbox.receive(wire(w.packet("ace:contact:1", body, CONTACT_DIGEST)))
+    assert out.kind == "delivered" and w.refreshes == [w.a.id]
+    assert list(w.b.peers.state(w.a.id).events) == w.a.identity.get_kel()
+    # Self-signed by the sender: a holder of a superseded key could sign one too.
+    assert w.b.peers.kel_live(w.a.id) is False
