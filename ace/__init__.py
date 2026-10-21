@@ -86,7 +86,7 @@ from .replay import ReplayDetector
 from .rules import MessageEvent, ProfileRules
 from .store import ACEStore, FileStore, MemoryStore
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "ACEError",
