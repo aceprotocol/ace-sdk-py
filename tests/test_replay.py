@@ -2,7 +2,7 @@
 
 import json
 
-from ace import ReplayDetector
+from ace import OFFLINE_WINDOW_SECONDS, ReplayDetector
 from ace._encoding import canonical_state_bytes
 
 from .helpers import raises
@@ -15,11 +15,16 @@ def mid(i):
 
 
 def test_defaults_use_clock():
-    det = ReplayDetector(clock=lambda: 10_000)
-    assert det.horizon == 9_700
-    assert det.accepts(mid(1), A, 9_701) and not det.accepts(mid(1), A, 9_700)
-    assert det.commit(mid(1), A, 9_800)  # floor defaults to now - 300
-    assert det.export_state()["entries"] == [[mid(1), A, 9_800]]
+    # 06 § Deduplication: H starts at F - 1 and the floor is F, F = now - 2 * OFFLINE
+    now = 10_000_000
+    f = now - 2 * OFFLINE_WINDOW_SECONDS
+    det = ReplayDetector(clock=lambda: now)
+    assert det.horizon == f - 1
+    assert det.accepts(mid(1), A, f) and not det.accepts(mid(1), A, f - 1)
+    assert det.commit(mid(1), A, f)  # kept: not below the default floor F
+    assert det.commit(mid(2), A, now)
+    assert det.export_state()["entries"] == [[mid(1), A, f], [mid(2), A, now]]
+    assert ReplayDetector(clock=lambda: 10_000).horizon == 0
 
 
 def test_argument_validation():

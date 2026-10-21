@@ -8,7 +8,7 @@ from typing import Any, Callable, TypedDict
 
 from ._encoding import check_wire_int, is_message_id, unix_now, wire_int
 from .errors import ACEError
-from .limits import DEFAULT_REPLAY_CAPACITY, TIMESTAMP_WINDOW_SECONDS
+from .limits import DEFAULT_REPLAY_CAPACITY, OFFLINE_WINDOW_SECONDS
 
 
 class ReplayState(TypedDict):
@@ -18,6 +18,11 @@ class ReplayState(TypedDict):
     horizon: int
     senderHorizons: dict[str, int]
     version: int
+
+
+def _floor(now: int) -> int:
+    """The retention floor ``F = max(0, now - 2 * OFFLINE_WINDOW_SECONDS)``."""
+    return max(0, now - 2 * OFFLINE_WINDOW_SECONDS)
 
 
 class ReplayDetector:
@@ -32,6 +37,9 @@ class ReplayDetector:
     3. over capacity, the global smallest is removed and raises its sender's ``SH``;
     4. sender horizons covered by ``H`` are dropped; more than ``capacity`` of them
        fold the lowest into ``H``.
+
+    ``horizon`` defaults to ``F - 1`` and ``commit``'s ``floor`` to ``F``, with
+    ``F = now - 2 * OFFLINE_WINDOW_SECONDS`` (06 § Deduplication).
 
     Persist with ``export_state()`` / ``ReplayDetector.from_state()``.
     """
@@ -49,7 +57,7 @@ class ReplayDetector:
         self._quota = max(1, capacity // 16)
         self._clock = clock
         self._horizon = (
-            max(0, unix_now(clock) - TIMESTAMP_WINDOW_SECONDS)
+            max(0, _floor(unix_now(clock)) - 1)
             if horizon is None
             else check_wire_int(horizon, "horizon")
         )
@@ -92,11 +100,7 @@ class ReplayDetector:
     ) -> bool:
         """Record a verified message. False if it is a duplicate or covered by a horizon."""
         self._check_args(message_id, sender, timestamp)
-        floor = (
-            max(0, unix_now(self._clock) - TIMESTAMP_WINDOW_SECONDS)
-            if floor is None
-            else check_wire_int(floor, "floor")
-        )
+        floor = _floor(unix_now(self._clock)) if floor is None else check_wire_int(floor, "floor")
         with self._lock:
             if not self._accepts(message_id, sender, timestamp):
                 return False

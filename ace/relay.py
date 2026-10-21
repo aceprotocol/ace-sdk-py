@@ -53,6 +53,9 @@ _MAX_CONNECT_FAILURES = 10
 _MAX_BACKOFF_SECONDS = 30
 _REGISTER_STATUSES = ("registered", "idempotent", "refreshed", "rotated")
 _RETRY_AFTER_RE = re.compile(r"[0-9]+")
+_RETRY_AFTER_MAX = 9_999_999_999  # ten digits; every use caps the delay far below
+_CONTROLS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_EOL_RE = re.compile(rb"[\r\n]")
 _WAKE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{22,512}")
 
 _sleep = time.sleep  # patched by tests
@@ -102,9 +105,12 @@ def _raw_json(value: object) -> bytes:
 
 
 def _retry_after(value: str | None) -> int | None:
+    """Delay-seconds (07 § Client rules); more than ten significant digits clamp to
+    ``_RETRY_AFTER_MAX`` (never an unbounded integer parse)."""
     if value is None or _RETRY_AFTER_RE.fullmatch(value) is None:
         return None
-    return int(value)
+    digits = value.lstrip("0") or "0"
+    return int(digits) if len(digits) <= 10 else _RETRY_AFTER_MAX
 
 
 def map_relay_response(status: int, body: bytes, retry_after: str | None) -> ACEError:
@@ -112,10 +118,11 @@ def map_relay_response(status: int, body: bytes, retry_after: str | None) -> ACE
     relay_code = message = None
     try:
         obj = _loads(body, "error body") if body else None
+        # relay text enters our error (and the host's logs) without control characters
         if isinstance(obj, dict) and isinstance(obj.get("error"), str):
-            relay_code = obj["error"][:64]
+            relay_code = _CONTROLS_RE.sub("", obj["error"])[:64]
             if isinstance(obj.get("message"), str):
-                message = obj["message"][:500]
+                message = _CONTROLS_RE.sub("", obj["message"])[:500]
     except ACEError:
         pass
     text = (
@@ -230,7 +237,7 @@ class RelayClient:
             conn.request(method, self._target(path, query), body=body, headers=hdrs)
             resp = conn.getresponse()
             return resp.status, resp.read(self._max_bytes + 1), resp.getheader("Retry-After")
-        except (OSError, http.client.HTTPException) as exc:
+        except (OSError, http.client.HTTPException, ValueError, UnicodeError) as exc:
             raise ACEError(
                 "relay_unavailable", f"relay request failed: {type(exc).__name__}: {exc}"
             ) from None
@@ -599,7 +606,7 @@ class RelayClient:
                     )
                     sock = conn.sock
                     resp = conn.getresponse()
-                except (OSError, http.client.HTTPException) as exc:
+                except (OSError, http.client.HTTPException, ValueError, UnicodeError) as exc:
                     raise ACEError("relay_unavailable", f"listen connect failed: {exc}") from None
                 if resp.status == 200:
                     break
@@ -685,11 +692,14 @@ class RelayClient:
 
 
 class _SSELines:
-    """Split an SSE byte stream into lines ending in CR, LF or CRLF."""
+    """Split an SSE byte stream into lines ending in CR, LF or CRLF. Linear in the stream: each
+    byte is scanned once (``_scan``) and consumed lines are dropped only before the next read."""
 
     def __init__(self, resp: http.client.HTTPResponse) -> None:
         self._resp = resp
-        self._buf = b""
+        self._buf = bytearray()
+        self._pos = 0  # start of the current line
+        self._scan = 0  # bytes before this hold no line ending of the current line
         self._skip_lf = False
 
     def _fill(self) -> bool:
@@ -699,28 +709,31 @@ class _SSELines:
             raise ACEError("relay_unavailable", f"listen stream dropped: {exc}") from None
         if not chunk:
             return False
+        del self._buf[: self._pos]
+        self._scan -= self._pos
+        self._pos = 0
         self._buf += chunk
         return True
 
     def next_line(self) -> bytes | None:
         while True:
-            if self._skip_lf and self._buf:
-                if self._buf.startswith(b"\n"):
-                    self._buf = self._buf[1:]
+            if self._skip_lf and self._pos < len(self._buf):
+                if self._buf[self._pos] == 0x0A:
+                    self._pos = self._scan = self._pos + 1
                 self._skip_lf = False
-            cr, lf = self._buf.find(b"\r"), self._buf.find(b"\n")
-            ends = [i for i in (cr, lf) if i >= 0]
-            if ends:
-                i = min(ends)
-                line, self._buf = self._buf[:i], self._buf[i + 1 :]
-                if i == cr:
-                    self._skip_lf = True
+            m = _EOL_RE.search(self._buf, self._scan)
+            if m is not None:
+                i = m.start()
+                line = bytes(self._buf[self._pos : i])
+                self._skip_lf = self._buf[i] == 0x0D
+                self._pos = self._scan = i + 1
                 if len(line) > _SSE_FRAME_LIMIT:
                     raise _protocol("SSE frame exceeds the size limit")
                 return line
-            if len(self._buf) > _SSE_FRAME_LIMIT:
+            self._scan = len(self._buf)
+            if self._scan - self._pos > _SSE_FRAME_LIMIT:
                 raise _protocol("SSE frame exceeds the size limit")
             if not self._fill():
-                if self._buf:
+                if self._pos < len(self._buf):
                     raise ACEError("relay_unavailable", "listen stream ended mid-line")
                 return None

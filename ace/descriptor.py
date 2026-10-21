@@ -23,12 +23,13 @@ from ._encoding import (
     is_namespaced_id,
     is_sha256_hex,
     resolve_now,
+    wire_int,
 )
 from ._relay_url import is_canonical_relay_url
-from .delegation import validate_erc8004, verify_delegation
+from .delegation import CREDENTIAL_KEYS, validate_erc8004, verify_delegation
 from .errors import ACEError
 from .identity import ACEIdentity, sign_claims
-from .kel import KelState
+from .kel import KelState, check_signature_shape, tail_time
 from .limits import (
     DEFAULT_DESCRIPTOR_LIFETIME,
     KEM_PUBLIC_KEY_SIZE,
@@ -186,6 +187,30 @@ def _check_prekey(prekey: object) -> Prekey:
     return Prekey(prekey["id"], pk)
 
 
+def _is_delegation_shape(entry: object) -> bool:
+    """A delegation entry's closed shape, part of the descriptor's (04 § Verification step 1):
+    ``{kel, credential: {issuer: ACE ID, subject: string, issuedAt, expiresAt: wire integers,
+    signature: operational signature shape}}``. ``kel`` is step 2's (``invalid_kel``); the entry's
+    rules (04 § Delegations) are step 4's."""
+    if type(entry) is not dict or set(entry) != {"kel", "credential"}:
+        return False
+    c = entry["credential"]
+    if (
+        type(c) is not dict
+        or set(c) != CREDENTIAL_KEYS
+        or not is_ace_id(c["issuer"])
+        or not isinstance(c["subject"], str)
+        or wire_int(c["issuedAt"]) is None
+        or wire_int(c["expiresAt"]) is None
+    ):
+        return False
+    try:
+        check_signature_shape(c["signature"], "invalid_authorization")
+    except ACEError:
+        return False
+    return True
+
+
 def check_stranger_source(value: object) -> None:
     """The bounds on a stranger's contact ``source`` (05 § Receiver admission), checked before
     any signature: its KEL and each delegation entry's KEL hold at most
@@ -256,26 +281,23 @@ def verify_published_agent(
             validate_erc8004(entry)
         if len({(x["agentRegistry"], x["agentId"]) for x in e}) != len(e):
             raise bad("duplicate erc8004 entry")
+    dl = d.get("delegations", [])
+    if "delegations" in d:  # shape before any KEL or signature work (04 § Verification)
+        if not isinstance(dl, list) or not 1 <= len(dl) <= MAX_DESCRIPTOR_DELEGATIONS:
+            raise bad("delegations must hold 1-4 entries")
+        if not all(_is_delegation_shape(e) for e in dl):
+            raise bad("delegations must be {kel, credential} entries")
+        if len({str(e["credential"]["issuer"]) for e in dl}) != len(dl):
+            raise bad("delegation issuers must be distinct")
     check_lifetime(d, t, MAX_DESCRIPTOR_LIFETIME)
     state = verify_signed(value["kel"], d, "agent-descriptor", t, pinned)
     live: list[str] = []
-    if "delegations" in d:
-        dl = d["delegations"]
-        if not isinstance(dl, list) or not 1 <= len(dl) <= MAX_DESCRIPTOR_DELEGATIONS:
-            raise bad("delegations must hold 1-4 entries")
-        issuers = [
-            e.get("credential", {}).get("issuer")
-            if type(e) is dict and type(e.get("credential")) is dict
-            else None
-            for e in dl
-        ]
-        if len(set(map(str, issuers))) != len(issuers):
-            raise bad("delegation issuers must be distinct")
-        for entry, who in zip(dl, issuers):
-            pin = delegation_pins.get(who) if delegation_pins and isinstance(who, str) else None
-            issuer, ok = verify_delegation(entry, d["aceId"], now=t, pinned=pin)
-            if ok:
-                live.append(issuer.ace_id)
+    for entry in dl:
+        who = entry["credential"]["issuer"]
+        pin = delegation_pins.get(who) if delegation_pins and isinstance(who, str) else None
+        issuer, ok = verify_delegation(entry, d["aceId"], now=t, pinned=pin)
+        if ok:
+            live.append(issuer.ace_id)
     return VerifiedAgent(d["aceId"], state, copy.deepcopy(value), prekey, tuple(live))
 
 
@@ -292,16 +314,19 @@ def create_published_agent(
     lifetime: int = DEFAULT_DESCRIPTOR_LIFETIME,
     allow_loopback_relays: bool = False,
 ) -> dict:
-    """Build and sign a PublishedAgent (verified before it is returned)."""
+    """Build and sign a PublishedAgent (verified before it is returned), issued at
+    ``max(now, ts of the KEL's last event)``: never before its signing delegation."""
     t = resolve_now(now)
     if type(lifetime) is not int or not 0 < lifetime <= MAX_DESCRIPTOR_LIFETIME:
         raise ACEError("invalid_argument", f"lifetime must be in (0, {MAX_DESCRIPTOR_LIFETIME}]")
     if not isinstance(prekey, Prekey):
         raise ACEError("invalid_argument", "prekey must be a Prekey")
+    kel = identity.get_kel()
+    issued = tail_time(kel, t)
     claims: dict = {
         "aceId": identity.get_ace_id(),
-        "issuedAt": t,
-        "expiresAt": t + lifetime,
+        "issuedAt": issued,
+        "expiresAt": issued + lifetime,
         "relays": list(relays),
         "prekey": prekey.to_dict(),
         "profiles": copy.deepcopy(profiles or []),
@@ -312,9 +337,6 @@ def create_published_agent(
         claims["delegations"] = copy.deepcopy(delegations)
     if erc8004:
         claims["erc8004"] = copy.deepcopy(erc8004)
-    source = {
-        "kel": identity.get_kel(),
-        "descriptor": sign_claims(identity, "agent-descriptor", claims),
-    }
+    source = {"kel": kel, "descriptor": sign_claims(identity, "agent-descriptor", claims)}
     verify_published_agent(source, now=t, allow_loopback_relays=allow_loopback_relays)
     return source

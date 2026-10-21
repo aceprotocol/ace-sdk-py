@@ -404,7 +404,10 @@ class NetworkClient:
         # The descriptor first: it pins or advances the KEL (live), so the card verifies under
         # the current KEL.
         agent = self._fetch(card.ace_id, [relay.base_url])
-        return agent, self._check_card(card.bundle, (relay.base_url, handle))
+        # as lookup_card: the pin's own kel_live (a served descriptor that did not move the pin
+        # to its KEL confirms nothing)
+        kel_live = self.peers.kel_live(card.ace_id)
+        return agent, self._check_card(card.bundle, (relay.base_url, handle), kel_live=kel_live)
 
     def lookup_card(self, target: str) -> VerifiedCard:
         """The verified card record of ``target`` (an ACE ID or ``@name@relay-host``). A handle

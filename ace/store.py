@@ -8,6 +8,7 @@ import json
 import os
 import re
 import stat
+import sys
 import threading
 import time
 from typing import Any, Callable, ContextManager, Protocol, runtime_checkable
@@ -22,10 +23,22 @@ MAX_VALUE_BYTES = 64 * 1024 * 1024
 _POLL_SECONDS = 0.05
 
 
+def fsync(fd: int) -> None:
+    """``fsync``; on macOS ``F_FULLFSYNC``, since its ``fsync`` does not flush the drive cache
+    (``fsync`` when the filesystem does not support it)."""
+    if sys.platform == "darwin" and hasattr(fcntl, "F_FULLFSYNC"):
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+            return
+        except OSError:
+            pass
+    os.fsync(fd)
+
+
 def fsync_dir(path: str) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
-        os.fsync(fd)
+        fsync(fd)
     finally:
         os.close(fd)
 
@@ -43,7 +56,7 @@ def write_file_atomic(path: str, data: bytes, tmp_name: str) -> None:
             view = memoryview(data)
             while view:
                 view = view[os.write(fd, view) :]
-            os.fsync(fd)
+            fsync(fd)
         finally:
             os.close(fd)
         os.rename(tmp, path)
@@ -64,7 +77,8 @@ class ACEStore(Protocol):
     - ``read`` returns ``None`` for a missing key.
     - ``write`` atomically replaces the value and is durable when it returns.
     - ``delete`` of a missing key is not an error.
-    - ``list(prefix)`` returns the keys starting with ``prefix``, sorted ascending.
+    - ``list(prefix)`` returns the keys starting with ``prefix``, sorted ascending; ``prefix``
+      is empty, a key, or a key followed by ``/`` (else ``invalid_argument``).
     - ``lock(name, timeout)`` returns a context manager holding an exclusive,
       non-reentrant lock from ``__enter__`` (or earlier) until ``__exit__``. A timeout is
       ``lock_busy``.
@@ -85,6 +99,15 @@ def check_key(key: object) -> str:
     if not isinstance(key, str) or len(key) > MAX_KEY_LENGTH or KEY_RE.fullmatch(key) is None:
         raise ACEError("invalid_argument", f"invalid store key {str(key)[:64]!r}")
     return key
+
+
+def check_prefix(prefix: object) -> str:
+    """A ``list`` prefix: empty, a key, or a key followed by ``/``."""
+    if not isinstance(prefix, str):
+        raise ACEError("invalid_argument", "prefix must be a string")
+    if prefix:
+        check_key(prefix[:-1] if prefix.endswith("/") else prefix)
+    return prefix
 
 
 def check_lock_name(name: object) -> str:
@@ -169,8 +192,7 @@ class MemoryStore:
             self._data.pop(key, None)
 
     def list(self, prefix: str) -> list[str]:
-        if not isinstance(prefix, str):
-            raise ACEError("invalid_argument", "prefix must be a string")
+        check_prefix(prefix)
         with self._mutex:
             return sorted(k for k in self._data if k.startswith(prefix))
 
@@ -359,8 +381,7 @@ class FileStore:
             raise _io_error(f"delete {key}", exc) from None
 
     def list(self, prefix: str) -> list[str]:
-        if not isinstance(prefix, str):
-            raise ACEError("invalid_argument", "prefix must be a string")
+        check_prefix(prefix)
         base_parts = prefix.split("/")[:-1]
         out: list[str] = []
         try:

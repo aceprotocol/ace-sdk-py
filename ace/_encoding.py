@@ -26,6 +26,7 @@ NAMESPACED_ID_RE = re.compile(r"[a-z][a-z0-9+.-]*:[A-Za-z0-9._~:/?#\[\]@!$&'()*+
 CAIP10_RE = re.compile(r"[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}:[-.%a-zA-Z0-9]{1,128}")
 CAIP19_RE = re.compile(r"[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}/[-a-z0-9]{3,8}:[-.%a-zA-Z0-9]{1,128}")
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
 _TIMESTAMP_RE = re.compile(r"0|[1-9][0-9]{0,15}")
 _STREAM_ID_RE = re.compile(r"[0-9]{1,20}-[0-9]{1,20}")
 _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -213,11 +214,16 @@ def decode_fixed_b64(text: object, size: int, code: ACEErrorCode, what: str) -> 
 def check_json_value(
     value: object, code: ACEErrorCode = "invalid_body", max_depth: int = MAX_JSON_DEPTH
 ) -> None:
-    """Plain JSON types only, finite numbers, depth <= ``max_depth``."""
+    """Plain JSON types only, finite numbers, depth <= ``max_depth``, no unpaired surrogate in a
+    key or string (02 § Canonical JSON: it would only fail later, natively, when encoded)."""
     stack: list[tuple[object, int]] = [(value, 0)]
     while stack:
         v, depth = stack.pop()
-        if v is None or isinstance(v, (bool, str)):
+        if isinstance(v, str):
+            if _SURROGATE_RE.search(v) is not None:
+                raise ACEError(code, "JSON string contains an unpaired surrogate")
+            continue
+        if v is None or isinstance(v, bool):
             continue
         if isinstance(v, int):
             try:
@@ -236,6 +242,8 @@ def check_json_value(
                 for k, child in v.items():  # type: ignore[union-attr]
                     if not isinstance(k, str):
                         raise ACEError(code, "JSON object keys must be strings")
+                    if _SURROGATE_RE.search(k) is not None:
+                        raise ACEError(code, "JSON object key contains an unpaired surrogate")
                     stack.append((child, depth + 1))
             else:
                 stack.extend((child, depth + 1) for child in v)  # type: ignore[union-attr]
@@ -247,11 +255,19 @@ def _reject_constant(name: str) -> Any:
     raise ValueError(f"non-finite number literal {name}")
 
 
+def _unique_object(pairs: list[tuple[str, Any]]) -> dict:
+    obj = dict(pairs)
+    if len(obj) != len(pairs):
+        raise ValueError("duplicate object key")
+    return obj
+
+
 def loads_json(raw: bytes | str) -> object:
-    """Strict JSON from wire bytes: fatal UTF-8, no NaN/Infinity; ``ValueError`` otherwise."""
+    """Strict JSON from wire bytes: fatal UTF-8, no NaN/Infinity, no duplicate object key (02 §
+    JSON values: this parser can detect them); ``ValueError`` otherwise."""
     try:
         text = raw if isinstance(raw, str) else bytes(raw).decode("utf-8")
-        value = json.loads(text, parse_constant=_reject_constant)
+        value = json.loads(text, parse_constant=_reject_constant, object_pairs_hook=_unique_object)
     except RecursionError:
         raise ValueError("JSON nesting too deep") from None
     except UnicodeDecodeError as exc:

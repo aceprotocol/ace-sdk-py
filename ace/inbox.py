@@ -8,20 +8,24 @@ any) first and acknowledges the relay entry only when ``outcome.ack`` is true. O
     pin write unless our card record is ``contact: open``, then they continue only as contact
     candidates
  3. sender KEL pin (refreshed at most once per sender per ``PIN_REFRESH_INTERVAL_SECONDS`` when
-    the packet names a newer delegation; otherwise the packet continues as a contact candidate)
+    the packet names a newer delegation, a transiently failed refresh included; otherwise the
+    packet continues as a contact candidate)
  4. operational signature (delegation ``seq``, signed while live, signer usable now)
  5. time window ``now - OFFLINE <= ts <= now + 300``
  6. prekey decryption (``rejected:unknown_prekey``)
  7. ``(type, schemaDigest)`` must be installed (``rejected:unsupported_schema``)
  8. body schema (``rejected:invalid_body``)
- 9. dedupe by ``(from, messageId)``: a duplicate is receipted ``delivered``; a packet beyond the
-    replay horizon is dropped (``replay_horizon``) and never receipted
+ 9. dedupe by ``(from, messageId)``, receipts and contacts too: a duplicate is receipted
+    ``delivered`` (receipts and contacts never are); a packet beyond the replay horizon is
+    dropped (``replay_horizon``) and never receipted
 10. busy thread, profile rules ``check``, then the delivery record, the rules' ``commit`` and the
-    seen entry in one transaction
+    seen entry in one transaction; a known peer's contact ``source`` moves its pin only here
 11. receipt, then relay ack
 
 Capacity backpressure leaves the packet on the relay. Any other failure is retried; a packet
-fetched ``MAX_FETCH_ATTEMPTS`` times without a final disposition is quarantined and acked.
+fetched ``MAX_FETCH_ATTEMPTS`` times without a final disposition is quarantined and acked. A
+packet already processed whose receipt send exhausts that budget is acked without a quarantine
+record (the sender's retry is a duplicate and gets a receipt).
 """
 
 from __future__ import annotations
@@ -332,6 +336,7 @@ class Inbox:
             if self._closed:
                 raise ACEError("invalid_argument", "the inbox is closed")
             fp = sha256_hex(raw)
+            processed = None
             try:
                 out = self._receive(raw)
                 if out.receipt is not None and send_receipt is not None:
@@ -339,6 +344,7 @@ class Inbox:
                         send_receipt(out.receipt)
                     except ACEError as exc:
                         if exc.is_transient:
+                            processed = out
                             raise
             except _Retry as r:
                 out = self._failed(fp, raw, r.error)
@@ -347,7 +353,7 @@ class Inbox:
             except ACEError as exc:
                 if exc.code == "receiver_capacity":
                     return ReceiveOutcome("retry", False, error=exc)
-                out = self._failed(fp, raw, exc)
+                out = self._failed(fp, raw, exc, processed)
             except Exception as exc:  # a host hook or bug: never retry a poison packet forever
                 out = self._failed(
                     fp, raw, ACEError("storage_failed", f"{type(exc).__name__}: {exc}")
@@ -363,9 +369,13 @@ class Inbox:
 
     # --- failure accounting ---------------------------------------------------------
 
-    def _failed(self, fp: str, raw: bytes, err: ACEError) -> ReceiveOutcome:
+    def _failed(
+        self, fp: str, raw: bytes, err: ACEError, processed: ReceiveOutcome | None = None
+    ) -> ReceiveOutcome:
         """Count a fetch without a final disposition (persisted, so a restart does not reset
-        it); the ``MAX_FETCH_ATTEMPTS``-th quarantines the packet and acks it."""
+        it); the ``MAX_FETCH_ATTEMPTS``-th quarantines the packet and acks it. ``processed``: the
+        outcome of a packet whose only failure was sending its receipt; its last fetch is acked
+        as that outcome, without a quarantine record."""
         try:
             rec = load_record(self._store, _attempts_key(fp))
             n = (wire_int(rec.get("attempts")) or 0 if rec else 0) + 1
@@ -373,6 +383,8 @@ class Inbox:
             if n < MAX_FETCH_ATTEMPTS:
                 write_record(self._store, _attempts_key(fp), {"attempts": n, "at": at})
                 return ReceiveOutcome("retry", False, error=err)
+            if processed is not None:
+                return processed
             self._quarantine(fp, raw, err)
             self._store.delete(_attempts_key(fp))
         except ACEError as store_exc:
@@ -466,12 +478,14 @@ class Inbox:
                 self._check_contact(p, m, now)
             except ACEError as exc:
                 raise _Drop(exc) from None
-            return self._commit(m, now, receipt=False)
+            return self._commit(m, now, receipt=False, pin=m.body["source"]["kel"])
         return self._commit(m, now, receipt=True)
 
     def _sender_state(self, p: Packet, state: KelState, now: int) -> KelState | None:
         """Step 3: the pinned KEL; one refresh per sender per ``PIN_REFRESH_INTERVAL_SECONDS``
-        when the packet names a newer delegation. Suppressed or transient refresh: retry. When
+        when the packet names a newer delegation, whatever its result (a transient failure does
+        not open the next one early: a forged packet must not drive a refresh per fetch).
+        Suppressed or transient refresh: retry. When
         no refresh is wired, the refresh fails permanently or it still does not reach the
         packet's delegation, ``None``: the packet continues only as a contact candidate
         authenticated by its ``source`` against the pin (e.g. a peer after a signing-key change
@@ -490,7 +504,6 @@ class Inbox:
             self._refresh(p.from_id)
         except ACEError as exc:
             if exc.is_transient:
-                self._refreshed.pop(p.from_id, None)
                 raise _Retry(exc) from None
             return None
         fresh = self._peers.state(p.from_id) or state
@@ -519,21 +532,19 @@ class Inbox:
                 raise ACEError("not_permitted", "a stranger may only send a contact request")
             if stranger:
                 check_stranger_source(m.body["source"])
-            self._check_contact(p, m, now, stranger=stranger)
+            self._check_contact(p, m, now)
         except ACEError as exc:
             if exc.category != "permanent":
                 raise
             raise _Drop(exc) from None
-        return self._commit(m, now, receipt=False)
+        pin = None if stranger else m.body["source"]["kel"]
+        return self._commit(m, now, receipt=False, pin=pin)
 
-    def _check_contact(
-        self, p: Packet, m: PrivateMessage, now: int, *, stranger: bool = False
-    ) -> None:
+    def _check_contact(self, p: Packet, m: PrivateMessage, now: int) -> None:
         """Core contact rules: the note is bounded (checked first, it costs nothing); the source
         authenticates the packet; request/accepted carry a reply permit (rejected none); the
-        profile is installed on both ends with one digest. A peer in the admission table then
-        has its source's KEL pinned (06 § Contact candidates: it extends or recovers the pin); a
-        stranger's never is."""
+        profile is installed on both ends with one digest. Nothing is pinned here: ``_commit``
+        pins a known peer's source KEL after dedupe and the rules (06 § Contact candidates)."""
         if len(m.body["note"].encode("utf-8")) > MAX_NOTE_BYTES:
             raise ACEError("invalid_body", "contact note exceeds 512 bytes")
         agent = verify_published_agent(
@@ -559,12 +570,16 @@ class Inbox:
             raise ACEError(
                 "unsupported_schema", "contact profile is not shared with an equal digest"
             )
-        if not stranger:
-            self._peers.pin(m.body["source"]["kel"], now)
 
     def _apply_receipt(self, m: PrivateMessage, state: KelState, now: int) -> ReceiveOutcome:
-        """Core receipt rules: ``code`` exactly when rejected (outcome-code grammar); a renewal
-        permit must be valid from the receipt's sender to us. Failures are dropped."""
+        """Step 9 like every packet (a replayed receipt is a duplicate, applied once; beyond the
+        horizon it is dropped), then the core receipt rules: ``code`` exactly when rejected
+        (outcome-code grammar); a renewal permit must be valid from the receipt's sender to us.
+        Failures are dropped. Once applied, its seen entry is committed."""
+        if self._replay.seen(m.message_id, m.from_id):
+            return ReceiveOutcome("duplicate", True, message=m)
+        if self._replay.covered(m.from_id, m.timestamp):
+            raise _Drop(ACEError("replay_horizon", "receipt is beyond the replay horizon"))
         body = m.body
         try:
             check_receipt_body(body)
@@ -593,9 +608,18 @@ class Inbox:
             )
         if self._on_receipt is not None:
             self._on_receipt(m.from_id, body, entry)
+        self._see(m.message_id, m.from_id, m.timestamp)
+        self._finish(_delivery_key(m.from_id, m.message_id), m)  # the durable seen entry
+        self._dirty += 1
+        if self._dirty >= _SNAPSHOT_EVERY:
+            self._snapshot()
         return ReceiveOutcome("delivered", True, message=m)
 
-    def _commit(self, m: PrivateMessage, now: int, *, receipt: bool) -> ReceiveOutcome:
+    def _commit(
+        self, m: PrivateMessage, now: int, *, receipt: bool, pin: list | None = None
+    ) -> ReceiveOutcome:
+        """Steps 9-10. ``pin``: a known peer's verified contact ``source`` KEL, pinned (it extends
+        or recovers the pin) only once the packet passed dedupe and the rules."""
         key = _delivery_key(m.from_id, m.message_id)
         # 9. duplicate / horizon (before the rules: a re-sent message is still delivered)
         # A pending journal entry is completed by its re-sent copy; otherwise the seen store
@@ -628,6 +652,8 @@ class Inbox:
             return self._acked("rejected", m, now, receipt, exc)
         if self._check_capacity is not None:
             self._check_capacity(m)
+        if pin is not None:
+            self._peers.pin(pin, now)
         # 10. persist: delivery record, then rules, seen store and hand-over (one transaction)
         write_record(
             self._store, key, {"status": "pending", "message": m.to_dict(), "receivedAt": now}

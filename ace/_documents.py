@@ -5,7 +5,14 @@ from __future__ import annotations
 
 from ._encoding import canonical_state_bytes, wire_int
 from .errors import ACEError
-from .kel import KelState, is_usable, reconcile_kel, verify_kel, verify_operational_signature
+from .kel import (
+    KelState,
+    check_signature_shape,
+    is_usable,
+    reconcile_kel,
+    verify_kel,
+    verify_operational_signature,
+)
 from .limits import TIMESTAMP_WINDOW_SECONDS
 
 
@@ -67,9 +74,12 @@ def verify_claims(state: KelState, action: str, document: dict, now: int) -> Non
 def verify_signed(
     kel: object, document: dict, action: str, now: int, pinned: KelState | None
 ) -> KelState:
-    """The KEL usable at ``now`` (``invalid_kel`` / ``invalid_signature``) naming
-    ``document["aceId"]``, reconciled with ``pinned`` when given, and ``document`` signed under it
+    """The signature's shape (``invalid_authorization``, before any KEL work, 04 §
+    Verification), the KEL usable at ``now`` (``invalid_kel`` / ``invalid_signature``) naming
+    ``document["aceId"]``, reconciled with ``pinned`` when given, ``issuedAt`` not before the
+    ``dlg`` of the current signing key (``stale_peer_binding``), and ``document`` signed under it
     (``verify_claims``). Returns the state it verified under."""
+    check_signature_shape(document.get("signature"), "invalid_authorization")
     state = verify_kel(kel, now)
     if not is_usable(state, now):
         raise ACEError("invalid_kel", "identity has no live signing delegation")
@@ -77,5 +87,10 @@ def verify_signed(
         raise bad("aceId does not match the kel")
     if pinned is not None:
         state, _ = reconcile_kel(pinned, state)
+    # Issued before its signing delegation: signed under another branch that delegated the same
+    # key at the same seq (a recovered fork), never under this log.
+    s = state.signing
+    if s is not None and document["issuedAt"] < wire_int(state.events[s.seq]["ts"]):  # type: ignore[operator]
+        raise ACEError("stale_peer_binding", f"{action} issued before its signing delegation")
     verify_claims(state, action, document, now)
     return state

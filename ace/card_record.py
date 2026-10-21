@@ -24,7 +24,7 @@ from ._encoding import (
 )
 from .descriptor import validate_card, validate_relay_route
 from .identity import ACEIdentity, sign_claims
-from .kel import KelState
+from .kel import KelState, tail_time
 from .limits import (
     MAX_CARD_RECORD_BYTES,
     MAX_PAY_ACCOUNTS,
@@ -174,11 +174,13 @@ def create_card_record(
     now: int | None = None,
     allow_loopback_relays: bool = False,
 ) -> dict:
-    """Create and sign this identity's CardBundle (verified before it is returned)."""
+    """Create and sign this identity's CardBundle (verified before it is returned), issued at
+    ``max(now, ts of the KEL's last event)``: never before its signing delegation."""
     t = resolve_now(now)
+    kel = identity.get_kel()
     claims: dict = {
         "aceId": identity.get_ace_id(),
-        "issuedAt": t,
+        "issuedAt": tail_time(kel, t),
         "home": home,
         "card": copy.deepcopy(card or {}),
         "contact": contact,
@@ -188,6 +190,6 @@ def create_card_record(
         claims["handle"] = handle
     if pay is not None:
         claims["pay"] = list(pay)
-    bundle = {"kel": identity.get_kel(), "card": sign_claims(identity, "card-record", claims)}
+    bundle = {"kel": kel, "card": sign_claims(identity, "card-record", claims)}
     verify_card_bundle(bundle, t, allow_loopback_relays=allow_loopback_relays)
     return bundle

@@ -18,7 +18,15 @@ from dataclasses import dataclass, replace
 from typing import Callable, Iterator, NamedTuple
 
 from . import _xwing
-from ._encoding import decode_fixed_b64, is_sha256_hex, sha256_hex, to_base64, unix_now, wire_int
+from ._encoding import (
+    check_wire_int,
+    decode_fixed_b64,
+    is_sha256_hex,
+    sha256_hex,
+    to_base64,
+    unix_now,
+    wire_int,
+)
 from .errors import ACEError
 from .limits import KEM_SEED_SIZE, MAX_RETAINED_PREKEYS, OFFLINE_WINDOW_SECONDS
 from .store import flock_file, write_file_atomic
@@ -157,6 +165,10 @@ class PrekeyVault:
             e.seed: e for e in ([state.current] if state.current else []) + state.retired
         }
 
+    def _time(self, now: object) -> int:
+        """``now`` as a wire integer (``invalid_argument``), or the clock when it is ``None``."""
+        return unix_now(self._clock) if now is None else check_wire_int(now, "now")
+
     # --- API ---
 
     @property
@@ -166,15 +178,16 @@ class PrekeyVault:
 
     def current(self, now: int | None = None) -> Prekey:
         """The current prekey; the first call generates one (dated ``now``)."""
+        at = self._time(now)
         with self._locked() as s:
             if s.current is None:
-                at = unix_now(self._clock) if now is None else now
                 self._commit(_State(_entry(os.urandom(KEM_SEED_SIZE), at), s.retired))
             assert self._state.current is not None
             return self._state.current.prekey
 
     def rotate(self, now: int) -> Prekey:
         """Generate a new current prekey; the old one is retained until ``now + OFFLINE``."""
+        now = check_wire_int(now, "now")
         with self._locked() as s:
             retired = s.retired + ([replace(s.current, at=now)] if s.current else [])
             fresh = _entry(os.urandom(KEM_SEED_SIZE), now)
@@ -187,7 +200,7 @@ class PrekeyVault:
         opportunistically (04 § Prekey)."""
         if not is_sha256_hex(prekey_id):
             raise ACEError("unknown_prekey", "prekey id must be 64 lowercase hex")
-        t = unix_now(self._clock) if now is None else now
+        t = self._time(now)
         with self._locked() as s:
             live = _live(s.retired, t)
             if len(live) != len(s.retired):
@@ -202,6 +215,7 @@ class PrekeyVault:
 
     def prune(self, now: int) -> None:
         """Delete retired seeds superseded ``OFFLINE_WINDOW_SECONDS`` or more ago."""
+        now = check_wire_int(now, "now")
         with self._locked() as s:
             live = _live(s.retired, now)
             if len(live) != len(s.retired):

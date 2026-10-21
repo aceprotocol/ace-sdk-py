@@ -110,21 +110,36 @@ def _check_next_digest(digest: object) -> bytes | None:
 def _new_next_root(
     next_root_digest: bytes | None, current: SoftwareKey, events: Sequence[dict]
 ) -> tuple[SoftwareKey | None, bytes]:
-    """The next root to commit and its digest; it must differ from every current or past root."""
+    """The next root to commit and its digest. Committing any key the log reveals (a current or
+    past root, or a delegated signing key), each possibly exposed, is refused (01 § Rotation and
+    recovery)."""
     if next_root_digest is not None:
         nxt, digest = None, bytes(next_root_digest)
     else:
         nxt = generate_software_key()
         digest = key_digest(nxt.scheme, nxt.public_key())
-    roots = {key_digest(current.scheme, current.public_key())}
+    revealed = {key_digest(current.scheme, current.public_key())}
     for ev in events:
-        if ev["t"] in ("icp", "rot"):
-            roots.add(key_digest(ev["root"]["scheme"], from_base64(ev["root"]["publicKey"])))
-    if digest in roots:
+        k = ev["key"] if ev["t"] == "dlg" else ev["root"]
+        revealed.add(key_digest(k["scheme"], from_base64(k["publicKey"])))
+    if digest in revealed:
         raise ACEError(
-            "invalid_argument", "the next root must differ from every current or past root"
+            "invalid_argument",
+            "the next root must differ from every root and signing key the log reveals",
         )
     return nxt, digest
+
+
+def _delegation(
+    state: KelState, root: SoftwareKey, key: bytes, ts: int, not_after: int | None = None
+) -> dict:
+    """``dlg`` of ``key`` signed by ``root``. A key that is the current root or the committed
+    next root is refused: its signatures would expose a root key (01 § Rotation and recovery)."""
+    if key == state.root_public_key or key_digest(SCHEME, key).hex() == state.next:
+        raise ACEError(
+            "invalid_argument", "the signing key must be neither the current nor the next root"
+        )
+    return create_signing_delegation(state, root, key, ts, not_after)
 
 
 def _check_committed(key: SoftwareKey, state: KelState) -> None:
@@ -164,7 +179,7 @@ class SoftwareIdentity:
         root, signing = generate_software_key(), generate_software_key()
         next_root, digest = _new_next_root(next_root_digest, root, ())
         icp = create_inception(root, digest, ts)
-        dlg = create_signing_delegation(verify_kel([icp], ts), root, signing.public_key(), ts)
+        dlg = _delegation(verify_kel([icp], ts), root, signing.public_key(), ts)
         return cls(root, next_root, signing, [icp, dlg], ts)
 
     @classmethod
@@ -203,18 +218,17 @@ class SoftwareIdentity:
             raise ACEError("invalid_argument", "next_root must be a SoftwareKey")
         next_root_digest = _check_next_digest(next_root_digest)
         now_ts = resolve_now(now)
-        state = verify_kel(kel, now_ts)
-        start = max(i for i, e in enumerate(state.events) if e["t"] in ("icp", "rot"))
-        events = copy.deepcopy(list(state.events[: start + 1]))
+        full = verify_kel(kel, now_ts)
+        start = max(i for i, e in enumerate(full.events) if e["t"] in ("icp", "rot"))
+        events = copy.deepcopy(list(full.events[: start + 1]))
         ts = tail_time(events, now_ts)
         state = verify_kel(events, ts)
         _check_committed(next_root, state)
-        new_next, digest = _new_next_root(next_root_digest, next_root, events)
+        # the dropped events (possibly a thief's) revealed their keys too
+        new_next, digest = _new_next_root(next_root_digest, next_root, full.events)
         signing = generate_software_key()
         events.append(create_rotation(state, next_root, digest, ts))
-        events.append(
-            create_signing_delegation(verify_kel(events, ts), next_root, signing.public_key(), ts)
-        )
+        events.append(_delegation(verify_kel(events, ts), next_root, signing.public_key(), ts))
         return cls(next_root, new_next, signing, events, ts)
 
     def export_private_key(self) -> SoftwareIdentityExport:
@@ -271,15 +285,11 @@ class SoftwareIdentity:
         new_next, digest = _new_next_root(next_root_digest, revealed, self._state.events)
         self._append(create_rotation(self._state, revealed, digest, ts), ts)
         self._root, self._next_root = revealed, new_next
-        self._append(
-            create_signing_delegation(self._state, self._root, self._signing.public_key(), ts), ts
-        )
+        self._append(_delegation(self._state, self._root, self._signing.public_key(), ts), ts)
 
     def delegate(self, now: int | None = None, not_after: int | None = None) -> None:
         """Delegate a fresh signing key (``dlg``), optionally with ``notAfter``."""
         ts = resolve_now(now)
         key = generate_software_key()
-        self._append(
-            create_signing_delegation(self._state, self._root, key.public_key(), ts, not_after), ts
-        )
+        self._append(_delegation(self._state, self._root, key.public_key(), ts, not_after), ts)
         self._signing = key

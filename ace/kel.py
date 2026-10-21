@@ -185,23 +185,46 @@ def create_signing_delegation(
 
 
 _VERIFIED_CACHE_SIZE = 256
-_verified: dict[str, tuple[KelState, int]] = {}
+_VERIFIED_CACHE_BYTES = 16 * 1024 * 1024  # canonical event bytes held, all entries together
+_verified: dict[str, tuple[KelState, int, int]] = {}  # key -> (state, last ts, bytes)
+_verified_bytes = 0
 _verified_lock = threading.Lock()
 
 
-def _prefix_keys(events: object) -> list[str] | None:
-    """Chained content keys: ``keys[i]`` hashes ``keys[i-1]`` and the canonical JSON of event
-    ``i`` (its ``sig`` included), so it names the exact prefix ``events[:i+1]``. None for a value
-    that is not a bounded JSON array."""
+def _prefix_keys(events: object) -> tuple[list[str], int] | None:
+    """Chained content keys and the log's canonical size: ``keys[i]`` hashes ``keys[i-1]`` and
+    the canonical JSON of event ``i`` (its ``sig`` included), so it names the exact prefix
+    ``events[:i+1]``. None for a value that is not a bounded JSON array."""
     if not isinstance(events, list) or not 0 < len(events) <= MAX_KEL_EVENTS:
         return None
     keys: list[str] = []
+    size = 0
     try:
         for ev in events:
-            keys.append(sha256_hex(keys[-1] if keys else "", canonical_state_bytes(ev)))
+            eb = canonical_state_bytes(ev)
+            size += len(eb)
+            keys.append(sha256_hex(keys[-1] if keys else "", eb))
     except (TypeError, ValueError, ACEError, RecursionError):
         return None
-    return keys
+    return keys, size
+
+
+def _cache_put(key: str, state: KelState, last_ts: int, size: int) -> None:
+    """Keep a verified state, oldest entries evicted first to stay within
+    ``_VERIFIED_CACHE_SIZE`` entries and ``_VERIFIED_CACHE_BYTES``; a larger log is not kept."""
+    global _verified_bytes
+    if size > _VERIFIED_CACHE_BYTES:
+        return
+    with _verified_lock:
+        old = _verified.pop(key, None)
+        if old is not None:
+            _verified_bytes -= old[2]
+        while _verified and (
+            len(_verified) >= _VERIFIED_CACHE_SIZE or _verified_bytes + size > _VERIFIED_CACHE_BYTES
+        ):
+            _verified_bytes -= _verified.pop(next(iter(_verified)))[2]
+        _verified[key] = (replace(state, events=copy.deepcopy(state.events)), last_ts, size)
+        _verified_bytes += size
 
 
 def verify_kel(events: list, now: int) -> KelState:
@@ -211,8 +234,11 @@ def verify_kel(events: list, now: int) -> KelState:
     verification is a pure function of the log and ``now``, and only the future bound
     ``ts <= now + TIMESTAMP_WINDOW_SECONDS`` depends on ``now``, so a hit re-checks that bound
     alone and costs no signature verification. A log extending a cached one (a pin plus new
-    events) re-checks the whole structure but verifies only the new events' signatures."""
-    keys = _prefix_keys(events)
+    events) re-checks the whole structure but verifies only the new events' signatures. Only a
+    log usable at ``now`` is cached, within a byte budget (a stranger's junk logs cannot crowd
+    out the pins)."""
+    prefix = _prefix_keys(events)
+    keys, size = (None, 0) if prefix is None else prefix
     key = None if keys is None else keys[-1]
     resume = None
     if keys is not None:
@@ -227,12 +253,8 @@ def verify_kel(events: list, now: int) -> KelState:
             st = hit[0]
             return replace(st, events=copy.deepcopy(st.events))
     state = _verify_kel(events, now, resume)
-    if key is not None:
-        last_ts = wire_int(state.events[-1]["ts"]) or 0
-        with _verified_lock:
-            if len(_verified) >= _VERIFIED_CACHE_SIZE:
-                _verified.pop(next(iter(_verified)))
-            _verified[key] = (replace(state, events=copy.deepcopy(state.events)), last_ts)
+    if key is not None and is_usable(state, now):
+        _cache_put(key, state, wire_int(state.events[-1]["ts"]) or 0, size)
     return state
 
 
@@ -345,6 +367,19 @@ def reconcile_kel(pinned: KelState | None, cand: KelState) -> tuple[KelState, st
     return pinned, "unchanged"
 
 
+def check_signature_shape(signature: object, code: ACEErrorCode) -> bytes:
+    """An operational signature's shape: ``{scheme: ml-dsa-65, seq, value}``, ``seq`` a wire
+    integer and ``value`` canonical Base64 of a signature's length; its raw bytes, or ``code``."""
+    if (
+        not isinstance(signature, dict)
+        or set(signature) != {"scheme", "seq", "value"}
+        or signature["scheme"] != SCHEME
+        or wire_int(signature["seq"]) is None
+    ):
+        raise ACEError(code, "signature must be {scheme: ml-dsa-65, seq, value}")
+    return decode_fixed_b64(signature["value"], SIGNATURE_SIZE, code, "signature")
+
+
 def verify_operational_signature(
     state: KelState,
     signature: object,
@@ -355,23 +390,16 @@ def verify_operational_signature(
     code: ACEErrorCode = "invalid_signature",
 ) -> None:
     """01 § Operational signatures, in order, for a ``{scheme, seq, value}`` signature over
-    ``M(state.ace_id, signed_at, seq, payload)``: 1. the scheme is ``ml-dsa-65`` (shape failures
-    are ``code``); 2. ``seq`` names the current signing delegation; 3. signed while live
+    ``M(state.ace_id, signed_at, seq, payload)``: 1. the shape (``check_signature_shape``,
+    ``code``); 2. ``seq`` names the current signing delegation; 3. signed while live
     (``signed_at < notAfter``); 4. the signature verifies (``code``); 5. the signer is usable at
     ``now``. Failures of 2, 3 and 5 are ``stale_peer_binding``."""
-    if (
-        not isinstance(signature, dict)
-        or set(signature) != {"scheme", "seq", "value"}
-        or signature["scheme"] != SCHEME
-        or wire_int(signature["seq"]) is None
-    ):
-        raise ACEError(code, "signature must be {scheme: ml-dsa-65, seq, value}")
-    seq, signing = wire_int(signature["seq"]), state.signing
+    raw = check_signature_shape(signature, code)
+    seq, signing = wire_int(signature["seq"]), state.signing  # type: ignore[index]
     if signing is None or seq != signing.seq:
         raise ACEError("stale_peer_binding", "seq is not the current signing delegation")
     if signing.not_after is not None and signed_at >= signing.not_after:
         raise ACEError("stale_peer_binding", "signed at or after the delegation's notAfter")
-    raw = decode_fixed_b64(signature["value"], SIGNATURE_SIZE, code, "signature")
     message = signing_message(state.ace_id, signed_at, signing.seq, payload)
     if not verify_signature(message, action, raw, signing.public_key):
         raise ACEError(code, f"{action} signature does not verify")

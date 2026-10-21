@@ -13,7 +13,7 @@ from .identity import ACEIdentity, sign_claims
 from .kel import KelState, reconcile_kel, verify_kel
 from .limits import MAX_DELEGATION_LIFETIME
 
-_KEYS = {"issuer", "subject", "issuedAt", "expiresAt", "signature"}
+CREDENTIAL_KEYS = {"issuer", "subject", "issuedAt", "expiresAt", "signature"}
 _AGENT_ID_RE = re.compile(r"0|[1-9][0-9]{0,77}")
 _NATIVE_AGENT_ID_RE = re.compile(r"[A-Za-z0-9]{1,128}")
 
@@ -58,7 +58,7 @@ def verify_delegation(
     c = entry["credential"]
     if (
         type(c) is not dict
-        or set(c) != _KEYS
+        or set(c) != CREDENTIAL_KEYS
         or not is_ace_id(c["issuer"])
         or c["subject"] != subject
         or c["issuer"] == subject

@@ -63,6 +63,16 @@ def _check_length(value: bytes, expected: int, what: str) -> None:
         )
 
 
+def _x25519(sk: X25519PrivateKey, pk: bytes) -> bytes:
+    """X25519 as RFC 7748 defines it. ``cryptography`` raises ``ValueError`` only for an
+    all-zero result (a small-order point), which X-Wing takes as is: 03 forbids an added
+    all-zero check, so that result is 32 zero bytes."""
+    try:
+        return sk.exchange(X25519PublicKey.from_public_bytes(pk))
+    except ValueError:
+        return bytes(_X_SIZE)
+
+
 def _combiner(ss_m: bytes, ss_x: bytes, ct_x: bytes, pk_x: bytes) -> bytes:
     return hashlib.sha3_256(ss_m + ss_x + ct_x + pk_x + XWING_LABEL).digest()
 
@@ -96,7 +106,7 @@ class DecapsulationKey:
         ct_m = bytes(ciphertext[:_MLKEM_CT_SIZE])
         ct_x = bytes(ciphertext[_MLKEM_CT_SIZE:])
         ss_m = self._sk_m.decapsulate(ct_m)
-        ss_x = self._sk_x.exchange(X25519PublicKey.from_public_bytes(ct_x))
+        ss_x = _x25519(self._sk_x, ct_x)
         return _combiner(ss_m, ss_x, ct_x, self._pk_x)
 
 
@@ -111,7 +121,7 @@ def encapsulate(public_key: bytes) -> tuple[bytes, bytes]:
 
     ek_x = X25519PrivateKey.generate()
     ct_x = ek_x.public_key().public_bytes_raw()
-    ss_x = ek_x.exchange(X25519PublicKey.from_public_bytes(pk_x))
+    ss_x = _x25519(ek_x, pk_x)
 
     # pyca returns (shared_secret[32], ciphertext[1088]).
     ss_m, ct_m = MLKEM768PublicKey.from_public_bytes(pk_m).encapsulate()

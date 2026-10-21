@@ -149,9 +149,11 @@ def test_receipt_failures_share_persistent_fetch_budget_and_release_the_queue(re
     try:
         assert [o.kind for o in restarted.pull()] == ["retry"]
         assert len(relay.streams[a]) == 2
-        assert [o.kind for o in restarted.pull()] == ["quarantined", "delivered"]
+        # the message was processed: its last receipt failure acks it without a quarantine
+        # record (C3); the sender's retry would get a duplicate's receipt
+        assert [o.kind for o in restarted.pull()] == ["duplicate", "delivered"]
         assert restarted.relay.inbox(restarted.identity).entries == []
-        assert len(restarted.inbox.quarantined()) == 1
+        assert restarted.inbox.quarantined() == []
         assert restarted.store.list("inbox/attempts/") == []
         assert [m.message_id for m in received if m.type == "ace:text:1"] == [first, second]
     finally:

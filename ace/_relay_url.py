@@ -4,6 +4,7 @@ import ipaddress
 import re
 from urllib.parse import urlsplit
 
+from ._encoding import is_https_url
 from .errors import ACEError
 
 _PORT_RE = re.compile(r"[1-9][0-9]{0,4}")
@@ -67,8 +68,9 @@ def normalize_relay_url(url: object) -> str:
 
 def is_canonical_relay_url(value: object, *, allow_loopback: bool) -> bool:
     """A canonical relay URL (02 § Relay URLs): ``https``, at most 2048 characters, already in
-    ``normalize_relay_url`` form. ``allow_loopback`` (local development) also admits ``http`` to
-    a loopback host; production verifiers reject it."""
+    ``normalize_relay_url`` form, host in the ACE HTTPS URL grammar (02 § HTTPS URLs: no IP
+    literal, empty label, edge hyphen or trailing dot). ``allow_loopback`` (local development)
+    also admits ``http`` to a loopback host; production verifiers reject it."""
     if not isinstance(value, str) or len(value) > 2048:
         return False
     try:
@@ -77,4 +79,6 @@ def is_canonical_relay_url(value: object, *, allow_loopback: bool) -> bool:
     except ACEError:
         return False
     url = urlsplit(value)
-    return url.scheme == "https" or (allow_loopback and url.hostname in _LOOPBACK)
+    if url.scheme == "https":
+        return is_https_url(value)
+    return allow_loopback and url.hostname in _LOOPBACK
