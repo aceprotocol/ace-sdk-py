@@ -462,6 +462,9 @@ def test_transient_on_one_route_plus_unknown_peer_on_another_does_not_fall_back(
         bob.import_agent(two_routes)  # shared out of band; it expires before bob looks again
         # Self-signed, not served by a relay: it does not confirm the pin.
         assert bob.peers.kel_live(a) is False
+        # Nor does a card lookup take that cached, still usable descriptor for a live one: it asks
+        # the relays.
+        assert bob.lookup_card(a).kel_live is False
         world.clock.now += 8 * 86400
         # Relay B is unreachable and the home relay answers unknown_peer: the lookup fails.
         relay_b.inject.append((path, 503, "internal_error", {}))

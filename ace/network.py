@@ -403,7 +403,7 @@ class NetworkClient:
         again and report False until one confirms it."""
         if is_ace_id(target):
             fetch_card = functools.cache(lambda: self._fetch_card(target))
-            kel_live = self._card_kel(target, lambda: self.agent(target), fetch_card)
+            kel_live = self._card_kel(target, lambda: self.agent(target, refresh=True), fetch_card)
             return self._check_card(fetch_card().bundle, kel_live=kel_live)
         card, relay, handle = self._card_by_handle(target)
         kel_live = self._card_kel(
@@ -418,8 +418,9 @@ class NetworkClient:
         card: Callable[[], VerifiedCard],
     ) -> bool:
         """The KEL a card lookup verifies under, and whether a live descriptor confirmed it. A
-        pin confirmed live is used as is. Otherwise the descriptor is looked up through ``fetch``
-        (adopting it records the pin as confirmed live, ``PeerStore.adopt``). When
+        pin confirmed live is used as is. Otherwise the descriptor is looked up at a relay through
+        ``fetch`` (never a cached one) and the result is the pin's ``kel_live`` after it: a
+        relay's descriptor bound to the pin confirms it, a replayed or older one does not. When
         every route answers ``unknown_peer``, an unconfirmed pin stays unconfirmed, and without a
         pin the card's own bundle (``card``) pins the KEL (``_pin_bundle_kel``). Every other
         failure propagates."""
@@ -434,7 +435,7 @@ class NetworkClient:
             if pinned is None:
                 self._pin_bundle_kel(card())
             return False
-        return True
+        return self.peers.kel_live(ace_id)
 
     def _pin_bundle_kel(self, card: VerifiedCard) -> None:
         """Pin the KEL of ``card`` (already verified for the looked-up identity; no live
