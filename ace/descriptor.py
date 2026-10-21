@@ -16,7 +16,6 @@ from dataclasses import dataclass, field
 from ._documents import bad, check_lifetime, check_size, verify_signed
 from ._encoding import (
     CONTROL_CHAR_RE,
-    canonical_state_bytes,
     check_json_value,
     decode_fixed_b64,
     is_ace_id,
@@ -164,12 +163,7 @@ def _check_ext(ext: object, profile_ids: set[str]) -> None:
         raise bad("ext keys must be announced profile ids")
     if not all(type(v) is dict for v in ext.values()):
         raise bad("ext values must be objects")
-    try:
-        size = len(canonical_state_bytes(ext))
-    except (TypeError, ValueError):
-        raise bad("ext is not JSON") from None
-    if size > MAX_EXT_BYTES:
-        raise bad(f"ext exceeds {MAX_EXT_BYTES} canonical bytes")
+    check_size(ext, MAX_EXT_BYTES, "ext")
     official = _official_ext()
     for key, value in ext.items():
         if key in official:

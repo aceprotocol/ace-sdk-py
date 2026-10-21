@@ -34,7 +34,7 @@ from .errors import ACEError
 from .identity import ACEIdentity
 from .inbox import Inbox, ReceiveOutcome, Reply
 from .invitation import verify_invitation
-from .kel import KelState, event_bytes
+from .kel import event_bytes
 from .limits import (
     CONTACT_REQUEST_TTL_SECONDS,
     DEFAULT_PAGE_LIMIT,
@@ -76,13 +76,6 @@ def _handle_owner_key(home: str, handle: str) -> str:
     return f"network/handle-owners/{sha256_hex(f'{home} {handle}')}.json"
 
 
-def _kel_provenance_key(ace_id: str) -> str:
-    """How a peer's KEL pin was confirmed: ``liveConfirmed`` False when a card lookup pinned the
-    bundle's own KEL because the identity had no live descriptor, until a live descriptor confirms
-    it. No record: pinned through a descriptor."""
-    return f"network/kel-provenance/{sha256_hex(ace_id)}.json"
-
-
 def _valid_card_pin(p: dict) -> bool:
     return (
         wire_int(p.get("issuedAt")) is not None
@@ -94,10 +87,6 @@ def _valid_card_pin(p: dict) -> bool:
 
 def _valid_owner_pin(p: dict) -> bool:
     return all(isinstance(p.get(k), str) for k in ("aceId", "home", "handle"))
-
-
-def _valid_provenance(p: dict) -> bool:
-    return isinstance(p.get("aceId"), str) and isinstance(p.get("liveConfirmed"), bool)
 
 
 def _load_pin(store: ACEStore, key: str, valid: Callable[[dict], bool]) -> dict | None:
@@ -393,11 +382,9 @@ class NetworkClient:
         if is_ace_id(target):
             return self.agent(target), None
         card, relay, handle = self._card_by_handle(target)
-        provenance = _load_pin(self.store, _kel_provenance_key(card.ace_id), _valid_provenance)
-        # The descriptor first: it pins or advances the KEL, so the card verifies under the
-        # current KEL.
+        # The descriptor first: it pins or advances the KEL (live), so the card verifies under
+        # the current KEL.
         agent = self._fetch(card.ace_id, [relay.base_url])
-        self._confirm_live(card.ace_id, provenance)
         return agent, self._check_card(card.bundle, (relay.base_url, handle))
 
     def lookup_card(self, target: str) -> VerifiedCard:
@@ -432,13 +419,12 @@ class NetworkClient:
     ) -> bool:
         """The KEL a card lookup verifies under, and whether a live descriptor confirmed it. A
         pin confirmed live is used as is. Otherwise the descriptor is looked up through ``fetch``
-        (pinning or reconciling the KEL): on success the pin is recorded as confirmed live. When
+        (adopting it records the pin as confirmed live, ``PeerStore.adopt``). When
         every route answers ``unknown_peer``, an unconfirmed pin stays unconfirmed, and without a
         pin the card's own bundle (``card``) pins the KEL (``_pin_bundle_kel``). Every other
         failure propagates."""
         pinned = self.peers.state(ace_id)
-        provenance = _load_pin(self.store, _kel_provenance_key(ace_id), _valid_provenance)
-        if pinned is not None and (provenance is None or provenance["liveConfirmed"]):
+        if pinned is not None and self.peers.kel_live(ace_id):
             return True
         try:
             fetch()
@@ -448,41 +434,17 @@ class NetworkClient:
             if pinned is None:
                 self._pin_bundle_kel(card())
             return False
-        self._confirm_live(ace_id, provenance)
         return True
-
-    def _mark_unconfirmed(self, ace_id: str) -> None:
-        """Record ``ace_id``'s KEL pin as not confirmed live (pinned without a live descriptor);
-        called under the ``peers`` lock, with the pin."""
-        write_record(
-            self.store, _kel_provenance_key(ace_id), {"aceId": ace_id, "liveConfirmed": False}
-        )
-
-    def _confirm_live(self, ace_id: str, provenance: dict | None) -> None:
-        """After a live descriptor was reconciled with ``ace_id``'s pin: a pin recorded (in
-        ``provenance``, read before the descriptor lookup) as not confirmed live is now
-        confirmed."""
-        if provenance is not None and not provenance["liveConfirmed"]:
-            with self.store.lock("peers"):
-                write_record(
-                    self.store,
-                    _kel_provenance_key(ace_id),
-                    {"aceId": ace_id, "liveConfirmed": True},
-                )
 
     def _pin_bundle_kel(self, card: VerifiedCard) -> None:
         """Pin the KEL of ``card`` (already verified for the looked-up identity; no live
-        descriptor), recorded as not confirmed live with the pin, atomically (under the ``peers``
-        lock). ``peers.pin`` reconciles it with any pin written since; ``_check_card`` then
-        re-verifies the record under the pin."""
-
-        def record(pinned: KelState, _outcome: str) -> None:
-            # As for a descriptor: another path advanced the pin past the card's KEL state.
-            if pinned.last_hash != card.state.last_hash:
-                raise ACEError("stale_peer_binding", "the pin advanced past the card record")
-            self._mark_unconfirmed(card.ace_id)
-
-        self.peers.pin(list(card.state.events), self._now(), then=record)
+        descriptor: not ``kel_live``). ``peers.pin`` reconciles it with any pin written since;
+        ``_check_card`` then re-verifies the record under the pin."""
+        state, _ = self.peers.pin(list(card.state.events), self._now())
+        # As for a descriptor: another path advanced the pin past the card's KEL state (the pin
+        # was left as it was).
+        if state.last_hash != card.state.last_hash:
+            raise ACEError("stale_peer_binding", "the pin advanced past the card record")
 
     def _check_card(
         self, bundle: dict, resolved: tuple[str, str] | None = None, *, kel_live: bool = True
@@ -873,22 +835,14 @@ class NetworkClient:
         to the pin, else by a normal lookup. A KEL pinned (or advanced) from the source alone is
         not confirmed live, as a card bundle's own KEL is not, until the refreshed descriptor
         confirms it (04 § Card record)."""
-
-        def record(state: KelState, outcome: str) -> None:
-            if outcome != "unchanged":
-                self._mark_unconfirmed(state.ace_id)
-
         # A pin failure (a fork: kel_conflict) fails the accept, never passed over by a lookup.
-        state, _ = self.peers.pin(source["kel"], self._now(), then=record)
+        state, _ = self.peers.pin(source["kel"], self._now())
         relays = list(source["descriptor"]["relays"])
         # bound: the source's kel ends at the pin (the pin did not move past it)
         bound = state.ace_id == ace_id and state.last_hash == sha256_hex(
             event_bytes(source["kel"][-1])
         )
-        provenance = _load_pin(self.store, _kel_provenance_key(ace_id), _valid_provenance)
-        agent = self._fetch(ace_id, relays) if bound else self.agent(ace_id, refresh=True)
-        self._confirm_live(ace_id, provenance)
-        return agent
+        return self._fetch(ace_id, relays) if bound else self.agent(ace_id, refresh=True)
 
     def reject(self, ace_id: str, note: str = "") -> None:
         """Decline a pending request (a ``rejected`` reply, best effort)."""

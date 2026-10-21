@@ -31,7 +31,7 @@ from ace import (
 )
 from ace.limits import MAX_CARD_RECORD_BYTES
 from ace.profiles import CONTACT_TYPE
-from ace.store import write_record
+from ace.store import load_record, write_record
 
 from .fake_relay import FakeRelay
 from .helpers import NOW, Clock, raises
@@ -460,6 +460,11 @@ def test_transient_on_one_route_plus_unknown_peer_on_another_does_not_fall_back(
         )
         assert bob.lookup_card(a).kel_live is False
         bob.import_agent(two_routes)  # shared out of band; it expires before bob looks again
+        # Adopting a live descriptor confirms the pin; a KEL alone (here: re-pinned from a
+        # bundle) leaves it unconfirmed again, the cached descriptor still naming relay B.
+        assert bob.peers.kel_live(a) is True
+        peer_key = f"peers/{sha256_hex(a)}.json"
+        write_record(bob.store, peer_key, {**load_record(bob.store, peer_key), "kelLive": False})
         world.clock.now += 8 * 86400
         # Relay B is unreachable and the home relay answers unknown_peer: the lookup fails.
         relay_b.inject.append((path, 503, "internal_error", {}))
@@ -492,11 +497,12 @@ def test_pin_missing_required_fields_is_storage_failed(world):
         with raises("storage_failed"):
             bob.lookup_card(f"@alice@{world.host}")
         bob.store.write(key, good)
-    # The record of how a KEL pin was confirmed, without its flag.
+    # A peer record whose live-confirmation flag is not a boolean.
     world.clock.now += 8 * 86400
     carol = world.agent()
     assert carol.lookup_card(a).kel_live is False
-    write_record(carol.store, f"network/kel-provenance/{sha256_hex(a)}.json", {"aceId": a})
+    peer_key = f"peers/{sha256_hex(a)}.json"
+    write_record(carol.store, peer_key, {**load_record(carol.store, peer_key), "kelLive": None})
     with raises("storage_failed"):
         carol.lookup_card(a)
 
@@ -647,3 +653,19 @@ def test_closed_agent_can_still_connect_to_an_open_owner(world):
     # and the closed one is not reachable by strangers
     with raises("not_permitted"):
         b.connect(a_id, profile=TEXT.id)
+
+
+def test_adopting_a_live_descriptor_by_any_path_confirms_a_fallback_pinned_kel(world):
+    alice = world.agent(contact="open", handle="alice")
+    a = alice.identity.get_ace_id()
+    world.clock.now += 8 * 86400
+    bob = world.agent()
+    assert bob.lookup_card(a).kel_live is False
+    # Alice is back: bob's plain descriptor lookup (no card lookup) adopts it and confirms the
+    # pin, so the next card lookup needs no descriptor request of its own.
+    alice.publish()
+    bob.agent(a)
+    assert bob.peers.kel_live(a) is True
+    world.relay.requests.clear()
+    assert bob.lookup_card(a).kel_live is True
+    assert [p for _, p in world.relay.requests if p.startswith("/v1/descriptor/")] == []

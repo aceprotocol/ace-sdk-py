@@ -12,7 +12,7 @@ from typing import Any, Callable
 from ._encoding import canonical_state_bytes, is_ace_id, sha256_hex, unix_now, wire_int
 from .descriptor import VerifiedAgent, verify_published_agent
 from .errors import ACEError
-from .kel import KelState, is_usable, reconcile_kel, tail_time, verify_kel
+from .kel import KelState, event_bytes, is_usable, reconcile_kel, tail_time, verify_kel
 from .limits import OFFLINE_WINDOW_SECONDS
 from .permit import verify_permit
 from .store import ACEStore, load_record, write_record
@@ -34,6 +34,10 @@ class PeerRecord:
     issued_permit: dict | None  # {expiresAt, seq} of the newest permit we sent the peer
     profile: str | None
     updated_at: int | None = None  # when ``status`` was last set (a pending entry's TTL)
+    # Whether a live descriptor vouched for the pinned KEL: False once a KEL alone (a card
+    # bundle's, a held request's source) pinned or advanced it, until a descriptor is adopted
+    # under it (04 § Card record).
+    kel_live: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -45,6 +49,7 @@ class PeerRecord:
             "issuedPermit": self.issued_permit,
             "profile": self.profile,
             "updatedAt": self.updated_at,
+            "kelLive": self.kel_live,
         }
 
 
@@ -59,6 +64,7 @@ def _record(d: dict, key: str) -> PeerRecord:
             d["issuedPermit"],
             d["profile"],
             d["updatedAt"],
+            d.get("kelLive", True),
         )
         if (
             not is_ace_id(r.ace_id)
@@ -68,6 +74,7 @@ def _record(d: dict, key: str) -> PeerRecord:
             or (r.agent is not None and not isinstance(r.agent, dict))
             or (r.profile is not None and not isinstance(r.profile, str))
             or (r.updated_at is not None and wire_int(r.updated_at) is None)
+            or type(r.kel_live) is not bool
             or (
                 r.held_permit is not None
                 and (
@@ -158,26 +165,22 @@ class PeerStore:
             self._states[raw] = cached
         return cached
 
-    def pin(
-        self,
-        kel: list,
-        now: int | None = None,
-        *,
-        then: Callable[[KelState, str], None] | None = None,
-    ) -> tuple[KelState, str]:
-        """Adopt or extend the pinned log (fork rules); ``kel_conflict`` on a fork. ``then`` runs
-        with the resulting pin and outcome still under the ``peers`` lock, so state derived from
-        it is written atomically with it (raising there leaves the pin as it was)."""
+    def pin(self, kel: list, now: int | None = None) -> tuple[KelState, str]:
+        """Adopt or extend the pinned log (fork rules); ``kel_conflict`` on a fork. A KEL alone
+        vouches for no live descriptor: a pin it moves is not ``kel_live``."""
         t = self._now() if now is None else now
         with self._store.lock("peers"):
             cand = verify_kel(kel, t)
             pinned = self.state(cand.ace_id)
             state, outcome = reconcile_kel(pinned, cand)
-            if then is not None:
-                then(state, outcome)
             if outcome != "unchanged":
-                self._update(state.ace_id, kel=list(state.events))
+                self._update(state.ace_id, kel=list(state.events), kel_live=False)
             return state, outcome
+
+    def kel_live(self, ace_id: str) -> bool:
+        """Whether a live descriptor vouched for the pinned KEL (``PeerRecord.kel_live``)."""
+        rec = self.get(ace_id)
+        return rec is not None and rec.kel is not None and rec.kel_live
 
     # --- descriptors ---
 
@@ -196,7 +199,8 @@ class PeerStore:
         return pins
 
     def adopt(self, agent: VerifiedAgent | dict, now: int | None = None) -> VerifiedAgent:
-        """Pin the agent's KEL (fork rules) and its descriptor. The descriptor must verify under the
+        """Pin the agent's KEL (fork rules; ``kel_live`` when the pin is the descriptor's own KEL:
+        the descriptor is live) and its descriptor. The descriptor must verify under the
         KEL state that ends up pinned (a descriptor carrying an older prefix of the pin and signed
         by a superseded delegation is ``stale_peer_binding``). It replaces the pinned one only
         when its ``issuedAt`` is newer (or equal with identical claims); an older one is ignored
@@ -224,6 +228,11 @@ class PeerStore:
             )
             state = verified.state
             kel = list(state.events)
+            # A live descriptor vouches only for its own KEL, not for a pin that has moved past it
+            # (that pin is left as it was, and so is its flag).
+            kel_live = state.last_hash == sha256_hex(event_bytes(source["kel"][-1])) or (
+                rec is not None and rec.kel_live
+            )
             old = None if rec is None else rec.agent
             if (
                 old is not None
@@ -236,7 +245,7 @@ class PeerStore:
                     )
                 )
             ):
-                self._update(verified.ace_id, kel=kel)
+                self._update(verified.ace_id, kel=kel, kel_live=kel_live)
                 kept = self.current(verified.ace_id, t)
                 if kept is None:
                     # An older revision never stands in for the newer cached one,
@@ -247,7 +256,7 @@ class PeerStore:
                     )
                 return kept
             stored = {"kel": kel, "descriptor": copy.deepcopy(verified.descriptor)}
-            self._update(verified.ace_id, kel=kel, agent=stored)
+            self._update(verified.ace_id, kel=kel, agent=stored, kel_live=kel_live)
         return VerifiedAgent(verified.ace_id, state, stored, verified.prekey, verified.delegations)
 
     def _cached(self, agent: dict, pins: dict[str, KelState] | None = None) -> VerifiedAgent:
