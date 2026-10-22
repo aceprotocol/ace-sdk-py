@@ -527,7 +527,7 @@ class Inbox:
             check_window(p, now)
             c = decode_content(decrypt_packet(p, self._vault, now))
             if c["type"] != CONTACT_TYPE:
-                raise ACEError("not_permitted", "only contact requests are accepted from strangers")
+                raise ACEError("not_permitted", "an unpinned sender may only send contact packets")
             self._profiles.validate(c["type"], c["schemaDigest"], c["body"])
             m = PrivateMessage.of(p, c)
             if stranger and m.body["kind"] != "request":

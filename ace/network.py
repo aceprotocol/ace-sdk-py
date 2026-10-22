@@ -138,6 +138,19 @@ def _blocked_peer() -> ACEError:
     return ACEError("not_permitted", "the peer is blocked; unblock it first")
 
 
+def _no_valid_permit() -> ACEError:
+    """The one refusal of a message, whether no permit verifies here or the relay answers
+    ``not_permitted``."""
+    return ACEError("not_permitted", "no valid permit from this peer")
+
+
+def _contact_refused() -> ACEError:
+    """The one refusal of a contact request, whether the card record is closed or the relay
+    answers ``not_permitted``. It names no cause: a closed peer and a blocking one read the same
+    (05 § Blocks)."""
+    return ACEError("not_permitted", "the peer does not accept contact requests from this identity")
+
+
 @dataclass(frozen=True)
 class ContactRequest:
     """A held incoming contact request (05 § Flow step 2)."""
@@ -660,8 +673,14 @@ class NetworkClient:
         renewal or refresh arrives); never the stranger path (06 § Outbox step 3)."""
         permit = self._their_permit(agent.ace_id)
         if permit is None:
-            raise ACEError("not_permitted", "no valid permit from this peer")
-        self._post(packet, agent, permit)
+            raise _no_valid_permit()
+        try:
+            self._post(packet, agent, permit)
+        except ACEError as exc:
+            # The relay's refusal (a block among others) reads exactly like a missing permit.
+            if exc.code == "not_permitted":
+                raise _no_valid_permit() from None
+            raise
 
     def _send_contact(self, agent: VerifiedAgent, body: dict, permit: dict | None = None) -> str:
         """A contact packet: one attempt, never queued. A permit it carries counts as issued
@@ -688,7 +707,7 @@ class NetworkClient:
         stored. Delivery is confirmed only by the receipt (``outbox.get(id).status``,
         ``on_receipt``)."""
         if self._their_permit(to) is None:
-            raise ACEError("not_permitted", "no valid permit from this peer")
+            raise _no_valid_permit()
         mid = self.outbox.enqueue(to, type_, body, thread_id=thread_id)
         self.outbox.deliver(mid, self._attempt, self._resolve)
         return mid
@@ -791,10 +810,7 @@ class NetworkClient:
         if self._their_permit(agent.ace_id) is None:
             card = card if card is not None else self._card_or_none(agent.ace_id)
             if card is None or card.contact != "open":
-                raise ACEError(
-                    "not_permitted",
-                    "the peer takes contact requests only from peers it issued a permit",
-                )
+                raise _contact_refused()
         # Resolution/card lookup may have raced a block in another client sharing the store.
         # Every network-driven admission mutation uses the same lock as block/unblock.
         with self.store.lock("network-blocks"):
@@ -803,7 +819,13 @@ class NetworkClient:
                 raise _blocked_peer()
             if status != "admitted":
                 self.peers.set_status(agent.ace_id, "pending", profile)
-        return self._send_contact(agent, self._contact("request", profile, note, agent.ace_id))
+        try:
+            return self._send_contact(agent, self._contact("request", profile, note, agent.ace_id))
+        except ACEError as exc:
+            # The relay's refusal (a block among others) reads exactly like a closed peer's.
+            if exc.code == "not_permitted":
+                raise _contact_refused() from None
+            raise
 
     def _card_or_none(self, ace_id: str) -> VerifiedCard | None:
         """The peer's verified card record; None when it has none (``unknown_peer``: closed,

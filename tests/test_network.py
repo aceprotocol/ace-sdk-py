@@ -226,6 +226,22 @@ def test_connect_never_clears_a_block_only_unblock_does(relay, pair):
     assert [r.from_id for r in alice.requests()] == [b]
 
 
+def test_a_blocked_strangers_contact_request_reads_like_one_to_a_closed_peer(relay):
+    """05 § Blocks: same code, same message, no relay status: the block is not revealed."""
+    open_, closed, bob = client(relay, contact="open", listed=True), client(relay), client(relay)
+    open_.block(bob.identity.get_ace_id())
+    refusals = []
+    for target in (open_, closed):
+        with raises("not_permitted") as info:
+            bob.connect(target.identity.get_ace_id(), profile=TEXT.id)
+        refusals.append(info.value)
+    blocked, shut = refusals
+    assert blocked.message == shut.message
+    assert blocked.status is None and blocked.relay_code is None
+    for c in (open_, closed, bob):
+        c.close()
+
+
 def test_pending_requests_one_slot_per_sender_ttl_and_oldest_evicted(relay, pair):
     from ace import CORE, PrivateMessage
     from ace.limits import CONTACT_REQUEST_TTL_SECONDS, MAX_PENDING_CONTACT_REQUESTS
