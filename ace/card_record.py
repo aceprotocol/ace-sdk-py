@@ -141,7 +141,7 @@ def verify_card_bundle(
     validate_relay_route(r["home"], allow_loopback=allow_loopback_relays)
     if "handle" in r:
         if not is_handle(r["handle"]):
-            raise bad("handle must match [a-z][a-z0-9_-]{2,31}")
+            raise bad("handle must match [a-z][a-z0-9]*(-[a-z0-9]+)*, 3-32 characters")
         if urlsplit(r["home"]).path:
             raise bad("a handle needs a home without a path (it resolves at https://host)")
     validate_card(r["card"])

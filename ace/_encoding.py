@@ -21,7 +21,7 @@ MAX_SAFE_INTEGER = (1 << 53) - 1
 ACE_ID_RE = re.compile(r"ace:sha256:[0-9a-f]{64}")
 MESSAGE_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
-HANDLE_RE = re.compile(r"[a-z][a-z0-9_-]{2,31}")
+HANDLE_RE = re.compile(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*")  # and 3..32 characters (is_handle)
 NAMESPACED_ID_RE = re.compile(r"[a-z][a-z0-9+.-]*:[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+")
 CAIP10_RE = re.compile(r"[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}:[-.%a-zA-Z0-9]{1,128}")
 CAIP19_RE = re.compile(r"[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}/[-a-z0-9]{3,8}:[-.%a-zA-Z0-9]{1,128}")
@@ -60,7 +60,7 @@ def is_caip10_account(value: object) -> bool:
 
 
 def is_handle(value: object) -> bool:
-    return isinstance(value, str) and HANDLE_RE.fullmatch(value) is not None
+    return isinstance(value, str) and 3 <= len(value) <= 32 and HANDLE_RE.fullmatch(value) is not None
 
 
 def is_namespaced_id(value: object) -> bool:

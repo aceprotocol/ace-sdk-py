@@ -56,7 +56,8 @@ from .rules import ProfileRules
 from .store import ACEStore, load_record, write_record
 
 _SELF_KEY = "network/self.json"
-_HANDLE_RE = re.compile("@(" + HANDLE_RE.pattern + r")@([a-z0-9.-]+(?::[0-9]+)?)")
+_HANDLE_RE = re.compile("@?(" + HANDLE_RE.pattern + r")@([a-z0-9.-]+(?::[0-9]+)?)")
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 
 
 def _incoming_key(ace_id: str) -> str:
@@ -384,13 +385,14 @@ class NetworkClient:
     def discover(
         self,
         *,
+        tag: str | None = None,
         profile: str | None = None,
         cursor: str | None = None,
         limit: int = DEFAULT_PAGE_LIMIT,
-    ) -> tuple[list[VerifiedAgent], str | None]:
-        """The public directory of our relay: identities whose card record is listed (verified,
-        not pinned)."""
-        return self.relay.directory(profile=profile, cursor=cursor, limit=limit)
+    ) -> tuple[list[VerifiedCard], str | None]:
+        """The public directory of our relay: listed card records (verified, not pinned).
+        ``lookup`` an entry's ACE ID to obtain its descriptor before connecting."""
+        return self.relay.directory(tag=tag, profile=profile, cursor=cursor, limit=limit)
 
     def import_agent(self, source: dict | VerifiedAgent) -> VerifiedAgent:
         """Verify and pin a PublishedAgent (e.g. shared out of band). Does not admit it."""
@@ -559,7 +561,8 @@ class NetworkClient:
         )
 
     def _card_by_handle(self, target: object) -> tuple[VerifiedCard, RelayClient, str]:
-        m = _HANDLE_RE.fullmatch(target) if isinstance(target, str) else None
+        # A typed address: the leading @ optional, any ASCII case (04 § Card record, Handles).
+        m = _HANDLE_RE.fullmatch(target.translate(_ASCII_LOWER)) if isinstance(target, str) else None
         if m is None:
             raise ACEError("invalid_argument", "use an ACE ID or @name@relay-host")
         home = urlsplit(self.relay.base_url)

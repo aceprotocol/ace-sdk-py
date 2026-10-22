@@ -102,18 +102,16 @@ def validate_relay_route(value: object, *, allow_loopback: bool = False) -> str:
 
 
 def validate_card(card: object) -> dict:
-    """A card record's closed ``card``: ``{name?, description?, image?, tags?}`` (tag ``hosted``:
-    keys held by a host)."""
-    if type(card) is not dict or not set(card) <= {"name", "description", "image", "tags"}:
-        raise bad("card permits only name, description, image and tags")
+    """A card record's closed ``card``: ``{description?, image?, tags?}`` (tag ``hosted``: keys
+    held by a host)."""
+    if type(card) is not dict or not set(card) <= {"description", "image", "tags"}:
+        raise bad("card permits only description, image and tags")
 
     def text(key: str, lo: int, hi: int) -> None:
         v = card[key]
         if not isinstance(v, str) or not lo <= len(v) <= hi or CONTROL_CHAR_RE.search(v):
             raise bad(f"card.{key} must be {lo}-{hi} characters without control characters")
 
-    if "name" in card:
-        text("name", 1, 64)
     if "description" in card:
         text("description", 0, 256)
     if "image" in card and not is_https_url(card["image"]):

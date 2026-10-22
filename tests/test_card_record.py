@@ -45,7 +45,7 @@ def alice_card(**extra):
     kw = {
         "home": RELAY,
         "handle": "alice",
-        "card": {"name": "Alice"},
+        "card": {"description": "Alice"},
         "pay": [SOL],
         "contact": "open",
         "listed": False,
@@ -113,7 +113,7 @@ def test_rejects_bad_caip10():
 
 def test_rejects_oversized_record():
     _, bundle = alice_card()
-    big = with_record(bundle, card={"name": "Alice", "description": "x" * MAX_CARD_RECORD_BYTES})
+    big = with_record(bundle, card={"description": "x" * MAX_CARD_RECORD_BYTES})
     with raises("invalid_authorization") as info:
         verify_card_bundle(big, now=NOW)
     assert "16384" in info.value.message

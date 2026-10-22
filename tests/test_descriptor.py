@@ -68,9 +68,8 @@ def test_retired_members_are_unknown(p, member):
 @pytest.mark.parametrize(
     "card",
     [
-        {"name": ""},
-        {"name": None},  # absent is fine, null is not a string
-        {"description": None},
+        {"name": "Alice"},  # a display name is application data (04 § Card)
+        {"description": None},  # absent is fine, null is not a string
         {"image": "http://x.example/i.png"},
         {"tags": ["UPPER"]},
         {"extra": 1},
@@ -79,7 +78,7 @@ def test_retired_members_are_unknown(p, member):
 def test_invalid_cards(card):
     with raises("invalid_authorization"):
         validate_card(card)
-    assert validate_card({"name": "Alice", "tags": ["hosted", "-x"]})
+    assert validate_card({"description": "translation", "tags": ["hosted", "-x"]})
 
 
 @pytest.mark.parametrize(

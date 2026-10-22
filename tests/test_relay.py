@@ -98,10 +98,13 @@ def test_descriptor_lookups_directory_and_handles(relay, pair):
     assert c.card(bob.id).contact == "closed" and c.card(bob.id).handle is None
     with raises("unknown_peer"):
         c.handle("nobody")
-    # the directory lists identities whose card record is listed
-    agents, cursor = c.directory()
-    assert [a.ace_id for a in agents] == [alice.id] and cursor is None
+    # the directory lists the card records listed here
+    cards, cursor = c.directory()
+    assert [x.ace_id for x in cards] == [alice.id] and cursor is None
     assert c.directory(profile="ace:commerce:1")[0] == []
+    assert c.directory(tag="nope")[0] == []
+    with raises("invalid_argument"):
+        c.directory(tag="NLP")
     # a relay serving another identity's descriptor is a protocol error
     other = "ace:sha256:" + "1" * 64
     relay.raw_responses[f"/v1/descriptor/{other}"] = (
@@ -307,13 +310,6 @@ def test_contained_objects_at_max_json_depth_pass_inside_wrappers(relay, pair, m
     relay.raw_responses[path] = (200, json.dumps(bad).encode(), JSON)
     with raises("relay_protocol_error"):
         alice.client.descriptor(ok["descriptor"]["aceId"])
-    page = {"agents": [ok], "cursor": None}
-    relay.raw_responses["/v1/descriptors"] = (200, json.dumps(page).encode(), JSON)
-    assert len(alice.client.directory()[0]) == 1
-    page["agents"].append(bad)  # never skipped: a conformant relay refused it on input
-    relay.raw_responses["/v1/descriptors"] = (200, json.dumps(page).encode(), JSON)
-    with raises("relay_protocol_error"):
-        alice.client.directory()
 
     for n, passes in ((32, True), (33, False)):
         packet = json.dumps(_nest(n), separators=(",", ":"))

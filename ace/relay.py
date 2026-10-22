@@ -57,6 +57,7 @@ _RETRY_AFTER_MAX = 9_999_999_999  # ten digits; every use caps the delay far bel
 _CONTROLS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _EOL_RE = re.compile(rb"[\r\n]")
 _WAKE_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{22,512}")
+_TAG_RE = re.compile(r"[a-z0-9-]{1,32}")
 
 _sleep = time.sleep  # patched by tests
 
@@ -383,40 +384,43 @@ class RelayClient:
     def directory(
         self,
         *,
+        tag: str | None = None,
         profile: str | None = None,
         cursor: str | None = None,
         limit: int = DEFAULT_PAGE_LIMIT,
-    ) -> tuple[list[VerifiedAgent], str | None]:
-        """``GET /v1/descriptors``: the public directory (identities whose card record is
-        listed). Each entry is verified on its own: one that fails verification permanently or
-        does not list ``profile`` is skipped; the rest of the page is kept."""
+    ) -> tuple[list[VerifiedCard], str | None]:
+        """``GET /v1/cards``: the public directory (card records listed at this relay). Each entry
+        is verified on its own: one that fails verification permanently, is not listed here or
+        does not carry ``tag`` is skipped; the rest of the page is kept. ``profile`` is the
+        relay's hint: the descriptor obtained before connecting is what counts (07 § Descriptors
+        and cards)."""
         if type(limit) is not int or not 1 <= limit <= MAX_INBOX_PAGE:
             raise ACEError("invalid_argument", f"limit must be 1..{MAX_INBOX_PAGE}")
+        if tag is not None and not (isinstance(tag, str) and _TAG_RE.fullmatch(tag)):
+            raise ACEError("invalid_argument", "tag must match [a-z0-9-]{1,32}")
         page = self._object(
             self._call(
                 "GET",
-                "/v1/descriptors",
-                query={"profile": profile, "cursor": cursor, "limit": limit},
+                "/v1/cards",
+                query={"tag": tag, "profile": profile, "cursor": cursor, "limit": limit},
             ),
-            "descriptors",
+            "directory",
         )
-        agents = page.get("agents")
-        if not isinstance(agents, list) or len(agents) > limit:
-            raise _protocol("invalid descriptor page")
+        cards = page.get("cards")
+        if not isinstance(cards, list) or len(cards) > limit:
+            raise _protocol("invalid directory page")
         out = []
-        for value in agents:
+        for value in cards:
             _contained(value)
             try:
-                a = verify_published_agent(
-                    value, now=self._now(), allow_loopback_relays=self.allow_loopback
-                )
+                c = verify_card_bundle(value, self._now(), allow_loopback_relays=self.allow_loopback)
             except ACEError as exc:
                 if exc.is_transient:
                     raise
                 continue
-            # listing the exact profile ID when one was requested
-            if profile is None or any(p["id"] == profile for p in a.profiles):
-                out.append(a)
+            listed = c.home == self.base_url and c.record["listed"]
+            if listed and (tag is None or tag in c.card.get("tags", ())):
+                out.append(c)
         return out, self._cursor(page)
 
     # --- admission ---

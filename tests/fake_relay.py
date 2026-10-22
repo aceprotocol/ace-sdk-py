@@ -381,18 +381,21 @@ class FakeRelay:
             raise _HTTPError(404, "unknown_peer")
         self._reply(h, 200, c)
 
-    def _get_v1_descriptors(self, h, query, body):
-        agents = [
-            s
+    def _get_v1_cards(self, h, query, body):
+        cards = [
+            (c, s)
             for a in sorted(self.descriptors)
-            if (c := self._card(a)) is not None and c["card"]["listed"] and (s := self._live(a))
+            if (c := self._card(a)) is not None
+            and c["card"]["listed"]
+            and c["card"]["home"] == self.url
+            and (s := self._live(a))
         ]
-        profile = query.get("profile")
-        if profile:
-            agents = [
-                s for s in agents if any(p["id"] == profile for p in s["descriptor"]["profiles"])
-            ]
-        self._reply(h, 200, {"agents": agents[: int(query.get("limit", "20"))], "cursor": None})
+        if tag := query.get("tag"):
+            cards = [(c, s) for c, s in cards if tag in c["card"]["card"].get("tags", [])]
+        if profile := query.get("profile"):
+            cards = [(c, s) for c, s in cards if any(p["id"] == profile for p in s["descriptor"]["profiles"])]
+        page = [c for c, _ in cards[: int(query.get("limit", "20"))]]
+        self._reply(h, 200, {"cards": page, "cursor": None})
 
     def _post_v1_blocks(self, h, query, body):
         ace_id = self._auth(h, "block", query, body)

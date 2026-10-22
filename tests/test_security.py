@@ -286,14 +286,15 @@ def test_registration_timestamp_is_persisted_across_clients(relay):
 
 def test_directory_skips_entries_failing_verification_or_the_query(relay, pair, monkeypatch):
     alice, bob = pair
-    good = alice.publish()
+    good = bob.relay.card(alice.identity.get_ace_id()).bundle
     forged = json.loads(json.dumps(good))
-    forged["descriptor"]["card"] = {"name": "Mallory"}  # changed after signing
-    page = {"agents": [forged, good], "cursor": None}
+    forged["card"]["card"] = {"description": "Mallory"}  # changed after signing
+    unlisted = bob.relay.card(bob.identity.get_ace_id()).bundle  # valid but not listed
+    page = {"cards": [forged, unlisted, good], "cursor": None}
     monkeypatch.setattr(bob.relay, "_call", lambda *a, **k: page)
-    agents, _ = bob.relay.directory()
-    assert [x.ace_id for x in agents] == [alice.identity.get_ace_id()]  # the bad entry is skipped
-    assert bob.relay.directory(profile="ace:commerce:1")[0] == []  # not matching the query
+    cards, _ = bob.relay.directory()
+    assert [x.ace_id for x in cards] == [alice.identity.get_ace_id()]  # the bad entries are skipped
+    assert bob.relay.directory(tag="absent")[0] == []  # not carrying the tag
 
 
 def test_contact_profile_and_errors_are_core():
