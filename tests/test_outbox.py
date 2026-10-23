@@ -2,6 +2,8 @@
 
 import threading
 
+import pytest
+
 from ace import ACEError, Outbox, Profiles, decode_packet
 from ace.limits import OFFLINE_WINDOW_SECONDS
 from ace.outbox import _key, _pending_key, backoff
@@ -51,6 +53,21 @@ def test_failures_back_off_and_expire():
     assert att.result == "failed" and ob.get(mid).next_attempt_at == clock.now + 60
     clock.now += OFFLINE_WINDOW_SECONDS
     assert [x.status for x in ob.flush(down, resolve)] == ["expired"]
+
+
+def test_interrupted_attempt_is_not_an_attempt():
+    clock, a, b, ob = setup()
+    mid = ob.enqueue(b.id, "ace:text:1", {"message": "hi"})
+    before = ob.get(mid)
+
+    def interrupted(p, ag):
+        raise KeyboardInterrupt
+
+    resolve = lambda ace_id, refresh=False: a.peers.agent(ace_id)  # noqa: E731
+    with pytest.raises(KeyboardInterrupt):
+        ob.deliver(mid, interrupted, resolve)
+    assert ob.get(mid) == before  # lease released, attempts / code / schedule untouched
+    assert ob.deliver(mid, lambda p, ag: None, resolve).result == "sent"
 
 
 def test_in_flight_marker_prevents_double_send():

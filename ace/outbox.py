@@ -450,7 +450,8 @@ class Outbox:
                 return Attempt(message_id, "skipped", "pending")
             if not force and now < e.next_attempt_at:
                 return Attempt(message_id, "skipped", "pending")
-            e = e.replace(in_flight_at=now, first_attempt_at=e.first_attempt_at or now)
+            first_attempt_at = e.first_attempt_at
+            e = e.replace(in_flight_at=now, first_attempt_at=first_attempt_at or now)
             self._save(e)
         error: ACEError | None = None
         used = e.prekey
@@ -509,6 +510,14 @@ class Outbox:
             error = exc
         except Exception as exc:  # a host transport bug is retried like an outage
             error = ACEError("relay_unavailable", f"transport failed: {type(exc).__name__}: {exc}")
+        except BaseException:
+            # An interrupt (the host stopping) is not an attempt: release the lease, leave the
+            # entry as it was
+            with self._store.lock("outbox"):
+                cur = self._load(message_id)
+                if cur is not None:
+                    self._save(cur.replace(in_flight_at=None, first_attempt_at=first_attempt_at))
+            raise
         with self._store.lock("outbox"):
             cur = self._load(message_id)
             if cur is None:
