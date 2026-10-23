@@ -34,7 +34,7 @@ from ._relay_url import is_canonical_relay_url
 from .card_record import Contact, VerifiedCard, create_card_record, verify_card_bundle
 from .descriptor import VerifiedAgent, create_published_agent, verify_published_agent
 from .errors import ACEError
-from .identity import ACEIdentity, check_usable
+from .identity import ACEIdentity
 from .inbox import Inbox, ReceiveOutcome, Reply
 from .invitation import verify_invitation
 from .kel import event_bytes
@@ -210,7 +210,13 @@ class NetworkClient:
         self._user_on_receipt = on_receipt
         self.peers = PeerStore(store, clock=clock, allow_loopback_relays=relay.allow_loopback)
         self.outbox = Outbox(
-            identity, store, self.profiles, rules=rules, resolve_peer=self._known, clock=clock
+            identity,
+            store,
+            self.profiles,
+            rules=rules,
+            resolve_peer=self._known,
+            admission=self._admission,
+            clock=clock,
         )
         self.inbox: Inbox | None = None
 
@@ -670,11 +676,17 @@ class NetworkClient:
                 error = exc
         raise error or ACEError("unknown_peer", "no relay route")
 
-    def _attempt(self, packet: dict, agent: VerifiedAgent) -> None:
+    def _attempt(
+        self, packet: dict, agent: VerifiedAgent, *, admission: Admission | None = None
+    ) -> None:
         """The Outbox transport: every attempt carries the newest permit the peer issued us that
-        is valid under its current pin, else ``not_permitted`` (retried on the schedule while a
-        renewal or refresh arrives); never the stranger path (06 § Outbox step 3)."""
-        permit = self._their_permit(agent.ace_id)
+        is valid under its current pin (the ``admission`` proof, when the packet carries one),
+        else ``not_permitted`` (retried on the schedule while a renewal or refresh arrives);
+        never the stranger path (06 § Outbox step 3). A fresh reply permit in ``admission``
+        counts as issued once the packet was sent."""
+        permit = (
+            self._their_permit(agent.ace_id) if admission is None else admission.content["proof"]
+        )
         if permit is None:
             raise _no_valid_permit()
         try:
@@ -684,6 +696,11 @@ class NetworkClient:
             if exc.code == "not_permitted":
                 raise _no_valid_permit() from None
             raise
+        if admission is not None and admission.fresh:
+            try:
+                self.peers.note_issued(agent.ace_id, admission.content["permit"])
+            except ACEError:
+                pass  # not recorded: the next packet to the peer carries a fresh permit
 
     def _send_contact(self, agent: VerifiedAgent, body: dict, permit: dict | None = None) -> str:
         """A contact packet: one attempt, never queued. A permit it carries counts as issued
@@ -712,59 +729,42 @@ class NetworkClient:
         if self._their_permit(to) is None:
             raise _no_valid_permit()
         mid = self.outbox.enqueue(to, type_, body, thread_id=thread_id)
-        self.outbox.deliver(mid, self._attempt, self._resolve, admission=self._admission)
+        self.outbox.deliver(mid, self._attempt, self._resolve)
         return mid
 
     def flush(self) -> list[Attempt]:
         """Attempt every due Outbox entry."""
-        return self.outbox.flush(self._attempt, self._resolve, admission=self._admission)
+        return self.outbox.flush(self._attempt, self._resolve)
 
     def attempt(self, message_id: str) -> OutboxEntry | None:
         """One attempt of ``message_id`` now, due or not (TS ``outbox.attempt``): ``None`` for an
         unknown message, a final entry as is, a pending one after the attempt."""
         if not is_message_id(message_id) or self.outbox.get(message_id) is None:
             return None
-        self.outbox.deliver(
-            message_id, self._attempt, self._resolve, force=True, admission=self._admission
-        )
+        self.outbox.deliver(message_id, self._attempt, self._resolve, force=True)
         return self.outbox.get(message_id)
 
     def _admission(self, to: str, now: int) -> Admission | None:
         """What an Outbox retry to a peer we hold as ``admitted`` carries (05 § Admission
         recovery), so a peer that lost its admission table recovers us without any lookup: as
-        ``proof`` the permit the attempt presents to the relay; a reply permit: the newest one we
-        issued the peer while no renewal is due and it verifies under our current KEL, else a
+        ``proof`` the permit the attempt presents to the relay (``_attempt`` presents exactly
+        it); a reply permit: the newest one we issued the peer while no renewal is due, else a
         fresh one, recorded as issued once the attempt was sent; and as ``source`` our current
-        PublishedAgent."""
+        PublishedAgent. None (the attempt goes without) when any is missing."""
         if self.peers.status(to) != "admitted":
             return None
-        proof = self._their_permit(to)
-        if proof is None:
-            return None  # the attempt fails not_permitted
-        source = self._own_source(now)
-        if source is None:
-            return None  # the attempt still goes, without admission
-        permit = self.peers.reusable_permit(to, self.identity.get_signing_seq(), now)
-        if permit is not None:
-            try:
-                verify_permit(permit, check_usable(self.identity, now), to, now=now)
-                return Admission({"proof": proof, "permit": permit, "source": source})
-            except ACEError:
-                pass
-        fresh = create_permit(self.identity, to, now=now)
-        return Admission(
-            {"proof": proof, "permit": fresh, "source": source},
-            lambda: self.peers.note_issued(to, fresh),
-        )
+        proof, source = self._their_permit(to), self._own_source(now)
+        if proof is None or source is None:
+            return None
+        permit = self.peers.reply_permit(to, self.identity.get_signing_seq(), now)
+        fresh = permit is None
+        if fresh:
+            permit = create_permit(self.identity, to, now=now)
+        return Admission({"proof": proof, "permit": permit, "source": source}, fresh)
 
     def _own_source(self, now: int) -> dict | None:
-        """Our current PublishedAgent for an ``admission``: ``publish`` (it posts only when due);
-        if that fails, the last published one while unexpired at ``now``; else None. It never
-        fails a retry: an unreachable home relay must not stop retries to peers' relays."""
-        try:
-            return self.publish()
-        except ACEError:
-            pass
+        """Our last published PublishedAgent while unexpired at ``now`` (upkeep keeps it fresh),
+        else None. Local only: obtaining it never fails or blocks a retry."""
         try:
             rec = load_record(self.store, _SELF_KEY)
         except ACEError:
@@ -1108,7 +1108,7 @@ class NetworkClient:
         for rec in self.peers.list():
             issued = rec.issued_permit
             if self.peers.status(rec.ace_id) != "admitted" or (
-                issued is not None and issued["seq"] == seq
+                issued is not None and issued["signature"]["seq"] == seq
             ):
                 continue
             try:

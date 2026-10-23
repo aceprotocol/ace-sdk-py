@@ -54,6 +54,7 @@ from .limits import (
     TIMESTAMP_WINDOW_SECONDS,
 )
 from .prekeys import Prekey, PrekeyVault, prekey_id
+from .profiles import CONTACT_TYPE, RECEIPT_TYPE
 
 PACKET_VERSION = "1"
 _LABEL = "ace.v1.packet"
@@ -212,9 +213,13 @@ def encode_content(
         raise ACEError("invalid_argument", "schemaDigest must be 64 lowercase hex")
     if thread_id is not None and not is_thread_id(thread_id):
         raise ACEError("invalid_argument", "threadId must be 1..256 characters without controls")
-    if admission is not None and not _is_admission(admission):
+    if admission is not None and (
+        not _is_admission(admission) or type_ in (RECEIPT_TYPE, CONTACT_TYPE)
+    ):
         raise ACEError(
-            "invalid_argument", "admission must be {proof, permit, source} of three objects"
+            "invalid_argument",
+            "admission must be {proof, permit, source} of three objects, never on a receipt or "
+            "contact",
         )
     if type(body) is not dict:
         raise ACEError("invalid_body", "body must be a JSON object")
@@ -232,7 +237,8 @@ def encode_content(
 
 def decode_content(raw: bytes) -> dict:
     """``{type, schemaDigest, threadId?, body, admission?}`` from decrypted bytes, or
-    ``invalid_body``. The receiver strips ``admission`` before anything reaches the host."""
+    ``invalid_body`` (also for ``admission`` on a receipt or contact). The receiver strips
+    ``admission`` before anything reaches the host."""
     c = loads_object(raw, "invalid_body", "private content")
     if (
         not {"type", "schemaDigest", "body"}
@@ -242,7 +248,10 @@ def decode_content(raw: bytes) -> dict:
         or not is_sha256_hex(c["schemaDigest"])
         or type(c["body"]) is not dict
         or ("threadId" in c and not is_thread_id(c["threadId"]))
-        or ("admission" in c and not _is_admission(c["admission"]))
+        or (
+            "admission" in c
+            and (not _is_admission(c["admission"]) or c["type"] in (RECEIPT_TYPE, CONTACT_TYPE))
+        )
     ):
         raise ACEError("invalid_body", "invalid private content")
     return c

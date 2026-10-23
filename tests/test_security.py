@@ -413,7 +413,7 @@ def test_a_kel_adopted_elsewhere_makes_the_cached_descriptor_stale(relay, pair):
     # bob has not republished: refreshing fails, and the stale descriptor is never used
     posted = []
     real_post = alice._post
-    alice._post = lambda packet, agent, *rest: (
+    alice._post = lambda packet, agent, *rest, **_: (  # a retry also passes ``admission``
         posted.append(packet),
         real_post(packet, agent, *rest),
     )

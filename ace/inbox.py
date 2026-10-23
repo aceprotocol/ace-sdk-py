@@ -36,20 +36,12 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
-from ._encoding import (
-    canonical_state_bytes,
-    is_message_id,
-    is_sha256_hex,
-    loads_json,
-    sha256_hex,
-    unix_now,
-    wire_int,
-)
+from ._encoding import is_message_id, is_sha256_hex, loads_json, sha256_hex, unix_now, wire_int
 from .card_record import Contact
-from .descriptor import check_stranger_source, verify_published_agent
+from .descriptor import VerifiedAgent, check_stranger_source, verify_published_agent
 from .errors import ACEError, is_outcome_code
-from .identity import ACEIdentity
-from .kel import KelState, tail_time, verify_kel
+from .identity import ACEIdentity, check_usable
+from .kel import KelState
 from .limits import (
     DEFAULT_REPLAY_CAPACITY,
     MAX_FETCH_ATTEMPTS,
@@ -148,11 +140,15 @@ def _attempts_key(fp: str) -> str:
     return f"inbox/attempts/{fp}.json"
 
 
-def _no_admission(content: dict, admission: dict | None) -> None:
-    """Receipts and contact packets carry no ``admission`` (03 § Private content):
-    ``invalid_body``, which drops them."""
-    if admission is not None and content["type"] in (RECEIPT_TYPE, CONTACT_TYPE):
-        raise ACEError("invalid_body", "receipts and contact packets carry no admission")
+def _core_type(content: dict | None, plaintext: bytes) -> bool:
+    """Whether content names a receipt or contact type, even content that failed to decode
+    (e.g. one carrying ``admission``): such packets are never receipted, only dropped."""
+    if content is None:
+        try:
+            content = loads_json(plaintext)
+        except ValueError:
+            return False
+    return isinstance(content, dict) and content.get("type") in (RECEIPT_TYPE, CONTACT_TYPE)
 
 
 class _Drop(Exception):
@@ -218,7 +214,6 @@ class Inbox:
         self._clock = clock
         self._mutex = threading.RLock()
         self._refreshed: dict[str, int] = {}
-        self._own: tuple[bytes, KelState] | None = None  # our verified KEL, keyed by its bytes
         self._since_snapshot: set[str] = set()
         self._dirty = 0
         self._closed = False
@@ -483,15 +478,14 @@ class Inbox:
         c = None
         try:
             c = decode_content(plaintext)
-            admission = c.pop("admission", None)  # never handed over or journaled
-            _no_admission(c, admission)
             self._profiles.validate(c["type"], c["schemaDigest"], c["body"])
         except ACEError as exc:
             if exc.category != "permanent":
                 raise
-            if c is not None and c["type"] in (RECEIPT_TYPE, CONTACT_TYPE):
+            if _core_type(c, plaintext):
                 raise _Drop(exc) from None  # receipts and contacts are never receipted
             return self._reject(p, exc, now)
+        admission = c.pop("admission", None)  # never handed over or journaled
         if admission is not None:
             # 05 § Admission recovery 4: an authenticated sender's proof is ignored; its reply
             # permit is held like a receipt renewal, an invalid one ignored
@@ -513,39 +507,34 @@ class Inbox:
         return self._commit(m, now, receipt=True)
 
     def _sender_state(self, p: Packet, state: KelState, now: int) -> KelState | None:
-        """Step 3: the pinned KEL; one refresh (``_look_up``) when the packet names a newer
-        delegation. Suppressed or transient refresh: retry. When no refresh is wired, the refresh
-        fails permanently or it still does not reach the packet's delegation, ``None``: the
-        packet continues only as a contact candidate authenticated by its ``source`` against the
-        pin (e.g. a peer after a signing-key change that has not republished its descriptor
-        yet)."""
+        """Step 3: the pinned KEL; one refresh per sender per ``PIN_REFRESH_INTERVAL_SECONDS``
+        when the packet names a newer delegation, whatever its result (a transient failure does
+        not open the next one early: a forged packet must not drive a refresh per fetch).
+        Suppressed or transient refresh: retry. When
+        no refresh is wired, the refresh fails permanently or it still does not reach the
+        packet's delegation, ``None``: the packet continues only as a contact candidate
+        authenticated by its ``source`` against the pin (e.g. a peer after a signing-key change
+        that has not republished its descriptor yet)."""
         if state.signing is not None and p.signature["seq"] <= state.signing.seq:
             return state
-        if self._refresh is None or self._look_up(p.from_id, now) is not None:
+        if self._refresh is None:
+            return None
+        for sender, at in list(self._refreshed.items()):
+            if now - at >= PIN_REFRESH_INTERVAL_SECONDS:
+                del self._refreshed[sender]
+        if p.from_id in self._refreshed:
+            raise _Retry(ACEError("relay_unavailable", "sender refresh suppressed; retry later"))
+        self._refreshed[p.from_id] = now
+        try:
+            self._refresh(p.from_id)
+        except ACEError as exc:
+            if exc.is_transient:
+                raise _Retry(exc) from None
             return None
         fresh = self._peers.state(p.from_id) or state
         if fresh.signing is None or p.signature["seq"] > fresh.signing.seq:
             return None
         return fresh
-
-    def _look_up(self, sender: str, now: int) -> ACEError | None:
-        """One lookup of ``sender``'s descriptor through ``refresh`` (which pins it), at most once
-        per sender per ``PIN_REFRESH_INTERVAL_SECONDS`` whatever its result (a transient failure
-        does not open the next one early: a forged packet must not drive a lookup per fetch).
-        Suppressed or transient: retry. Returns the permanent failure, None on success."""
-        for s, at in list(self._refreshed.items()):
-            if now - at >= PIN_REFRESH_INTERVAL_SECONDS:
-                del self._refreshed[s]
-        if sender in self._refreshed:
-            raise _Retry(ACEError("relay_unavailable", "sender refresh suppressed; retry later"))
-        self._refreshed[sender] = now
-        try:
-            self._refresh(sender)  # type: ignore[misc]
-        except ACEError as exc:
-            if exc.is_transient:
-                raise _Retry(exc) from None
-            return exc
-        return None
 
     def _unpinned(self, p: Packet, now: int, *, stranger: bool) -> ReceiveOutcome:
         """A sender we cannot authenticate from a pin (a stranger, or a ``pending`` or
@@ -571,11 +560,7 @@ class Inbox:
         if admission is None:
             return False
         try:
-            kel = self._identity.get_kel()
-            raw = canonical_state_bytes(kel)
-            if self._own is None or self._own[0] != raw:
-                self._own = (raw, verify_kel(kel, tail_time(kel, now)))
-            verify_permit(admission["proof"], self._own[1], sender, now=now)
+            verify_permit(admission["proof"], check_usable(self._identity, now), sender, now=now)
         except ACEError:
             return False
         return True
@@ -593,44 +578,26 @@ class Inbox:
         admission = c.pop("admission")  # never handed over or journaled
         invalid = None
         try:
-            _no_admission(c, admission)
             self._profiles.validate(c["type"], c["schemaDigest"], c["body"])
         except ACEError as exc:
             if exc.category != "permanent":
                 raise
-            if exc.code != "invalid_body" or c["type"] in (RECEIPT_TYPE, CONTACT_TYPE):
+            if exc.code != "invalid_body":
                 raise _Drop(exc) from None  # step 7, before the sender is recorded
             invalid = exc  # step 8: rejected once the sender is recorded
         try:
-            source = admission["source"]
-            agent = verify_published_agent(
-                source,
-                now=now,
-                allow_loopback_relays=self._peers.allow_loopback_relays,
-                pinned=self._peers.state(p.from_id),  # never an older log than the one pinned
-                delegation_pins=self._peers.delegation_pins(source),
-            )
-            if agent.ace_id != p.from_id:
-                raise ACEError(
-                    "invalid_authorization", "admission source does not match the sender"
-                )
-            verify_packet(p, agent.state, now)
-            try:
-                permit = verify_permit(admission["permit"], agent.state, self._me, now=now)
-            except ACEError:
-                raise ACEError(
-                    "invalid_authorization", "the admission permit is not valid"
-                ) from None
+            agent = self._verify_source(p, admission["source"], admission["permit"], now)
         except ACEError as exc:
             if exc.category != "permanent":
                 raise
             raise _Drop(exc) from None
+        permit = admission["permit"]
         # Recorded under lock `peers`, where a block decided meanwhile wins; only then is the source
         # pinned (as a contact's, after its checks), so a blocked sender changes no pin.
         if not self._peers.restore(p.from_id, admission["proof"]):
             raise _Drop(ACEError("not_permitted", "sender is blocked"))
         try:
-            state = self._peers.adopt(source, now).state
+            state = self._peers.adopt(agent, now, checked=True).state
         except ACEError as exc:
             if exc.category != "permanent":
                 raise
@@ -639,6 +606,27 @@ class Inbox:
         if invalid is not None:
             return self._reject(p, invalid, now)
         return self._commit(PrivateMessage.of(p, c), now, receipt=True)
+
+    def _verify_source(
+        self, p: Packet, source: object, permit: object | None, now: int
+    ) -> VerifiedAgent:
+        """A sender's PublishedAgent carried in its packet (a contact's ``source``, an
+        ``admission``'s): it verifies under our pin rules (never an older log than the one
+        pinned) and names ``from``; the packet signature verifies under its KEL, and so does
+        ``permit`` (when given) from the sender to us. Nothing is pinned here."""
+        agent = verify_published_agent(
+            source,
+            now=now,
+            allow_loopback_relays=self._peers.allow_loopback_relays,
+            pinned=self._peers.state(p.from_id),
+            delegation_pins=self._peers.delegation_pins(source),
+        )
+        if agent.ace_id != p.from_id:
+            raise ACEError("invalid_authorization", "source does not match the sender")
+        verify_packet(p, agent.state, now)
+        if permit is not None:
+            verify_permit(permit, agent.state, self._me, now=now)
+        return agent
 
     def _hold(self, permit: dict, state: KelState, now: int) -> None:
         """Keep a verified permit from the sender (newest wins) unless it is blocked meanwhile."""
@@ -659,7 +647,6 @@ class Inbox:
             c = content
             if c["type"] != CONTACT_TYPE:
                 raise ACEError("not_permitted", "an unpinned sender may only send contact packets")
-            _no_admission(c, c.get("admission"))
             self._profiles.validate(c["type"], c["schemaDigest"], c["body"])
             m = PrivateMessage.of(p, c)
             if stranger and m.body["kind"] != "request":
@@ -681,23 +668,12 @@ class Inbox:
         pins a known peer's source KEL after dedupe and the rules (06 § Contact candidates)."""
         if len(m.body["note"].encode("utf-8")) > MAX_NOTE_BYTES:
             raise ACEError("invalid_body", "contact note exceeds 512 bytes")
-        agent = verify_published_agent(
-            m.body["source"],
-            now=now,
-            allow_loopback_relays=self._peers.allow_loopback_relays,
-            pinned=self._peers.state(p.from_id),  # never trust an older log than the one pinned
-            delegation_pins=self._peers.delegation_pins(m.body["source"]),
-        )
-        if agent.ace_id != p.from_id:
-            raise ACEError("invalid_authorization", "contact source does not match the sender")
-        verify_packet(p, agent.state, now)
         kind = m.body["kind"]
         if (kind == "rejected") == ("permit" in m.body):
             raise ACEError(
                 "invalid_authorization", "request/accepted carry a reply permit, rejected none"
             )
-        if "permit" in m.body:
-            verify_permit(m.body["permit"], agent.state, self._me, now=now)
+        agent = self._verify_source(p, m.body["source"], m.body.get("permit"), now)
         if kind != "rejected" and not any(
             e["id"] == m.body["profile"] and self._profiles.supports(e) for e in agent.profiles
         ):
@@ -728,9 +704,7 @@ class Inbox:
         except ACEError as exc:
             raise _Drop(exc) from None
         if permit is not None:
-            self._peers.save_permit(
-                permit, state, self._me, now, when=lambda r: r is not None and r.status != "blocked"
-            )
+            self._hold(permit, state, now)
         entry = None
         if self._outbox is not None:
             entry = self._outbox.settle(
@@ -904,8 +878,8 @@ class Inbox:
             body["prekey"] = prekey
         seq = self._identity.get_signing_seq()
         permit = None
-        if self._peers.status(to) in ("pending", "admitted") and self._peers.renewal_due(
-            to, seq, now
+        if self._peers.status(to) in ("pending", "admitted") and (
+            self._peers.reply_permit(to, seq, now) is None
         ):
             permit = body["permit"] = create_permit(self._identity, to, now=now)
         plaintext = encode_content(RECEIPT_TYPE, CORE.messages[RECEIPT_TYPE].digest, body)

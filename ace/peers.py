@@ -31,7 +31,7 @@ class PeerRecord:
     agent: dict | None
     status: str | None  # None (stranger), "pending", "admitted", "blocked"
     held_permit: dict | None
-    issued_permit: dict | None  # {expiresAt, seq, permit}: the newest permit we sent the peer
+    issued_permit: dict | None  # the newest permit we sent the peer
     profile: str | None
     updated_at: int | None = None  # when ``status`` was last set (a pending entry's TTL)
     # Whether a live descriptor served by a relay vouched for the pinned KEL: False once anything
@@ -88,9 +88,11 @@ def _record(d: dict, key: str) -> PeerRecord:
                 r.issued_permit is not None
                 and (
                     not isinstance(r.issued_permit, dict)
+                    or r.issued_permit.get("subject") != r.ace_id
+                    or wire_int(r.issued_permit.get("issuedAt")) is None
                     or wire_int(r.issued_permit.get("expiresAt")) is None
-                    or wire_int(r.issued_permit.get("seq")) is None
-                    or not isinstance(r.issued_permit.get("permit"), dict)
+                    or not isinstance(r.issued_permit.get("signature"), dict)
+                    or wire_int(r.issued_permit["signature"].get("seq")) is None
                 )
             )
         ):
@@ -98,15 +100,6 @@ def _record(d: dict, key: str) -> PeerRecord:
     except (KeyError, TypeError, ValueError) as exc:
         raise ACEError("storage_failed", f"{key}: invalid peer record ({exc})") from None
     return r
-
-
-def _issued(permit: dict) -> dict:
-    """The ``issuedPermit`` record of a permit we issued: ``{expiresAt, seq, permit}``."""
-    return {
-        "expiresAt": permit["expiresAt"],
-        "seq": permit["signature"]["seq"],
-        "permit": copy.deepcopy(permit),
-    }
 
 
 class PeerStore:
@@ -209,7 +202,12 @@ class PeerStore:
         return pins
 
     def adopt(
-        self, agent: VerifiedAgent | dict, now: int | None = None, *, live: bool = False
+        self,
+        agent: VerifiedAgent | dict,
+        now: int | None = None,
+        *,
+        live: bool = False,
+        checked: bool = False,
     ) -> VerifiedAgent:
         """Pin the agent's KEL (fork rules) and its descriptor. ``live``: a relay served it
         (``kel_live`` when the pin is its own KEL); otherwise a pin it moves is not ``kel_live``.
@@ -219,7 +217,9 @@ class PeerStore:
         when its ``issuedAt`` is newer (or equal with identical claims); an older one is ignored
         and the pinned agent returned, unless the subject's KEL state moved on since the cached one
         was verified: then it is replaced unconditionally (a descriptor signed by a superseded key
-        can never outlive the key change). Unsigned metadata is never merged."""
+        can never outlive the key change). Unsigned metadata is never merged. ``checked``: the
+        caller verified ``agent`` (a VerifiedAgent) under our pins at ``now``; it is not verified
+        again while the pin has not moved past its KEL."""
         t = self._now() if now is None else now
         source = agent.source if isinstance(agent, VerifiedAgent) else agent
         with self._store.lock("peers"):
@@ -232,13 +232,20 @@ class PeerStore:
             )
             rec = None if ace_id is None else self.get(ace_id)
             pinned = None if rec is None or rec.kel is None else self._verify(rec.kel)
-            verified = verify_published_agent(
-                source,
-                now=t,
-                allow_loopback_relays=self.allow_loopback_relays,
-                pinned=pinned,
-                delegation_pins=self.delegation_pins(source),
-            )
+            if (
+                checked
+                and isinstance(agent, VerifiedAgent)
+                and reconcile_kel(pinned, agent.state)[0].last_hash == agent.state.last_hash
+            ):
+                verified = agent
+            else:
+                verified = verify_published_agent(
+                    source,
+                    now=t,
+                    allow_loopback_relays=self.allow_loopback_relays,
+                    pinned=pinned,
+                    delegation_pins=self.delegation_pins(source),
+                )
             state = verified.state
             kel = list(state.events)
             # A relay's descriptor vouches only for its own KEL, not for a pin that has moved past
@@ -396,8 +403,8 @@ class PeerStore:
             if rec is None or rec.status != "admitted":
                 changes.update(status="admitted", updated_at=self._now())
             old = None if rec is None else rec.issued_permit
-            if old is None or old["permit"]["issuedAt"] < proof["issuedAt"]:
-                changes["issued_permit"] = _issued(proof)
+            if old is None or old["issuedAt"] < proof["issuedAt"]:
+                changes["issued_permit"] = copy.deepcopy(proof)
             if changes:
                 self._update(ace_id, **changes)
             return True
@@ -474,25 +481,22 @@ class PeerStore:
         """Record ``permit`` as the newest one the peer holds from us, once the packet carrying
         it was sent (a failed send leaves the peer due for a fresh one)."""
         with self._store.lock("peers"):
-            self._update(subject, issued_permit=_issued(permit))
+            self._update(subject, issued_permit=copy.deepcopy(permit))
 
     def issued(self, subject: str) -> dict | None:
+        """The newest permit we issued ``subject``."""
         rec = self.get(subject)
-        return None if rec is None else rec.issued_permit
+        return None if rec is None else copy.deepcopy(rec.issued_permit)
 
-    def renewal_due(self, subject: str, seq: int, now: int) -> bool:
-        """Whether a packet to ``subject`` carries a fresh permit (05 § Renewal): we issued it
-        none, or the newest has less than ``PERMIT_RENEWAL_SECONDS`` left or predates our current
-        delegation ``seq``."""
-        issued = self.issued(subject)
-        return (
-            issued is None
-            or issued["expiresAt"] - now < PERMIT_RENEWAL_SECONDS
-            or issued["seq"] != seq
-        )
-
-    def reusable_permit(self, subject: str, seq: int, now: int) -> dict | None:
-        """The newest permit we issued ``subject`` while no renewal is due, else None."""
-        if self.renewal_due(subject, seq, now):
+    def reply_permit(self, subject: str, seq: int, now: int) -> dict | None:
+        """The newest permit we issued ``subject`` while it is signed under our current
+        delegation ``seq`` with at least ``PERMIT_RENEWAL_SECONDS`` left (it is our own, so it
+        is not verified again); None when a fresh one is due (05 § Renewal)."""
+        p = self.issued(subject)
+        if (
+            p is None
+            or p["signature"]["seq"] != seq
+            or p["expiresAt"] - now < PERMIT_RENEWAL_SECONDS
+        ):
             return None
-        return copy.deepcopy(self.issued(subject)["permit"])  # type: ignore[index]
+        return p

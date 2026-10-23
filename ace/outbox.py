@@ -14,8 +14,8 @@ receipt, expiry or abandonment releases the thread without any state change (a l
 ``delivered`` receipt for an expired entry still commits).
 
 Every attempt after the first refreshes the recipient's descriptor (it may have lost its prekeys
-with its state) and, through the ``admission`` hook, may add ``admission`` to that attempt's
-content (05 § Admission recovery); it is never stored in the entry.
+with its state) and, through the ``admission`` hook given at construction, may add ``admission``
+to that attempt's content (05 § Admission recovery); it is never stored in the entry.
 
 Settled entries are kept until ``prune`` (``get(id).status`` reports the outcome), so retries
 scan a pending index (``outbox-pending/``), not the whole history. The index is a superset of
@@ -52,21 +52,22 @@ from .store import ACEStore, load_record, write_record
 IN_FLIGHT_TIMEOUT_SECONDS = 120
 
 Status = Literal["pending", "delivered", "rejected", "expired"]
-#: ``transport(packet, recipient_agent)`` sends one packet; ``resolve(ace_id, refresh)`` returns
-#: the recipient's current ``VerifiedAgent`` (refreshing an expired descriptor, or always when
+#: ``transport(packet, recipient_agent)`` sends one packet, called with ``admission=`` (the
+#: ``Admission`` the packet carries) when there is one; ``resolve(ace_id, refresh)`` returns the
+#: recipient's current ``VerifiedAgent`` (refreshing an expired descriptor, or always when
 #: ``refresh``).
-Transport = Callable[[dict, Any], None]
+Transport = Callable[..., None]
 Resolver = Callable[[str, bool], Any]
 
 
 @dataclass(frozen=True)
 class Admission:
     """What a retry adds to its content (05 § Admission recovery): ``content`` is
-    ``{proof, permit, source}``; ``sent()`` runs once the attempt was sent (it records a fresh reply
-    permit as issued)."""
+    ``{proof, permit, source}``. The transport presents ``proof`` to the relay and, when
+    ``fresh``, records the reply permit as issued once the packet was sent."""
 
     content: dict
-    sent: Callable[[], None] = lambda: None
+    fresh: bool = False
 
 
 #: ``admission(to, now)``: the ``Admission`` for a retry to ``to``, or None to send without.
@@ -196,11 +197,13 @@ class Outbox:
         *,
         rules: list[ProfileRules] | tuple[ProfileRules, ...] = (),
         resolve_peer: Callable[[str], Any] | None = None,
+        admission: AdmissionHook | None = None,
         clock: Callable[[], int] | None = None,
     ) -> None:
         """``resolve_peer(to)`` ensures a descriptor for ``to`` is held or resolvable; ``enqueue``
         calls it before storing anything (permanent failure: ``unknown_peer``; transient:
-        re-raised)."""
+        re-raised). ``admission(to, now)``: what an attempt after the first adds to its content
+        (05 § Admission recovery)."""
         if not isinstance(profiles, Profiles):
             raise ACEError("invalid_argument", "profiles must be a Profiles")
         self._identity = identity
@@ -208,6 +211,7 @@ class Outbox:
         self._profiles = profiles
         self._rules = check_rules(list(rules))
         self._resolve_peer = resolve_peer
+        self._admission = admission
         self._clock = clock
 
     def _now(self) -> int:
@@ -427,11 +431,10 @@ class Outbox:
         resolve: Resolver,
         *,
         force: bool = False,
-        admission: AdmissionHook | None = None,
     ) -> Attempt:
         """One attempt now (when due, or ``force``): resolve the recipient, encrypt to its current
         prekey, sign with a fresh timestamp and hand the packet to ``transport``. An attempt
-        after the first refreshes the descriptor and adds what ``admission`` returns to the
+        after the first refreshes the descriptor and adds the ``admission`` hook's result to the
         content, unless that would exceed ``MAX_PLAINTEXT_BYTES`` (05 § Admission recovery)."""
         now = self._now()
         with self._store.lock("outbox"):
@@ -454,8 +457,9 @@ class Outbox:
         retry = e.attempts > 0
         extra: Admission | None = None
         try:
-            # 06 § Outbox step 1: a retry refreshes any cached descriptor; if that fails, a cached one
-            # still unexpired and bound to the pins is used (an `unknown_prekey` refresh never falls back)
+            # 06 § Outbox step 1: a retry refreshes any cached descriptor; if that fails, a cached
+            # one still unexpired and bound to the pins is used (an `unknown_prekey` refresh never
+            # falls back)
             if retry and not e.refresh:
                 try:
                     agent = resolve(e.to, True)
@@ -478,21 +482,17 @@ class Outbox:
                 return Attempt(message_id, "skipped", cur.status)
             used = agent.prekey.id
             c = e.content
-            plaintext = encode_content(c["type"], c["schemaDigest"], c["body"], c.get("threadId"))
-            extra = admission(e.to, now) if retry and admission is not None else None
-            if extra is not None:
-                try:
-                    plaintext = encode_content(
-                        c["type"],
-                        c["schemaDigest"],
-                        c["body"],
-                        c.get("threadId"),
-                        admission=extra.content,
-                    )
-                except ACEError as exc:
-                    if exc.code != "limit_exceeded":
-                        raise
-                    extra = None  # too large with it: sent without
+            args = (c["type"], c["schemaDigest"], c["body"], c.get("threadId"))
+            extra = self._admission(e.to, now) if retry and self._admission is not None else None
+            try:
+                plaintext = encode_content(
+                    *args, admission=None if extra is None else extra.content
+                )
+            except ACEError as exc:
+                if extra is None or exc.code != "limit_exceeded":
+                    raise
+                extra = None  # too large with it: sent without
+                plaintext = encode_content(*args)
             packet = create_packet(
                 self._identity,
                 e.to,
@@ -501,16 +501,14 @@ class Outbox:
                 timestamp=now,
                 message_id=e.message_id,
             )
-            transport(packet, agent)
+            if extra is None:
+                transport(packet, agent)
+            else:
+                transport(packet, agent, admission=extra)
         except ACEError as exc:
             error = exc
         except Exception as exc:  # a host transport bug is retried like an outage
             error = ACEError("relay_unavailable", f"transport failed: {type(exc).__name__}: {exc}")
-        if error is None and extra is not None:
-            try:
-                extra.sent()
-            except ACEError:
-                pass  # not recorded: the next packet to the peer carries a fresh permit
         with self._store.lock("outbox"):
             cur = self._load(message_id)
             if cur is None:
@@ -540,17 +538,11 @@ class Outbox:
             return Attempt(message_id, "failed", cur.status, error)
         return Attempt(message_id, "sent", cur.status)
 
-    def flush(
-        self,
-        transport: Transport,
-        resolve: Resolver,
-        *,
-        admission: AdmissionHook | None = None,
-    ) -> list[Attempt]:
+    def flush(self, transport: Transport, resolve: Resolver) -> list[Attempt]:
         """``deliver`` every pending entry that is due."""
         now = self._now()
         return [
-            self.deliver(e.message_id, transport, resolve, admission=admission)
+            self.deliver(e.message_id, transport, resolve)
             for e in self.entries("pending")
             if now >= e.next_attempt_at or e.overdue(now)
         ]

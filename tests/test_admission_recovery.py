@@ -22,6 +22,7 @@ from ace import (
     decrypt_packet,
     encode_content,
 )
+from ace._encoding import canonical_state_bytes
 from ace.limits import MAX_PLAINTEXT_BYTES
 from ace.outbox import Admission, _key
 from ace.store import load_record, write_record
@@ -67,65 +68,78 @@ def test_any_other_admission_shape_is_invalid_body(bad):
             encode_content("ace:text:1", TEXT_DIGEST, {}, admission=bad)
 
 
+def test_admission_on_a_receipt_or_contact_is_invalid():
+    for type_ in ("ace:receipt:1", "ace:contact:1"):
+        content = {"type": type_, "schemaDigest": TEXT_DIGEST, "body": {}, "admission": _adm()}
+        with raises("invalid_body"):
+            decode_content(json.dumps(content).encode())
+        with raises("invalid_argument"):
+            encode_content(type_, TEXT_DIGEST, {}, admission=_adm())
+
+
 # --- Outbox sender (05 § Admission recovery 1, 06 § Outbox) -----------------------------------
 
 
-def _outbox():
+def _outbox(fresh=True):
     clock = Clock()
     a, b = Party(clock), Party(clock)
     a.peers.adopt(b.source())
-    return clock, a, b, Outbox(a.identity, a.store, Profiles(), clock=clock)
+    hooked = []
+
+    def admission(to, now):
+        assert to == b.id
+        hooked.append(now)
+        return Admission(_adm(), fresh)
+
+    ob = Outbox(a.identity, a.store, Profiles(), admission=admission, clock=clock)
+    return clock, a, b, ob, hooked
+
+
+def _content(packet, b):
+    return json.loads(decrypt_packet(decode_packet(packet), b.vault))
 
 
 def test_retries_refresh_the_descriptor_and_carry_admission_never_stored():
-    clock, a, b, ob = _outbox()
+    clock, a, b, ob, hooked = _outbox()
     mid = ob.enqueue(b.id, "ace:text:1", {"message": "hi"})
-    sent, refreshes, noted = [], [], []
+    sent, refreshes = [], []
 
     def resolve(ace_id, refresh=False):
         refreshes.append(refresh)
         return a.peers.agent(ace_id)
 
-    def admission(to, now):
-        assert to == b.id
-        return Admission(_adm(), lambda: noted.append(now))
+    def transport(packet, agent, admission=None):
+        sent.append((packet, admission))
 
-    def content(packet):
-        return json.loads(decrypt_packet(decode_packet(packet), b.vault))
-
-    ob.deliver(mid, lambda p, ag: sent.append(p), resolve, admission=admission)
+    ob.deliver(mid, transport, resolve)
     clock.now += 60
-    ob.deliver(mid, lambda p, ag: sent.append(p), resolve, admission=admission)
+    ob.deliver(mid, transport, resolve)
     assert refreshes == [False, True]  # every attempt after the first refreshes
-    assert "admission" not in content(sent[0]) and content(sent[1])["admission"] == _adm()
-    assert noted == [clock.now]  # recorded once the attempt was sent
+    (first, none), (second, adm) = sent
+    assert none is None and "admission" not in _content(first, b)
+    assert adm.content == _content(second, b)["admission"] == _adm() and adm.fresh
+    assert hooked == [clock.now]  # asked on the retry only
     assert "admission" not in ob.get(mid).content
-
-    def down(p, ag):
-        raise ACEError("relay_unavailable", "down")
-
-    clock.now += 120
-    assert ob.deliver(mid, down, resolve, admission=admission).result == "failed"
-    assert noted == [clock.now - 120]  # a failed send records nothing
 
 
 def test_admission_is_left_out_when_the_content_would_exceed_the_limit():
-    clock, a, b, ob = _outbox()
+    clock, a, b, ob, _ = _outbox()
     base = len(encode_content("ace:text:1", TEXT_DIGEST, {"message": ""}))
     mid = ob.enqueue(b.id, "ace:text:1", {"message": ""})
     big = {"message": "x" * (MAX_PLAINTEXT_BYTES - base - 10)}  # beyond the text schema: white-box
     e = ob.get(mid)
     write_record(a.store, _key(mid), e.replace(content={**e.content, "body": big}).to_dict())
-    sent, noted = [], []
+    sent = []
     resolve = lambda ace_id, refresh=False: a.peers.agent(ace_id)  # noqa: E731
-    admission = lambda to, now: Admission(_adm(), lambda: noted.append(now))  # noqa: E731
-    ob.deliver(mid, lambda p, ag: sent.append(p), resolve, admission=admission)
+
+    def transport(packet, agent, admission=None):
+        sent.append((packet, admission))
+
+    ob.deliver(mid, transport, resolve)
     clock.now += 60
-    assert ob.deliver(mid, lambda p, ag: sent.append(p), resolve, admission=admission).result == (
-        "sent"
-    )
-    raw = json.loads(decrypt_packet(decode_packet(sent[1]), b.vault))
-    assert "admission" not in raw and noted == []
+    assert ob.deliver(mid, transport, resolve).result == "sent"
+    packet, adm = sent[1]
+    assert adm is None and "admission" not in _content(packet, b)
 
 
 # --- receiver: recovery candidates (05 § Admission recovery 2-3) ------------------------------
@@ -142,9 +156,12 @@ def _recovering(**kw):
 
 def _packet(w, admission, *, type_="ace:text:1", digest=TEXT_DIGEST, body=None, sender=None):
     sender = sender or w.a
-    plain = encode_content(
-        type_, digest, {"message": "hi"} if body is None else body, admission=admission
-    )
+    content = {
+        "type": type_,
+        "schemaDigest": digest,
+        "body": {"message": "hi"} if body is None else body,
+    }
+    plain = canonical_state_bytes({**content, "admission": admission})  # also where encode refuses
     return create_packet(sender.identity, w.b.id, w.b.vault.current(), plain, timestamp=w.clock.now)
 
 
@@ -173,7 +190,7 @@ def test_a_valid_proof_restores_the_sender_from_its_source_without_any_lookup():
     assert w.got[0].body == {"message": "hi"} and not hasattr(w.got[0], "admission")
     for key in w.b.store.list("inbox/"):  # never journaled
         assert b"admission" not in w.b.store.read(key)
-    assert w.b.peers.issued(w.a.id)["permit"] == adm["proof"]  # the proof is the newest issued
+    assert w.b.peers.issued(w.a.id) == adm["proof"]  # the proof is the newest issued
     body = w.receipt_body(out)
     assert body["outcome"] == "delivered" and "permit" not in body  # no needless renewal
 
@@ -183,7 +200,7 @@ def test_an_older_proof_never_replaces_a_newer_issued_permit():
     newer = create_permit(w.b.identity, w.a.id, now=w.clock.now + 5)
     w.b.peers.note_issued(w.a.id, newer)
     assert w.inbox.receive(wire(_packet(w, _adm_of(w)))).kind == "delivered"
-    assert w.b.peers.issued(w.a.id)["permit"] == newer
+    assert w.b.peers.issued(w.a.id) == newer
 
 
 def test_an_uninstalled_type_is_dropped_before_recording():
@@ -430,7 +447,7 @@ def test_recovery_across_relays_needs_no_lookup(relay):
 
 
 def test_a_failing_publish_never_fails_a_retry(relay):
-    """The source falls back to the last published one while unexpired, else is left out."""
+    """The source is the stored PublishedAgent (no publish) while unexpired, else left out."""
     from ace.network import _SELF_KEY
 
     now = [int(time.time())]

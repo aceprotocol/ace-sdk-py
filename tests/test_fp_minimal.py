@@ -163,9 +163,9 @@ def test_refresh_permits_retried_after_transient(world):
     seq = bob.identity.get_signing_seq()
     relay.inject.append(("/v1/send", 503, "internal_error", {}))
     bob.maintain()  # the permit push hits a 503
-    assert bob.peers.issued(a)["seq"] != seq
+    assert bob.peers.issued(a)["signature"]["seq"] != seq
     bob.maintain()  # retried
-    assert bob.peers.issued(a)["seq"] == seq
+    assert bob.peers.issued(a)["signature"]["seq"] == seq
     alice.pull()
     assert alice.peers.permit_from(b)["signature"]["seq"] == seq
 
