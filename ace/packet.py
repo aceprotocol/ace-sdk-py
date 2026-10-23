@@ -185,22 +185,45 @@ def aead_key(ss: bytes, header: bytes) -> bytes:
 # --- private content ------------------------------------------------------------
 
 
+def _is_admission(value: object) -> bool:
+    """The closed object ``{proof, permit, source}`` of three JSON objects (03 § Private
+    content); the permits and the PublishedAgent are checked by the receiver (05 § Admission
+    recovery)."""
+    return (
+        type(value) is dict
+        and set(value) == {"proof", "permit", "source"}
+        and all(type(v) is dict for v in value.values())
+    )
+
+
 def encode_content(
-    type_: str, schema_digest: str, body: dict, thread_id: str | None = None
+    type_: str,
+    schema_digest: str,
+    body: dict,
+    thread_id: str | None = None,
+    *,
+    admission: dict | None = None,
 ) -> bytes:
-    """Canonical JSON of ``{type, schemaDigest, threadId?, body}``."""
+    """Canonical JSON of ``{type, schemaDigest, threadId?, body, admission?}``. ``admission``:
+    the ``{proof, permit, source}`` of an Outbox retry (05 § Admission recovery)."""
     if not is_namespaced_id(type_):
         raise ACEError("invalid_argument", "type must be a namespaced identifier")
     if not is_sha256_hex(schema_digest):
         raise ACEError("invalid_argument", "schemaDigest must be 64 lowercase hex")
     if thread_id is not None and not is_thread_id(thread_id):
         raise ACEError("invalid_argument", "threadId must be 1..256 characters without controls")
+    if admission is not None and not _is_admission(admission):
+        raise ACEError(
+            "invalid_argument", "admission must be {proof, permit, source} of three objects"
+        )
     if type(body) is not dict:
         raise ACEError("invalid_body", "body must be a JSON object")
     check_json_value({"body": body})  # depth counted from the content root, as receivers do
     content = {"type": type_, "schemaDigest": schema_digest, "body": body}
     if thread_id is not None:
         content["threadId"] = thread_id
+    if admission is not None:
+        content["admission"] = admission
     raw = canonical_state_bytes(content)
     if len(raw) > MAX_PLAINTEXT_BYTES:
         raise ACEError("limit_exceeded", f"private content exceeds {MAX_PLAINTEXT_BYTES} bytes")
@@ -208,16 +231,18 @@ def encode_content(
 
 
 def decode_content(raw: bytes) -> dict:
-    """``{type, schemaDigest, threadId?, body}`` from decrypted bytes, or ``invalid_body``."""
+    """``{type, schemaDigest, threadId?, body, admission?}`` from decrypted bytes, or
+    ``invalid_body``. The receiver strips ``admission`` before anything reaches the host."""
     c = loads_object(raw, "invalid_body", "private content")
     if (
         not {"type", "schemaDigest", "body"}
         <= set(c)
-        <= {"type", "schemaDigest", "threadId", "body"}
+        <= {"type", "schemaDigest", "threadId", "body", "admission"}
         or not is_namespaced_id(c["type"])
         or not is_sha256_hex(c["schemaDigest"])
         or type(c["body"]) is not dict
         or ("threadId" in c and not is_thread_id(c["threadId"]))
+        or ("admission" in c and not _is_admission(c["admission"]))
     ):
         raise ACEError("invalid_body", "invalid private content")
     return c

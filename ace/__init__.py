@@ -66,7 +66,7 @@ from .limits import (
     TIMESTAMP_WINDOW_SECONDS,
 )
 from .network import ContactRequest, NetworkClient
-from .outbox import Attempt, Outbox, OutboxEntry
+from .outbox import Admission, Attempt, Outbox, OutboxEntry
 from .packet import (
     Packet,
     PrivateMessage,
@@ -95,6 +95,7 @@ __all__ = [
     "ACEErrorCode",
     "ACEIdentity",
     "ACEStore",
+    "Admission",
     "Attempt",
     "COMMERCE",
     "CORE",

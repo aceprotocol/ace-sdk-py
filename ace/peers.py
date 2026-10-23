@@ -13,7 +13,7 @@ from ._encoding import canonical_state_bytes, is_ace_id, sha256_hex, unix_now, w
 from .descriptor import VerifiedAgent, verify_published_agent
 from .errors import ACEError
 from .kel import KelState, event_bytes, is_usable, reconcile_kel, tail_time, verify_kel
-from .limits import OFFLINE_WINDOW_SECONDS
+from .limits import OFFLINE_WINDOW_SECONDS, PERMIT_RENEWAL_SECONDS
 from .permit import verify_permit
 from .store import ACEStore, load_record, write_record
 
@@ -31,7 +31,7 @@ class PeerRecord:
     agent: dict | None
     status: str | None  # None (stranger), "pending", "admitted", "blocked"
     held_permit: dict | None
-    issued_permit: dict | None  # {expiresAt, seq} of the newest permit we sent the peer
+    issued_permit: dict | None  # {expiresAt, seq, permit}: the newest permit we sent the peer
     profile: str | None
     updated_at: int | None = None  # when ``status`` was last set (a pending entry's TTL)
     # Whether a live descriptor served by a relay vouched for the pinned KEL: False once anything
@@ -90,6 +90,7 @@ def _record(d: dict, key: str) -> PeerRecord:
                     not isinstance(r.issued_permit, dict)
                     or wire_int(r.issued_permit.get("expiresAt")) is None
                     or wire_int(r.issued_permit.get("seq")) is None
+                    or not isinstance(r.issued_permit.get("permit"), dict)
                 )
             )
         ):
@@ -97,6 +98,15 @@ def _record(d: dict, key: str) -> PeerRecord:
     except (KeyError, TypeError, ValueError) as exc:
         raise ACEError("storage_failed", f"{key}: invalid peer record ({exc})") from None
     return r
+
+
+def _issued(permit: dict) -> dict:
+    """The ``issuedPermit`` record of a permit we issued: ``{expiresAt, seq, permit}``."""
+    return {
+        "expiresAt": permit["expiresAt"],
+        "seq": permit["signature"]["seq"],
+        "permit": copy.deepcopy(permit),
+    }
 
 
 class PeerStore:
@@ -371,6 +381,27 @@ class PeerStore:
         with self._store.lock("peers"):
             self._update(ace_id, status=status, profile=profile, updated_at=self._now())
 
+    def restore(self, ace_id: str, proof: dict) -> bool:
+        """Record a peer that presented ``proof``, a valid permit we issued it, as ``admitted``
+        (05 § Admission recovery): the permit is the decision, the table only caches it. A
+        stranger's row records no profile; a ``pending`` or ``admitted`` row keeps the one it
+        records. ``proof`` becomes the newest permit issued to the peer unless the row records a
+        newer one (no needless renewal or upkeep refresh). False, and nothing changes, when the
+        peer is blocked (checked under the ``peers`` lock, so a concurrent block wins)."""
+        with self._store.lock("peers"):
+            rec = self.get(ace_id)
+            if rec is not None and rec.status == "blocked":
+                return False
+            changes: dict[str, Any] = {}
+            if rec is None or rec.status != "admitted":
+                changes.update(status="admitted", updated_at=self._now())
+            old = None if rec is None else rec.issued_permit
+            if old is None or old["permit"]["issuedAt"] < proof["issuedAt"]:
+                changes["issued_permit"] = _issued(proof)
+            if changes:
+                self._update(ace_id, **changes)
+            return True
+
     # --- permits ---
 
     def hold_permit(
@@ -442,10 +473,26 @@ class PeerStore:
     def note_issued(self, subject: str, permit: dict) -> None:
         """Record ``permit`` as the newest one the peer holds from us, once the packet carrying
         it was sent (a failed send leaves the peer due for a fresh one)."""
-        issued = {"expiresAt": permit["expiresAt"], "seq": permit["signature"]["seq"]}
         with self._store.lock("peers"):
-            self._update(subject, issued_permit=issued)
+            self._update(subject, issued_permit=_issued(permit))
 
     def issued(self, subject: str) -> dict | None:
         rec = self.get(subject)
         return None if rec is None else rec.issued_permit
+
+    def renewal_due(self, subject: str, seq: int, now: int) -> bool:
+        """Whether a packet to ``subject`` carries a fresh permit (05 § Renewal): we issued it
+        none, or the newest has less than ``PERMIT_RENEWAL_SECONDS`` left or predates our current
+        delegation ``seq``."""
+        issued = self.issued(subject)
+        return (
+            issued is None
+            or issued["expiresAt"] - now < PERMIT_RENEWAL_SECONDS
+            or issued["seq"] != seq
+        )
+
+    def reusable_permit(self, subject: str, seq: int, now: int) -> dict | None:
+        """The newest permit we issued ``subject`` while no renewal is due, else None."""
+        if self.renewal_due(subject, seq, now):
+            return None
+        return copy.deepcopy(self.issued(subject)["permit"])  # type: ignore[index]

@@ -323,7 +323,7 @@ def test_accept_never_clears_a_block(relay, pair):
     alice.store.write(_incoming_key(b), held)
     with raises("not_permitted"):
         alice.accept(b)
-    assert alice.peers.is_blocked(b) and relay.blocks[(a, b)] == (True, 0)
+    assert alice.peers.is_blocked(b) and relay.blocks[(a, b)][0] is True
 
 
 @pytest.mark.parametrize("block_first", [False, True])

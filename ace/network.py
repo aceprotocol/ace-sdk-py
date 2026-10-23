@@ -34,7 +34,7 @@ from ._relay_url import is_canonical_relay_url
 from .card_record import Contact, VerifiedCard, create_card_record, verify_card_bundle
 from .descriptor import VerifiedAgent, create_published_agent, verify_published_agent
 from .errors import ACEError
-from .identity import ACEIdentity
+from .identity import ACEIdentity, check_usable
 from .inbox import Inbox, ReceiveOutcome, Reply
 from .invitation import verify_invitation
 from .kel import event_bytes
@@ -45,7 +45,7 @@ from .limits import (
     MAX_PENDING_CONTACT_REQUESTS,
     PREKEY_ROTATION_SECONDS,
 )
-from .outbox import Attempt, Outbox, OutboxEntry
+from .outbox import Admission, Attempt, Outbox, OutboxEntry
 from .packet import PrivateMessage, create_packet, encode_content
 from .peers import PeerStore
 from .permit import create_permit, verify_permit
@@ -712,20 +712,65 @@ class NetworkClient:
         if self._their_permit(to) is None:
             raise _no_valid_permit()
         mid = self.outbox.enqueue(to, type_, body, thread_id=thread_id)
-        self.outbox.deliver(mid, self._attempt, self._resolve)
+        self.outbox.deliver(mid, self._attempt, self._resolve, admission=self._admission)
         return mid
 
     def flush(self) -> list[Attempt]:
         """Attempt every due Outbox entry."""
-        return self.outbox.flush(self._attempt, self._resolve)
+        return self.outbox.flush(self._attempt, self._resolve, admission=self._admission)
 
     def attempt(self, message_id: str) -> OutboxEntry | None:
         """One attempt of ``message_id`` now, due or not (TS ``outbox.attempt``): ``None`` for an
         unknown message, a final entry as is, a pending one after the attempt."""
         if not is_message_id(message_id) or self.outbox.get(message_id) is None:
             return None
-        self.outbox.deliver(message_id, self._attempt, self._resolve, force=True)
+        self.outbox.deliver(
+            message_id, self._attempt, self._resolve, force=True, admission=self._admission
+        )
         return self.outbox.get(message_id)
+
+    def _admission(self, to: str, now: int) -> Admission | None:
+        """What an Outbox retry to a peer we hold as ``admitted`` carries (05 § Admission
+        recovery), so a peer that lost its admission table recovers us without any lookup: as
+        ``proof`` the permit the attempt presents to the relay; a reply permit: the newest one we
+        issued the peer while no renewal is due and it verifies under our current KEL, else a
+        fresh one, recorded as issued once the attempt was sent; and as ``source`` our current
+        PublishedAgent."""
+        if self.peers.status(to) != "admitted":
+            return None
+        proof = self._their_permit(to)
+        if proof is None:
+            return None  # the attempt fails not_permitted
+        source = self._own_source(now)
+        if source is None:
+            return None  # the attempt still goes, without admission
+        permit = self.peers.reusable_permit(to, self.identity.get_signing_seq(), now)
+        if permit is not None:
+            try:
+                verify_permit(permit, check_usable(self.identity, now), to, now=now)
+                return Admission({"proof": proof, "permit": permit, "source": source})
+            except ACEError:
+                pass
+        fresh = create_permit(self.identity, to, now=now)
+        return Admission(
+            {"proof": proof, "permit": fresh, "source": source},
+            lambda: self.peers.note_issued(to, fresh),
+        )
+
+    def _own_source(self, now: int) -> dict | None:
+        """Our current PublishedAgent for an ``admission``: ``publish`` (it posts only when due);
+        if that fails, the last published one while unexpired at ``now``; else None. It never
+        fails a retry: an unreachable home relay must not stop retries to peers' relays."""
+        try:
+            return self.publish()
+        except ACEError:
+            pass
+        try:
+            rec = load_record(self.store, _SELF_KEY)
+        except ACEError:
+            return None
+        src = None if rec is None else rec.get("source")
+        return copy.deepcopy(src) if src and src["descriptor"]["expiresAt"] > now else None
 
     def _known(self, ace_id: str) -> None:
         """A cached descriptor (even expired or stale: attempts refresh it) suffices; otherwise
@@ -748,7 +793,9 @@ class NetworkClient:
         keep_block: bool = False,
     ) -> None:
         """Apply a local admission decision. Setting a block, or lifting one, allocates the next
-        relay revision in the same step under the ``network-blocks`` lock and persists it as
+        relay revision (``max(previous + 1, now)``, so a decision made after the block records
+        were lost still outranks every earlier one, 05 § Blocks) in the same step under the
+        ``network-blocks`` lock and persists it as
         ``unsynced`` until the home relay registers it (``maintain`` re-sends exactly it); a
         block also discards the peer's held request in that step. With ``lift`` the decision
         applies only while the peer is still blocked; with ``keep_block`` (accept) a blocked
@@ -767,7 +814,7 @@ class NetworkClient:
             if not blocked and not was_blocked:
                 return
             rec = load_record(self.store, key)
-            revision = 0 if rec is None else rec["revision"] + 1
+            revision = max(0 if rec is None else rec["revision"] + 1, self._now())
             write_record(
                 self.store,
                 key,
@@ -933,8 +980,9 @@ class NetworkClient:
         self._decide(ace_id, "blocked")
 
     def unblock(self, ace_id: str) -> None:
-        """Remove a block (the explicit admission action, 05 § Blocks); the peer becomes a
-        stranger again until contact is re-established."""
+        """Remove a block (the explicit admission action, 05 § Blocks); the peer is a stranger
+        until it presents a permit it still holds from us, which re-admits it (05 § Admission
+        recovery), or contact is established again."""
         self._decide(ace_id, None, lift=True)
 
     def set_wake(self, gateway: str, token: str) -> None:
