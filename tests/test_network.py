@@ -10,7 +10,6 @@ from ace import (
     RelayClient,
     SoftwareIdentity,
     create_published_agent,
-    issue_delegation,
 )
 
 from .fake_relay import FakeRelay
@@ -453,13 +452,12 @@ def test_a_route_replaying_an_older_descriptor_does_not_block_the_next(routes):
 
 
 def test_a_stale_cached_descriptor_is_refreshed_from_its_relays_and_the_home_relay(routes):
-    """A cached descriptor no longer bound to the current pins (here a delegation issuer's pin
-    advanced past the key that signed its entry) is refreshed from its relays and the home
-    relay; a bound one from its relays alone."""
+    """A cached descriptor no longer bound to the current pin (here the subject's pin advanced
+    past the KEL it carries) is refreshed from its relays and the home relay; a bound one from
+    its relays alone."""
     clock, home, relay_b, rc, peer = routes
     alice = peer()
     a = alice.identity.get_ace_id()
-    dave = SoftwareIdentity.generate(now=clock.now - 10)
     prekey = alice.vault.current(clock.now)
 
     def descriptor(relays: list[str], **kw) -> dict:
@@ -474,18 +472,15 @@ def test_a_stale_cached_descriptor_is_refreshed_from_its_relays_and_the_home_rel
             **kw,
         )
 
-    delegated = descriptor(
-        [relay_b.url], delegations=[issue_delegation(dave, a, now=clock.now + 1)]
-    )
     bob = peer()
-    bob.peers.pin(dave.get_kel(), clock.now)
-    bob.import_agent(delegated)
+    bob.import_agent(descriptor([relay_b.url]))
     clock.now += 1
-    dave.delegate(now=clock.now)
-    bob.peers.pin(dave.get_kel(), clock.now)
-    assert bob.peers.current(a) is None  # stale: no longer bound to dave's pin
+    alice.identity.delegate(now=clock.now)  # a new signing key, learnt from the KEL alone
+    bob.peers.pin(alice.identity.get_kel(), clock.now)
+    assert bob.peers.current(a) is None  # stale: no longer bound to alice's pin
     # Relay B, the cached route, does not serve it: the home relay is asked too.
     current = descriptor([relay_b.url, home.url])
+    rc(home.url).register(alice.identity)
     rc(home.url).publish(current)
     assert bob.agent(a).source == current
     assert _descriptor_gets(relay_b, 0) == [f"/v1/descriptor/{a}"]

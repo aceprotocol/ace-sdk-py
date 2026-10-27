@@ -187,20 +187,6 @@ class PeerStore:
 
     # --- descriptors ---
 
-    def delegation_pins(self, source: object) -> dict[str, KelState]:
-        """Our pins for the delegation issuers a PublishedAgent names (01 § Pinning)."""
-        pins: dict[str, KelState] = {}
-        d = source.get("descriptor") if isinstance(source, dict) else None
-        entries = d.get("delegations") if isinstance(d, dict) else None
-        for e in entries if isinstance(entries, list) else []:
-            c = e.get("credential") if isinstance(e, dict) else None
-            who = c.get("issuer") if isinstance(c, dict) else None
-            if isinstance(who, str) and is_ace_id(who) and who not in pins:
-                st = self.state(who)
-                if st is not None:
-                    pins[who] = st
-        return pins
-
     def adopt(
         self,
         agent: VerifiedAgent | dict,
@@ -244,7 +230,6 @@ class PeerStore:
                     now=t,
                     allow_loopback_relays=self.allow_loopback_relays,
                     pinned=pinned,
-                    delegation_pins=self.delegation_pins(source),
                 )
             state = verified.state
             kel = list(state.events)
@@ -277,14 +262,13 @@ class PeerStore:
                 return kept
             stored = {"kel": kel, "descriptor": copy.deepcopy(verified.descriptor)}
             self._update(verified.ace_id, kel=kel, agent=stored, kel_live=kel_live)
-        return VerifiedAgent(verified.ace_id, state, stored, verified.prekey, verified.delegations)
+        return VerifiedAgent(verified.ace_id, state, stored, verified.prekey)
 
-    def _cached(self, agent: dict, pins: dict[str, KelState] | None = None) -> VerifiedAgent:
+    def _cached(self, agent: dict) -> VerifiedAgent:
         return verify_published_agent(
             agent,
             now=tail_time(agent["kel"], agent["descriptor"]["issuedAt"]),
             allow_loopback_relays=self.allow_loopback_relays,
-            delegation_pins=pins,
         )
 
     def cached(self, ace_id: str) -> VerifiedAgent | None:
@@ -308,32 +292,12 @@ class PeerStore:
         )
 
     def agent(self, ace_id: str) -> VerifiedAgent | None:
-        """The cached descriptor while it is bound to our current pins (possibly expired: use
-        ``current`` to encrypt to it): verified under the subject's pinned KEL state and still
-        verifying against our current pins for its delegation issuers. None when absent or stale
-        (a pin moved on since it was verified): refresh it, never use the stale one. Delegations
-        expired at the store clock are dropped."""
-        return self._bound_agent(*self.binding(ace_id))
-
-    def _bound_agent(self, cached: VerifiedAgent | None, bound: bool) -> VerifiedAgent | None:
-        if cached is None or not bound:
-            return None
-        pins = self.delegation_pins(cached.source)
-        if pins:
-            try:
-                cached = self._cached(cached.source, pins)
-            except ACEError:
-                return None  # a delegation issuer's key changed since the entry was verified
-        # an entry that has expired since is dropped (04 § Delegations), never reported
-        now = self._now()
-        expires = {
-            e["credential"]["issuer"]: e["credential"]["expiresAt"]
-            for e in cached.descriptor.get("delegations") or []
-        }
-        live = tuple(i for i in cached.delegations if expires[i] > now)
-        return (
-            cached if live == cached.delegations else dataclasses.replace(cached, delegations=live)
-        )
+        """The cached descriptor while it is bound to our current pin (possibly expired: use
+        ``current`` to encrypt to it): verified under the subject's pinned KEL state. None when
+        absent or stale (the pin moved on since it was verified): refresh it, never use the stale
+        one."""
+        cached, bound = self.binding(ace_id)
+        return cached if bound else None
 
     def current(self, ace_id: str, now: int | None = None) -> VerifiedAgent | None:
         """``agent(ace_id)`` while usable at ``now``: the descriptor to encrypt to."""
@@ -343,13 +307,12 @@ class PeerStore:
         self, ace_id: str, now: int | None = None
     ) -> tuple[VerifiedAgent | None, VerifiedAgent | None, bool]:
         """``(current, cached, bound)`` from one read: the descriptor to encrypt to (04 § Caching:
-        bound to our current pins, unexpired, and the subject usable at ``now``, 01 § Verifier
+        bound to our current pin, unexpired, and the subject usable at ``now``, 01 § Verifier
         rules 5: never send to an unusable identity), else None; plus, for a refresh, the cached
-        descriptor and whether it is bound to our current pins (``agent``: the subject's KEL and
-        its delegation issuers')."""
+        descriptor and whether it is bound to our current pin of the subject's KEL."""
         t = self._now() if now is None else now
-        cached, kel_bound = self.binding(ace_id)
-        agent = self._bound_agent(cached, kel_bound)
+        cached, bound = self.binding(ace_id)
+        agent = cached if bound else None
         # a bound descriptor's state is the pin, so the subject's usability is read off it
         usable = agent is not None and agent.expires_at > t and is_usable(agent.state, t)
         return (agent if usable else None), cached, agent is not None

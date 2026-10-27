@@ -35,8 +35,8 @@ from .card_record import VerifiedCard, verify_card_bundle
 from .descriptor import VerifiedAgent, verify_published_agent
 from .errors import ACEError, ACEErrorCode
 from .identity import ACEIdentity
+from .kel import tail_time
 from .limits import (
-    DEFAULT_PAGE_LIMIT,
     MAX_INBOX_PAGE,
     MAX_JSON_DEPTH,
     MAX_PACKET_BYTES,
@@ -265,7 +265,7 @@ class RelayClient:
         for attempt in (0, 1):
             headers: dict[str, str] = {}
             if auth is not None:
-                ts = self._now()
+                ts = tail_time(identity.get_kel(), self._now())  # type: ignore[union-attr]
                 if auth[0] == "unregister":
                     ts = self._next_registration_ts(identity, ts)  # type: ignore[arg-type]
                 headers = create_auth_headers(identity, *auth, ts, audience=self.base_url)  # type: ignore[arg-type]
@@ -319,7 +319,7 @@ class RelayClient:
 
     def register(self, identity: ACEIdentity) -> str:
         """``POST /v1/register``: ``registered | idempotent | refreshed | rotated``."""
-        ts = self._next_registration_ts(identity, self._now())
+        ts = self._next_registration_ts(identity, tail_time(identity.get_kel(), self._now()))
         obj = self._object(
             self._call(
                 "POST",
@@ -387,7 +387,7 @@ class RelayClient:
         tag: str | None = None,
         profile: str | None = None,
         cursor: str | None = None,
-        limit: int = DEFAULT_PAGE_LIMIT,
+        limit: int = MAX_INBOX_PAGE,
     ) -> tuple[list[VerifiedCard], str | None]:
         """``GET /v1/cards``: the public directory (card records listed at this relay). Each entry
         is verified on its own: one that fails verification permanently, is not listed here or
@@ -599,7 +599,7 @@ class RelayClient:
                         identity,
                         "listen",
                         encode_payload(since),
-                        self._now(),
+                        tail_time(identity.get_kel(), self._now()),
                         audience=self.base_url,
                     ),
                     "Accept": "text/event-stream",

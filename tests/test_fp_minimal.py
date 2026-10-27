@@ -40,7 +40,7 @@ def _inbox(b: Party, clock: Clock, got=None, **kw) -> Inbox:
 
 
 def _admitted_pair(clock: Clock, **source) -> tuple[Party, Party]:
-    a, b = Party(clock), Party(clock)
+    a, b = Party(clock, born=clock.now - 60), Party(clock, born=clock.now - 60)
     b.peers.adopt(a.source(**source))
     b.peers.set_status(a.id, "admitted")
     return a, b

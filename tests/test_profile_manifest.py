@@ -2,19 +2,21 @@ import copy
 
 import pytest
 
-from ace import COMMERCE, CORE, TEXT, ProfileManifest, Profiles
+from ace import COMMERCE, CORE, DELEGATION, TEXT, ProfileManifest, Profiles
 from tests.helpers import raises
 
 # 08-profiles § Official manifests
 OFFICIAL = {
     "ace:core:1": "66f46d4b8951b75f98abae24a72ceffa173c4e27748d09be78b8d6382ddc8222",
     "ace:text:1": "48619350eaea46b2d60f7ce71fe55867e00c8dd081796b408fb6a95692b8b307",
+    "ace:delegation:1": "fc1653477df13c6c8be00d34ce4811d90365053c0afd2b858f90603eab474964",
     "ace:commerce:1": "30583f0a1acd86ac5a217d706df1c27dc7caea5d4f2deed6112807679afab053",
 }
 MESSAGES = {
     "ace:receipt:1": "a79fea8c61d30c484fdc9ba71fee310c612da84f84827fe2c4b2e99e5708d3e3",
     "ace:contact:1": "29fc76bbaa5a437aa068f823b1f2b2466c89fed6b2ea4b9cfa7c31cc80df15e9",
     "ace:text:1": "e91541145d670369cf651d062e6bb8a94ce2605d4a9f2261ceef1d8a29c2e7da",
+    "ace:delegation:1": "4beba7c7640936f14d9eb90843726f6a53afc75c6798cb02fa914c09af5b24b1",
     "ace:commerce:rfq:1": "7b3fc71d8e538ff2f5ca0189d81feb237aa31e1f49787e951b90e9e17c1207d5",
     "ace:commerce:payment:1": "33a1fde87d16bf5ad5d4387d73e0823ed14ccd15149f51bee938b54be8d95ff5",
     "ace:commerce:confirm:1": "876f22d60311651917fb7aee630368b885b8378fa1d0ac9dd91b17a65d8800d7",
@@ -40,9 +42,9 @@ TRANSLATION = {
 
 
 def test_official_digests_match_the_spec():
-    for m in (CORE, TEXT, COMMERCE):
+    for m in (CORE, TEXT, DELEGATION, COMMERCE):
         assert m.digest == OFFICIAL[m.id]
-    every = {t: s.digest for m in (CORE, TEXT, COMMERCE) for t, s in m.messages.items()}
+    every = {t: s.digest for m in (CORE, TEXT, DELEGATION, COMMERCE) for t, s in m.messages.items()}
     for t, d in MESSAGES.items():
         assert every[t] == d
     assert len(COMMERCE.messages) == 8

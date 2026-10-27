@@ -438,21 +438,6 @@ def test_a_kel_adopted_elsewhere_makes_the_cached_descriptor_stale(relay, pair):
     assert alice.outbox.get(mid).status == "delivered"
 
 
-def test_a_delegation_issuer_key_change_makes_the_cached_descriptor_stale():
-    from ace import issue_delegation
-    from tests.helpers import NOW, Party
-
-    clock = Clock()
-    alice, dave, viewer = Party(clock), Party(clock), Party(clock)
-    viewer.peers.pin(dave.identity.get_kel(), NOW)
-    src = alice.source(delegations=[issue_delegation(dave.identity, alice.id, now=NOW - 5)])
-    viewer.peers.adopt(src, NOW)
-    assert viewer.peers.agent(alice.id).delegations == (dave.id,)
-    dave.identity.delegate(now=NOW + 1)  # dave replaces its signing key
-    viewer.peers.pin(dave.identity.get_kel(), NOW + 1)
-    assert viewer.peers.agent(alice.id) is None  # stale: refresh, never report the delegation
-
-
 def test_a_kel_stale_descriptors_relays_never_receive_the_permit(relay, pair):
     from ace import create_published_agent
 
@@ -538,22 +523,6 @@ def test_a_permit_from_the_issuers_superseded_key_is_never_presented(relay, pair
     # the refresh is the anonymous lookup (bob is resolvable by ACE ID), never with the permit
     assert alice.agent(b, refresh=True).ace_id == b
     assert calls == [("send", None), ("descriptor",)], calls  # never the permit
-
-
-def test_a_cached_descriptor_never_reports_an_expired_delegation():
-    from ace import issue_delegation
-    from tests.helpers import NOW, Party
-
-    clock = Clock()
-    alice, dave, viewer = Party(clock), Party(clock), Party(clock)
-    src = alice.source(
-        delegations=[issue_delegation(dave.identity, alice.id, now=NOW - 5, lifetime=60)]
-    )
-    viewer.peers.adopt(src, NOW)
-    assert viewer.peers.agent(alice.id).delegations == (dave.id,)
-    clock.now = NOW + 55  # the credential expired; the descriptor has not
-    cached = viewer.peers.agent(alice.id)
-    assert cached is not None and cached.delegations == () and cached.source == src
 
 
 def test_an_admitted_peers_contact_source_extends_the_pin_but_does_not_confirm_it_live():

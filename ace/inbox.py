@@ -643,7 +643,6 @@ class Inbox:
             now=now,
             allow_loopback_relays=self._peers.allow_loopback_relays,
             pinned=self._peers.state(p.from_id),
-            delegation_pins=self._peers.delegation_pins(source),
         )
         if agent.ace_id != p.from_id:
             raise ACEError("invalid_authorization", "source does not match the sender")

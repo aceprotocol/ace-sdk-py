@@ -20,6 +20,8 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from ace import (
     COMMERCE,
     CORE,
+    DELEGATION,
+    DELEGATION_TYPE,
     TEXT,
     ACEError,
     Inbox,
@@ -39,13 +41,15 @@ from ace import (
     create_packet,
     decode_content,
     decode_packet,
+    delegation_rules,
     encode_payload,
     extend_kel,
     from_base64,
     is_usable,
     signing_message,
+    validate_delegation_ext,
     verify_card_bundle,
-    verify_delegation,
+    verify_delegation_credential,
     verify_erc8004_registration,
     verify_kel,
     verify_permit,
@@ -70,8 +74,8 @@ from ace._encoding import (
 from ace._net import is_blocked_address
 from ace._relay_url import normalize_relay_url
 from ace.auth import create_auth_headers
+from ace.card_record import validate_erc8004
 from ace.commerce import ThreadStore, commerce_rules, validate_commerce_ext
-from ace.delegation import validate_erc8004
 from ace.errors import _CODE_RE
 from ace.kel import event_bytes, verify_operational_signature
 from ace.packet import packet_header
@@ -365,10 +369,7 @@ def test_private_content(c):
 
 @pytest.mark.parametrize("c", V["descriptor"]["valid"], ids=ids(V["descriptor"]["valid"]))
 def test_descriptor_valid(c):
-    assert (
-        list(verify_published_agent(c["publishedAgent"], now=c["now"]).delegations)
-        == c["delegations"]
-    )
+    verify_published_agent(c["publishedAgent"], now=c["now"])
 
 
 @pytest.mark.parametrize("c", V["descriptor"]["invalid"], ids=ids(V["descriptor"]["invalid"]))
@@ -402,6 +403,7 @@ def test_card_record_valid(c):
         "home": v.home,
         "handle": v.handle,
         "pay": v.pay,
+        "erc8004": v.erc8004,
         "contact": v.contact,
         "listed": v.listed,
     }
@@ -413,35 +415,38 @@ def test_card_record_invalid(c):
     assert code_of(lambda: verify_card_bundle(c["bundle"], c["now"])) == c["error"]
 
 
-def test_delegation_permit_and_erc8004():
-    for c in V["delegation"]["cases"]:
-
-        def run():
-            _, live = verify_delegation(c["entry"], c["subject"], now=c["now"])
-            return "live" if live else "expired"
-
-        if "result" in c:
-            assert run() == c["result"], c["name"]
-        else:
-            assert code_of(run) == c["error"], c["name"]
-    for c in V["delegation"]["pinned"]:
-
-        def run_pinned():
-            pin = state_of(c["pinned"], c["now"])
-            _, live = verify_delegation(c["entry"], c["subject"], now=c["now"], pinned=pin)
-            return "live" if live else "expired"
-
-        if "result" in c:
-            assert run_pinned() == c["result"], c["name"]
-        else:
-            assert code_of(run_pinned) == c["error"], c["name"]
-    for c in V["delegation"]["descriptors"]:
-        pins = {V["agents"][x]["aceId"]: state_of(x, c["now"]) for x in c["delegationPins"]}
-        got = code_of(
-            lambda: verify_published_agent(c["publishedAgent"], now=c["now"], delegation_pins=pins)
+@pytest.mark.parametrize(
+    "c", V["delegation"]["credentials"], ids=ids(V["delegation"]["credentials"])
+)
+def test_delegation_credential(c):
+    got = code_of(
+        lambda: verify_delegation_credential(
+            c["credential"], state_of(c["issuer"], c["now"]), c["now"]
         )
-        assert got == c["error"], c["name"]
-        assert code_of(lambda: verify_published_agent(c["publishedAgent"], now=c["now"])) is None
+    )
+    assert got == c["error"]
+
+
+@pytest.mark.parametrize("c", V["delegation"]["ext"], ids=ids(V["delegation"]["ext"]))
+def test_delegation_ext(c):
+    assert (
+        code_of(lambda: validate_delegation_ext(c["value"], c["subject"], c["now"])) == c["error"]
+    )
+
+
+@pytest.mark.parametrize("c", V["delegation"]["messages"], ids=ids(V["delegation"]["messages"]))
+def test_delegation_message(c):
+    peers = PeerStore(MemoryStore(), clock=lambda: c["now"])
+    if c["senderPinned"]:
+        peers.pin(kel_of(c["from"]), c["now"])
+    frm, to = AGENTS[c["from"]]["aceId"], AGENTS[c["to"]]["aceId"]
+    rules = delegation_rules(peers, to if c["direction"] == "receive" else frm)
+    mid = "8a4f6a2e-3c0b-4d1e-9f7a-1b2c3d4e5f60"
+    event = MessageEvent(c["direction"], mid, frm, to, c["now"], DELEGATION_TYPE, None)
+    assert code_of(lambda: rules.check(event, c["body"])) == c["error"]
+
+
+def test_permit_and_erc8004():
     for c in V["permit"]["cases"]:
         got = code_of(
             lambda: verify_permit(
@@ -472,7 +477,7 @@ def test_stranger_source_bounds(c):
 
 def test_manifests():
     m = V["manifests"]
-    bundled = {x.id: x for x in (CORE, TEXT, COMMERCE)}
+    bundled = {x.id: x for x in (CORE, TEXT, DELEGATION, COMMERCE)}
     for o in m["official"]:
         pm = bundled[o["id"]]
         assert pm.digest == o["digest"]

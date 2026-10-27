@@ -17,6 +17,8 @@ import ace.kel as kel_mod
 import ace.store as store_mod
 from ace import (
     CORE,
+    DELEGATION,
+    DELEGATION_PROFILE_ID,
     TEXT,
     ACEError,
     FileStore,
@@ -27,12 +29,12 @@ from ace import (
     RelayClient,
     SoftwareIdentity,
     create_card_record,
+    create_delegation_credential,
     create_inception,
     create_permit,
     create_published_agent,
     create_rotation,
     create_signing_delegation,
-    issue_delegation,
     verify_card_bundle,
     verify_kel,
     verify_published_agent,
@@ -209,22 +211,18 @@ def _broken_kel(source: dict) -> dict:
     return source
 
 
-def test_delegation_shape_is_checked_before_the_kel():
+def test_delegation_ext_shape_is_checked_before_the_kel():
     p = Party(Clock())
+    profiles = [DELEGATION.descriptor()]
     with raises("invalid_kel"):
-        verify_published_agent(_broken_kel(p.source()), now=p.clock.now)
-    for entries in ([{"kel": []}], [{"kel": [], "credential": {}}], [1]):
-        source = _broken_kel(p.source())
-        source["descriptor"]["delegations"] = entries
-        with raises("invalid_authorization"):
-            verify_published_agent(source, now=p.clock.now)
-    good = issue_delegation(Party(p.clock).identity, p.id, now=p.clock.now)
+        verify_published_agent(_broken_kel(p.source(profiles=profiles)), now=p.clock.now)
+    good = create_delegation_credential(Party(p.clock).identity, p.id, now=p.clock.now)
     bad_sig = copy.deepcopy(good)
-    bad_sig["credential"]["signature"]["value"] = "AAAA"
-    for entry, code in ((bad_sig, "invalid_authorization"), ({**good, "kel": "x"}, "invalid_kel")):
-        source = _broken_kel(p.source())  # a non-array kel is step 2's, not the entry's shape
-        source["descriptor"]["delegations"] = [entry]
-        with raises(code):
+    bad_sig["signature"]["value"] = "AAAA"
+    for value in ({"credentials": [{}]}, {"credentials": [1]}, {"credentials": [bad_sig]}, {}):
+        source = _broken_kel(p.source(profiles=profiles))
+        source["descriptor"]["ext"] = {DELEGATION_PROFILE_ID: value}
+        with raises("invalid_authorization"):
             verify_published_agent(source, now=p.clock.now)
 
 

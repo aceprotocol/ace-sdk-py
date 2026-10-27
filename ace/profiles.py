@@ -140,7 +140,8 @@ class MessageSchema:
 
 class ProfileManifest:
     """A validated manifest. ``ProfileManifest(value)`` is for third-party manifests (the
-    reserved prefixes are rejected); the official ones are ``CORE``, ``TEXT``, ``COMMERCE``."""
+    reserved prefixes are rejected); the official ones are ``CORE``, ``TEXT``, ``DELEGATION``,
+    ``COMMERCE``."""
 
     def __init__(self, value: object, *, _official: bool = False) -> None:
         if (
@@ -197,6 +198,7 @@ def _bundled(name: str) -> ProfileManifest:
 
 CORE = _bundled("core")
 TEXT = _bundled("text")
+DELEGATION = _bundled("delegation")
 COMMERCE = _bundled("commerce")
 
 

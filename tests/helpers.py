@@ -60,11 +60,20 @@ class Clock:
 
 
 class Party:
-    """An identity with its store, prekey vault and peer store (no network)."""
+    """An identity with its store, prekey vault and peer store (no network). ``born``: when its
+    KEL was made (default ten seconds ago); it signs nothing dated earlier (01 § Operational
+    signatures)."""
 
-    def __init__(self, clock: Clock, relay: str = "https://relay.example", **descriptor) -> None:
+    def __init__(
+        self,
+        clock: Clock,
+        relay: str = "https://relay.example",
+        *,
+        born: int | None = None,
+        **descriptor,
+    ) -> None:
         self.clock = clock
-        self.identity = SoftwareIdentity.generate(now=clock.now - 10)
+        self.identity = SoftwareIdentity.generate(now=clock.now - 10 if born is None else born)
         self.id = self.identity.get_ace_id()
         self.store = MemoryStore()
         self.vault = PrekeyVault()

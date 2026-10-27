@@ -8,7 +8,7 @@ import copy
 from ._documents import bad, check_lifetime, verify_claims
 from ._encoding import is_ace_id, resolve_now
 from .identity import ACEIdentity, sign_claims
-from .kel import KelState
+from .kel import KelState, tail_time
 from .limits import MAX_PERMIT_LIFETIME
 
 _KEYS = {"issuer", "subject", "issuedAt", "expiresAt", "signature"}
@@ -21,8 +21,9 @@ def create_permit(
     now: int | None = None,
     lifetime: int = MAX_PERMIT_LIFETIME,
 ) -> dict:
-    """A permit from ``identity`` to ``subject`` valid for ``lifetime`` seconds (<= 30 days)."""
-    t = resolve_now(now)
+    """A permit from ``identity`` to ``subject`` valid for ``lifetime`` seconds (<= 30 days),
+    issued at ``max(now, ts of the identity's last KEL event)``."""
+    t = tail_time(identity.get_kel(), resolve_now(now))
     if not is_ace_id(subject) or subject == identity.get_ace_id():
         raise bad("invalid permit subject")
     if type(lifetime) is not int or not 0 < lifetime <= MAX_PERMIT_LIFETIME:

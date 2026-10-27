@@ -1,7 +1,7 @@
 """The card record (04 § Card record): an agent's durable identity facts.
 
-Its set-once handle, card, payment accounts, whether strangers may request contact and whether it
-is listed, published as the closed CardBundle ``{kel, card}`` and signed with action
+Its set-once handle, card, payment and ERC-8004 accounts, whether strangers may request contact
+and whether it is listed, published as the closed CardBundle ``{kel, card}`` and signed with action
 ``card-record`` over ``canonicalStateBytes(claims)`` (claims: the record without ``signature``).
 It has no expiry.
 """
@@ -9,6 +9,7 @@ It has no expiry.
 from __future__ import annotations
 
 import copy
+import re
 from dataclasses import dataclass, field
 from typing import Literal, TypedDict
 from urllib.parse import urlsplit
@@ -19,6 +20,7 @@ from ._encoding import (
     is_ace_id,
     is_caip10_account,
     is_handle,
+    loads_json,
     resolve_now,
     wire_int,
 )
@@ -26,6 +28,7 @@ from .descriptor import validate_card, validate_relay_route
 from .identity import ACEIdentity, sign_claims
 from .kel import KelState, tail_time
 from .limits import (
+    MAX_CARD_ERC8004,
     MAX_CARD_RECORD_BYTES,
     MAX_PAY_ACCOUNTS,
     MAX_PUBLISHED_AGENT_BYTES,
@@ -36,12 +39,15 @@ from .limits import (
 Contact = Literal["open", "closed"]
 
 _REQUIRED = {"aceId", "issuedAt", "home", "card", "contact", "listed", "signature"}
-_OPTIONAL = {"handle", "pay"}
+_OPTIONAL = {"handle", "pay", "erc8004"}
+_AGENT_ID_RE = re.compile(r"0|[1-9][0-9]{0,77}")
+_NATIVE_AGENT_ID_RE = re.compile(r"[A-Za-z0-9]{1,128}")
 
 
 class _CardRecordOptional(TypedDict, total=False):
     handle: str
     pay: list[str]
+    erc8004: list[dict]
 
 
 class CardRecord(_CardRecordOptional):
@@ -63,13 +69,50 @@ class CardBundle(TypedDict):
     card: CardRecord
 
 
+def validate_erc8004(entry: object) -> dict:
+    """A card record ``erc8004`` entry ``{agentRegistry: CAIP-10, agentId}``: for an ``eip155``
+    registry a decimal string of at most 78 digits; for any other CAIP-2 namespace 1-128
+    characters of ``[A-Za-z0-9]`` (a chain-native identifier such as a Solana base58 address)."""
+    if (
+        type(entry) is not dict
+        or set(entry) != {"agentRegistry", "agentId"}
+        or not is_caip10_account(entry["agentRegistry"])
+        or not isinstance(entry["agentId"], str)
+    ):
+        raise bad("erc8004 entry must be {agentRegistry: CAIP-10, agentId}")
+    eip155 = entry["agentRegistry"].split(":", 1)[0] == "eip155"
+    if (_AGENT_ID_RE if eip155 else _NATIVE_AGENT_ID_RE).fullmatch(entry["agentId"]) is None:
+        raise bad("erc8004 agentId must be decimal (eip155) or 1-128 [A-Za-z0-9]")
+    return copy.deepcopy(entry)
+
+
+def verify_erc8004_registration(registration: object, ace_id: str) -> bool:
+    """Whether an ERC-8004 registration file (tokenURI JSON, as a dict or JSON text) lists
+    ``{"name": "ACE", "endpoint": ace_id}`` under ``services``: the claim of a card record
+    ``erc8004`` entry holds. Reading the chain and the tokenURI is the host's job. Never
+    raises."""
+    try:
+        if isinstance(registration, (str, bytes, bytearray)):
+            registration = loads_json(registration)
+    except ValueError:
+        return False
+    items = registration.get("services") if isinstance(registration, dict) else None
+    return (
+        is_ace_id(ace_id)
+        and isinstance(items, list)
+        and any(
+            isinstance(s, dict) and s.get("name") == "ACE" and s.get("endpoint") == ace_id
+            for s in items
+        )
+    )
+
+
 @dataclass(frozen=True)
 class VerifiedCard:
     """A verified CardBundle (``record`` is ``bundle["card"]``). ``kel_live``: whether the KEL it
-    verified under was confirmed by a live descriptor or an existing pin
-    (``NetworkClient.lookup_card``); False when only the bundle's own KEL vouches for it, as from
-    ``verify_card_bundle`` alone or a lookup of an identity with no live descriptor (04 § Card
-    record)."""
+    verified under is a pin a live descriptor confirmed (``NetworkClient.lookup_card``); False
+    from ``verify_card_bundle`` alone, where only the bundle's own KEL vouches for it. Rely on
+    ``pay`` or ``erc8004`` only when it is True (04 § Card record)."""
 
     ace_id: str
     state: KelState
@@ -96,6 +139,12 @@ class VerifiedCard:
     def pay(self) -> list[str] | None:
         pay = self.record.get("pay")
         return None if pay is None else list(pay)
+
+    @property
+    def erc8004(self) -> list[dict] | None:
+        """The claimed ERC-8004 registrations (``verify_erc8004_registration`` checks one)."""
+        entries = self.record.get("erc8004")
+        return None if entries is None else copy.deepcopy(entries)
 
     @property
     def contact(self) -> Contact:
@@ -154,6 +203,14 @@ def verify_card_bundle(
             or len(set(pay)) != len(pay)
         ):
             raise bad(f"pay must hold 1-{MAX_PAY_ACCOUNTS} distinct CAIP-10 accounts")
+    if "erc8004" in r:
+        e = r["erc8004"]
+        if not isinstance(e, list) or not 1 <= len(e) <= MAX_CARD_ERC8004:
+            raise bad(f"erc8004 must hold 1-{MAX_CARD_ERC8004} entries")
+        for entry in e:
+            validate_erc8004(entry)
+        if len({(x["agentRegistry"], x["agentId"]) for x in e}) != len(e):
+            raise bad("duplicate erc8004 entry")
     if r["contact"] not in ("open", "closed"):
         raise bad("contact must be open or closed")
     if type(r["listed"]) is not bool:
@@ -169,6 +226,7 @@ def create_card_record(
     handle: str | None = None,
     card: dict | None = None,
     pay: list[str] | None = None,
+    erc8004: list[dict] | None = None,
     contact: Contact,
     listed: bool,
     now: int | None = None,
@@ -190,6 +248,8 @@ def create_card_record(
         claims["handle"] = handle
     if pay is not None:
         claims["pay"] = list(pay)
+    if erc8004 is not None:
+        claims["erc8004"] = copy.deepcopy(erc8004)
     bundle = {"kel": kel, "card": sign_claims(identity, "card-record", claims)}
     verify_card_bundle(bundle, t, allow_loopback_relays=allow_loopback_relays)
     return bundle

@@ -44,7 +44,7 @@ from ._encoding import (
 from ._signing import SCHEME, SIGNATURE_SIZE, encode_payload
 from .errors import ACEError
 from .identity import ACEIdentity, sign_operational
-from .kel import KelState, verify_operational_signature
+from .kel import KelState, tail_time, verify_operational_signature
 from .limits import (
     KEM_CIPHERTEXT_SIZE,
     KEM_PUBLIC_KEY_SIZE,
@@ -283,8 +283,10 @@ def create_packet(
     _kem: tuple[bytes, bytes] | None = None,
     _nonce: bytes | None = None,
 ) -> dict:
-    """Encrypt ``plaintext`` (encoded private content) to ``prekey`` and sign. Returns the wire
-    dict. ``_kem`` = ``(ss, kemCiphertext)`` and ``_nonce`` are deterministic-vector hooks."""
+    """Encrypt ``plaintext`` (encoded private content) to ``prekey`` and sign at
+    ``max(timestamp, ts of the identity's last KEL event)`` (01 § Operational signatures: the
+    signer's ``t``, which becomes the packet's ``timestamp``). Returns the wire dict. ``_kem`` =
+    ``(ss, kemCiphertext)`` and ``_nonce`` are deterministic-vector hooks."""
     if isinstance(prekey, dict):
         public = decode_fixed_b64(
             prekey.get("publicKey"), KEM_PUBLIC_KEY_SIZE, "invalid_argument", "prekey.publicKey"
@@ -295,6 +297,7 @@ def create_packet(
     if prekey_id(prekey.public_key) != prekey.id:
         raise ACEError("invalid_argument", "prekey id does not match its public key")
     check_wire_int(timestamp, "timestamp")
+    timestamp = tail_time(identity.get_kel(), timestamp)
     if len(plaintext) > MAX_PLAINTEXT_BYTES:
         raise ACEError("limit_exceeded", f"plaintext exceeds {MAX_PLAINTEXT_BYTES} bytes")
     from_id = identity.get_ace_id()

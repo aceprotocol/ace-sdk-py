@@ -394,7 +394,7 @@ class FakeRelay:
             cards = [(c, s) for c, s in cards if tag in c["card"]["card"].get("tags", [])]
         if profile := query.get("profile"):
             cards = [(c, s) for c, s in cards if any(p["id"] == profile for p in s["descriptor"]["profiles"])]
-        page = [c for c, _ in cards[: int(query.get("limit", "20"))]]
+        page = [c for c, _ in cards[: int(query.get("limit", "100"))]]
         self._reply(h, 200, {"cards": page, "cursor": None})
 
     def _post_v1_blocks(self, h, query, body):

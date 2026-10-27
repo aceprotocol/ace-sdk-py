@@ -22,7 +22,9 @@ from .card_record import (
     VerifiedCard,
     create_card_record,
     is_caip10_account,
+    validate_erc8004,
     verify_card_bundle,
+    verify_erc8004_registration,
 )
 from .commerce import (
     CommerceRules,
@@ -32,10 +34,15 @@ from .commerce import (
     validate_commerce_ext,
 )
 from .delegation import (
-    issue_delegation,
-    validate_erc8004,
-    verify_delegation,
-    verify_erc8004_registration,
+    DELEGATION_PROFILE_ID,
+    DELEGATION_TYPE,
+    MAX_DELEGATION_CREDENTIAL_LIFETIME,
+    MAX_DELEGATION_CREDENTIALS,
+    DelegationRules,
+    create_delegation_credential,
+    delegation_rules,
+    validate_delegation_ext,
+    verify_delegation_credential,
 )
 from .descriptor import (
     VerifiedAgent,
@@ -80,7 +87,7 @@ from .packet import (
 from .peers import PeerRecord, PeerStore
 from .permit import create_permit, verify_permit
 from .prekeys import Prekey, PrekeyVault, prekey_id
-from .profiles import COMMERCE, CORE, TEXT, ProfileManifest, Profiles
+from .profiles import COMMERCE, CORE, DELEGATION, TEXT, ProfileManifest, Profiles
 from .registration import create_registration_request
 from .relay import InboxPage, RelayClient, RelayEntry
 from .replay import ReplayDetector
@@ -103,11 +110,17 @@ __all__ = [
     "CommerceRules",
     "Contact",
     "ContactRequest",
+    "DELEGATION",
+    "DELEGATION_PROFILE_ID",
+    "DELEGATION_TYPE",
+    "DelegationRules",
     "FileStore",
     "Inbox",
     "InboxPage",
     "KelState",
     "KeyProvider",
+    "MAX_DELEGATION_CREDENTIALS",
+    "MAX_DELEGATION_CREDENTIAL_LIFETIME",
     "MAX_PACKET_BYTES",
     "MAX_PLAINTEXT_BYTES",
     "MemoryStore",
@@ -147,6 +160,7 @@ __all__ = [
     "conversation_key",
     "create_auth_headers",
     "create_card_record",
+    "create_delegation_credential",
     "create_inception",
     "create_packet",
     "create_permit",
@@ -157,6 +171,7 @@ __all__ = [
     "decode_content",
     "decode_packet",
     "decrypt_packet",
+    "delegation_rules",
     "encode_content",
     "encode_payload",
     "extend_kel",
@@ -167,7 +182,6 @@ __all__ = [
     "is_canonical_relay_url",
     "is_message_id",
     "is_usable",
-    "issue_delegation",
     "key_digest",
     "normalize_relay_url",
     "prekey_id",
@@ -176,9 +190,10 @@ __all__ = [
     "to_base64",
     "validate_card",
     "validate_commerce_ext",
+    "validate_delegation_ext",
     "validate_erc8004",
     "verify_card_bundle",
-    "verify_delegation",
+    "verify_delegation_credential",
     "verify_erc8004_registration",
     "verify_kel",
     "verify_operational_signature",

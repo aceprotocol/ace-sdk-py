@@ -76,8 +76,7 @@ def verify_signed(
 ) -> KelState:
     """The signature's shape (``invalid_authorization``, before any KEL work, 04 §
     Verification), the KEL usable at ``now`` (``invalid_kel`` / ``invalid_signature``) naming
-    ``document["aceId"]``, reconciled with ``pinned`` when given, ``issuedAt`` not before the
-    ``dlg`` of the current signing key (``stale_peer_binding``), and ``document`` signed under it
+    ``document["aceId"]``, reconciled with ``pinned`` when given, and ``document`` signed under it
     (``verify_claims``). Returns the state it verified under."""
     check_signature_shape(document.get("signature"), "invalid_authorization")
     state = verify_kel(kel, now)
@@ -87,10 +86,5 @@ def verify_signed(
         raise bad("aceId does not match the kel")
     if pinned is not None:
         state, _ = reconcile_kel(pinned, state)
-    # Issued before its signing delegation: signed under another branch that delegated the same
-    # key at the same seq (a recovered fork), never under this log.
-    s = state.signing
-    if s is not None and document["issuedAt"] < wire_int(state.events[s.seq]["ts"]):  # type: ignore[operator]
-        raise ACEError("stale_peer_binding", f"{action} issued before its signing delegation")
     verify_claims(state, action, document, now)
     return state

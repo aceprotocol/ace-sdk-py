@@ -17,7 +17,7 @@ from ace import (
     encode_content,
 )
 from ace.limits import MAX_PERMIT_LIFETIME, OFFLINE_WINDOW_SECONDS
-from tests.helpers import PEER_PREKEY, Clock, Party, raises, wire
+from tests.helpers import NOW, PEER_PREKEY, Clock, Party, raises, wire
 
 TEXT_DIGEST = TEXT.messages["ace:text:1"].digest
 CONTACT_DIGEST = CORE.messages["ace:contact:1"].digest
@@ -25,10 +25,17 @@ CONTACT_DIGEST = CORE.messages["ace:contact:1"].digest
 
 class World:
     def __init__(
-        self, *, contact="closed", admitted=True, refresh=None, on_message=None, capacity=None
+        self,
+        *,
+        contact="closed",
+        admitted=True,
+        refresh=None,
+        on_message=None,
+        capacity=None,
+        born=None,
     ):
         self.clock = Clock()
-        self.a, self.b = Party(self.clock), Party(self.clock)
+        self.a, self.b = Party(self.clock, born=born), Party(self.clock, born=born)
         self.got = []
         self.refreshes = []
         if admitted:
@@ -170,7 +177,8 @@ def contact(w, kind="request", profile=TEXT, permit=True, ts=None):
 def test_stranger_contacts_only_while_open_and_never_admit():
     private = World(admitted=False)
     assert private.inbox.receive(wire(contact(private))).kind == "dropped"
-    w = World(admitted=False, contact="open")
+    # born before the oldest packet below, which it could not sign otherwise
+    w = World(admitted=False, contact="open", born=NOW - OFFLINE_WINDOW_SECONDS - 60)
     out = w.inbox.receive(wire(contact(w)))
     assert out.kind == "delivered" and out.receipt is None  # contacts are never receipted
     assert w.got[0].type == "ace:contact:1"

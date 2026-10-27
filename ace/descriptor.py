@@ -3,14 +3,13 @@
 live in the card record (``card_record``).
 
 The descriptor is signed with action ``agent-descriptor``, ``aceId``, ``issuedAt`` and payload
-``canonicalStateBytes(claims)``. Expired delegation entries are
-dropped; any other invalid field invalidates the whole descriptor (``invalid_authorization``).
+``canonicalStateBytes(claims)``. Any invalid field invalidates the whole descriptor
+(``invalid_authorization``).
 """
 
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from ._documents import bad, check_lifetime, check_size, verify_signed
@@ -23,24 +22,19 @@ from ._encoding import (
     is_namespaced_id,
     is_sha256_hex,
     resolve_now,
-    wire_int,
 )
 from ._relay_url import is_canonical_relay_url
-from .delegation import CREDENTIAL_KEYS, validate_erc8004, verify_delegation
 from .errors import ACEError
 from .identity import ACEIdentity, sign_claims
-from .kel import KelState, check_signature_shape, tail_time
+from .kel import KelState, tail_time
 from .limits import (
     DEFAULT_DESCRIPTOR_LIFETIME,
     KEM_PUBLIC_KEY_SIZE,
-    MAX_DESCRIPTOR_DELEGATIONS,
-    MAX_DESCRIPTOR_ERC8004,
     MAX_DESCRIPTOR_LIFETIME,
     MAX_DESCRIPTOR_PROFILES,
     MAX_DESCRIPTOR_RELAYS,
     MAX_EXT_BYTES,
     MAX_PUBLISHED_AGENT_BYTES,
-    MAX_STRANGER_DELEGATIONS,
     MAX_STRANGER_KEL_EVENTS,
 )
 from .prekeys import Prekey, prekey_id
@@ -54,19 +48,18 @@ _REQUIRED = {
     "profiles",
     "signature",
 }
-_OPTIONAL = {"ext", "delegations", "erc8004"}
+_OPTIONAL = {"ext"}
 _TAG_CHARS = set("abcdefghijklmnopqrstuvwxyz0123456789-")
 
 
 @dataclass(frozen=True)
 class VerifiedAgent:
-    """A verified PublishedAgent. ``delegations`` lists the issuers of the live credentials."""
+    """A verified PublishedAgent."""
 
     ace_id: str
     state: KelState
     source: dict = field(hash=False)
     prekey: Prekey
-    delegations: tuple[str, ...] = ()
 
     @property
     def descriptor(self) -> dict:
@@ -148,16 +141,22 @@ def _check_profiles(profiles: object) -> list[dict]:
     return profiles
 
 
-#: Official profiles' descriptor ``ext`` validators; an official profile without one takes no ext.
+#: Official profiles' descriptor ``ext`` validators, called with ``(value, aceId, now)``; an
+#: official profile without one takes no ext.
 def _official_ext() -> dict:
     from .commerce import PROFILE_ID, validate_commerce_ext
+    from .delegation import DELEGATION_PROFILE_ID, validate_delegation_ext
 
-    return {PROFILE_ID: validate_commerce_ext}
+    return {
+        PROFILE_ID: lambda value, ace_id, now: validate_commerce_ext(value),
+        DELEGATION_PROFILE_ID: validate_delegation_ext,
+    }
 
 
-def _check_ext(ext: object, profile_ids: set[str]) -> None:
-    """Keys are announced profile ids, values objects, canonical size <= 4096; an official
-    profile's value must match its schema (and only official profiles that define one)."""
+def _check_ext(ext: object, profile_ids: set[str], ace_id: str, now: int) -> None:
+    """Keys are announced profile ids, values objects, canonical size <= ``MAX_EXT_BYTES``; an
+    official profile's value must match its schema (and only official profiles that define
+    one)."""
     if type(ext) is not dict or not ext or not set(ext) <= profile_ids:
         raise bad("ext keys must be announced profile ids")
     if not all(type(v) is dict for v in ext.values()):
@@ -166,7 +165,7 @@ def _check_ext(ext: object, profile_ids: set[str]) -> None:
     official = _official_ext()
     for key, value in ext.items():
         if key in official:
-            official[key](value)
+            official[key](value, ace_id, now)
         elif key.startswith("ace:"):
             raise bad(f"profile {key} defines no ext")
 
@@ -185,47 +184,13 @@ def _check_prekey(prekey: object) -> Prekey:
     return Prekey(prekey["id"], pk)
 
 
-def _is_delegation_shape(entry: object) -> bool:
-    """A delegation entry's closed shape, part of the descriptor's (04 § Verification step 1):
-    ``{kel, credential: {issuer: ACE ID, subject: string, issuedAt, expiresAt: wire integers,
-    signature: operational signature shape}}``. ``kel`` is step 2's (``invalid_kel``); the entry's
-    rules (04 § Delegations) are step 4's."""
-    if type(entry) is not dict or set(entry) != {"kel", "credential"}:
-        return False
-    c = entry["credential"]
-    if (
-        type(c) is not dict
-        or set(c) != CREDENTIAL_KEYS
-        or not is_ace_id(c["issuer"])
-        or not isinstance(c["subject"], str)
-        or wire_int(c["issuedAt"]) is None
-        or wire_int(c["expiresAt"]) is None
-    ):
-        return False
-    try:
-        check_signature_shape(c["signature"], "invalid_authorization")
-    except ACEError:
-        return False
-    return True
-
-
 def check_stranger_source(value: object) -> None:
-    """The bounds on a stranger's contact ``source`` (05 § Receiver admission), checked before
-    any signature: its KEL and each delegation entry's KEL hold at most
-    ``MAX_STRANGER_KEL_EVENTS`` events and it carries at most ``MAX_STRANGER_DELEGATIONS``
-    delegation entries. ``not_permitted`` otherwise (the request is dropped)."""
-
-    def short(kel: object) -> bool:
-        return isinstance(kel, list) and len(kel) <= MAX_STRANGER_KEL_EVENTS
-
-    d = value.get("descriptor") if isinstance(value, dict) else None
-    if not isinstance(value, dict) or not isinstance(d, dict) or not short(value.get("kel")):
+    """The bound on a stranger's contact ``source`` (05 § Receiver admission), checked before
+    any signature: its ``kel`` holds at most ``MAX_STRANGER_KEL_EVENTS`` events.
+    ``not_permitted`` otherwise (the request is dropped)."""
+    kel = value.get("kel") if isinstance(value, dict) else None
+    if not isinstance(kel, list) or len(kel) > MAX_STRANGER_KEL_EVENTS:
         raise ACEError("not_permitted", "stranger source exceeds the KEL bound")
-    dl = d.get("delegations", [])
-    if not isinstance(dl, list) or len(dl) > MAX_STRANGER_DELEGATIONS:
-        raise ACEError("not_permitted", "stranger source carries too many delegations")
-    if not all(isinstance(e, dict) and short(e.get("kel")) for e in dl):
-        raise ACEError("not_permitted", "stranger delegation exceeds the KEL bound")
 
 
 def verify_published_agent(
@@ -234,7 +199,6 @@ def verify_published_agent(
     now: int | None = None,
     allow_loopback_relays: bool = False,
     pinned: KelState | None = None,
-    delegation_pins: Mapping[str, KelState] | None = None,
 ) -> VerifiedAgent:
     """Verify a ``{kel, descriptor}`` at ``now``; ``invalid_authorization`` (or the KEL's own
     ``invalid_kel`` / ``invalid_signature`` codes).
@@ -242,10 +206,7 @@ def verify_published_agent(
     With ``pinned`` (the verifier's pin for this identity) the carried KEL is first reconciled
     with the pin under the fork rules and the signature must verify under the resulting, newest
     state: a descriptor carrying an older prefix of the pinned log and signed by a delegation
-    the pin has superseded is ``stale_peer_binding``; a fork is ``kel_conflict``.
-
-    ``delegation_pins`` maps delegation issuers to the verifier's pins for them; each entry's
-    issuer KEL is reconciled with its pin the same way (a failure is ``invalid_authorization``)."""
+    the pin has superseded is ``stale_peer_binding``; a fork is ``kel_conflict``."""
     t = resolve_now(now)
     if type(value) is not dict or set(value) != {"kel", "descriptor"}:
         raise bad("published agent must be {kel, descriptor}")
@@ -270,33 +231,10 @@ def verify_published_agent(
     prekey = _check_prekey(d["prekey"])
     profiles = _check_profiles(d["profiles"])
     if "ext" in d:
-        _check_ext(d["ext"], {p["id"] for p in profiles})
-    if "erc8004" in d:
-        e = d["erc8004"]
-        if not isinstance(e, list) or not 1 <= len(e) <= MAX_DESCRIPTOR_ERC8004:
-            raise bad("erc8004 must hold 1-4 entries")
-        for entry in e:
-            validate_erc8004(entry)
-        if len({(x["agentRegistry"], x["agentId"]) for x in e}) != len(e):
-            raise bad("duplicate erc8004 entry")
-    dl = d.get("delegations", [])
-    if "delegations" in d:  # shape before any KEL or signature work (04 § Verification)
-        if not isinstance(dl, list) or not 1 <= len(dl) <= MAX_DESCRIPTOR_DELEGATIONS:
-            raise bad("delegations must hold 1-4 entries")
-        if not all(_is_delegation_shape(e) for e in dl):
-            raise bad("delegations must be {kel, credential} entries")
-        if len({str(e["credential"]["issuer"]) for e in dl}) != len(dl):
-            raise bad("delegation issuers must be distinct")
+        _check_ext(d["ext"], {p["id"] for p in profiles}, d["aceId"], t)
     check_lifetime(d, t, MAX_DESCRIPTOR_LIFETIME)
     state = verify_signed(value["kel"], d, "agent-descriptor", t, pinned)
-    live: list[str] = []
-    for entry in dl:
-        who = entry["credential"]["issuer"]
-        pin = delegation_pins.get(who) if delegation_pins and isinstance(who, str) else None
-        issuer, ok = verify_delegation(entry, d["aceId"], now=t, pinned=pin)
-        if ok:
-            live.append(issuer.ace_id)
-    return VerifiedAgent(d["aceId"], state, copy.deepcopy(value), prekey, tuple(live))
+    return VerifiedAgent(d["aceId"], state, copy.deepcopy(value), prekey)
 
 
 def create_published_agent(
@@ -306,8 +244,6 @@ def create_published_agent(
     prekey: Prekey,
     profiles: list[dict] | None = None,
     ext: dict | None = None,
-    delegations: list[dict] | None = None,
-    erc8004: list[dict] | None = None,
     now: int | None = None,
     lifetime: int = DEFAULT_DESCRIPTOR_LIFETIME,
     allow_loopback_relays: bool = False,
@@ -331,10 +267,6 @@ def create_published_agent(
     }
     if ext:
         claims["ext"] = copy.deepcopy(ext)
-    if delegations:
-        claims["delegations"] = copy.deepcopy(delegations)
-    if erc8004:
-        claims["erc8004"] = copy.deepcopy(erc8004)
     source = {"kel": kel, "descriptor": sign_claims(identity, "agent-descriptor", claims)}
     verify_published_agent(source, now=t, allow_loopback_relays=allow_loopback_relays)
     return source

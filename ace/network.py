@@ -1,7 +1,7 @@
 """NetworkClient: publish, discover, look up, connect / accept / reject / block, send, pull.
 
 It wires the core pieces together over relays: our descriptor (with prekey rotation) and card
-record (handle, card, pay, contact, listed; 04 § Card record), the
+record (handle, card, pay, erc8004, contact, listed; 04 § Card record), the
 PeerStore admission table, the Outbox (send + retry), the Inbox (receipts, permit renewal) and
 relay clients for foreign relays (SSRF-safe ``RelayClient``). Remote content (contacts,
 descriptors, messages) never changes local admission: only ``connect``, ``accept``, ``reject``,
@@ -11,7 +11,6 @@ descriptors, messages) never changes local admission: only ``connect``, ``accept
 from __future__ import annotations
 
 import copy
-import functools
 import re
 import threading
 from dataclasses import dataclass, replace
@@ -32,6 +31,13 @@ from ._encoding import (
 )
 from ._relay_url import is_canonical_relay_url
 from .card_record import Contact, VerifiedCard, create_card_record, verify_card_bundle
+from .delegation import (
+    DELEGATION_PROFILE_ID,
+    DELEGATION_TYPE,
+    check_credential,
+    delegation_rules,
+    verify_delegation_credential,
+)
 from .descriptor import VerifiedAgent, create_published_agent, verify_published_agent
 from .errors import ACEError
 from .identity import ACEIdentity
@@ -40,7 +46,6 @@ from .invitation import verify_invitation
 from .kel import event_bytes
 from .limits import (
     CONTACT_REQUEST_TTL_SECONDS,
-    DEFAULT_PAGE_LIMIT,
     MAX_INBOX_PAGE,
     MAX_PENDING_CONTACT_REQUESTS,
     PREKEY_ROTATION_SECONDS,
@@ -183,7 +188,6 @@ class NetworkClient:
         contact: Contact = "closed",
         listed: bool = False,
         ext: dict | None = None,
-        delegations: list[dict] | None = None,
         erc8004: list[dict] | None = None,
         accept_profiles: tuple[str, ...] | list[str] = (),
         relay_factory: Callable[[str], RelayClient] | None = None,
@@ -197,18 +201,22 @@ class NetworkClient:
             raise ACEError("invalid_argument", "accept_profiles must name installed profiles")
         self.accept_profiles = tuple(accept_profiles)
         # the card record: handle is set once per home (it can never change or be dropped there)
-        self.handle, self.card, self.pay = handle, card or {}, pay
+        self.handle, self.card, self.pay, self.erc8004 = handle, card or {}, pay, erc8004
         self.contact, self.listed, self.ext = contact, listed, ext
-        self.delegations, self.erc8004 = delegations, erc8004
         # foreign relays come from untrusted descriptors: same loopback policy as the home relay
         self._factory = relay_factory or (
             lambda url: RelayClient(url, allow_loopback=relay.allow_loopback, clock=clock)
         )
         self._clock = clock
         self._user_on_message = on_message
-        self._rules = rules
         self._user_on_receipt = on_receipt
         self.peers = PeerStore(store, clock=clock, allow_loopback_relays=relay.allow_loopback)
+        # an installed ``ace:delegation:1`` runs its message rule over our peer pins
+        if self.profiles.get(DELEGATION_PROFILE_ID) is not None and not any(
+            DELEGATION_TYPE in r.types for r in rules
+        ):
+            rules = (*rules, delegation_rules(self.peers, identity.get_ace_id()))
+        self._rules = rules
         self.outbox = Outbox(
             identity,
             store,
@@ -300,6 +308,7 @@ class NetworkClient:
                 "listed": self.listed,
                 **({"handle": self.handle} if self.handle is not None else {}),
                 **({"pay": self.pay} if self.pay is not None else {}),
+                **({"erc8004": self.erc8004} if self.erc8004 is not None else {}),
             }
             digest = sha256_hex(
                 canonical_state_bytes(
@@ -338,8 +347,6 @@ class NetworkClient:
             "prekey": prekey.to_dict(),
             "profiles": self.profiles.entries(),
             **({"ext": self.ext} if self.ext else {}),
-            **({"delegations": self.delegations} if self.delegations else {}),
-            **({"erc8004": self.erc8004} if self.erc8004 else {}),
         }
         if old is not None:
             src = old["source"]
@@ -347,7 +354,7 @@ class NetworkClient:
             same = (
                 src["kel"] == self.identity.get_kel()
                 and all(d.get(k) == v for k, v in wanted.items())
-                and all(k in wanted for k in ("ext", "delegations", "erc8004") if k in d)
+                and ("ext" not in d or "ext" in wanted)
             )
             if same and d["expiresAt"] > now + 3600:
                 if force:
@@ -360,8 +367,6 @@ class NetworkClient:
             prekey=prekey,
             profiles=self.profiles.entries(),
             ext=self.ext,
-            delegations=self.delegations,
-            erc8004=self.erc8004,
             now=issued,
             allow_loopback_relays=self.peers.allow_loopback_relays,
         )
@@ -395,7 +400,7 @@ class NetworkClient:
         tag: str | None = None,
         profile: str | None = None,
         cursor: str | None = None,
-        limit: int = DEFAULT_PAGE_LIMIT,
+        limit: int = MAX_INBOX_PAGE,
     ) -> tuple[list[VerifiedCard], str | None]:
         """The public directory of our relay: listed card records (verified, not pinned).
         ``lookup`` an entry's ACE ID to obtain its descriptor before connecting."""
@@ -432,65 +437,26 @@ class NetworkClient:
         return agent, self._check_card(card.bundle, (relay.base_url, handle), kel_live=kel_live)
 
     def lookup_card(self, target: str) -> VerifiedCard:
-        """The verified card record of ``target`` (an ACE ID or ``@name@relay-host``). A handle
-        resolves only to a record whose ``home`` is the queried relay and whose ``handle`` is the
-        queried one (``unknown_peer``). A handle is set once per home: after a record with a
-        handle was seen for an identity, a record of it naming the same home with another or no
-        handle is ``invalid_authorization``; a new home adds a binding without forgetting earlier
-        homes. A handle's first
-        resolution pins its ACE ID; a later resolution to another one is
-        ``invalid_authorization``. Without a KEL pin for the identity, its descriptor is looked
-        up first and its KEL pinned, so the card is verified under the current KEL, never one a
-        relay chose. When every route answers ``unknown_peer`` (no live descriptor: offline past
-        its lifetime), the card is verified under the bundle's own KEL instead, that KEL is
-        pinned as a descriptor's would be, and the result has ``kel_live`` False (04 § Card
-        record). That pin is recorded as not confirmed live: later lookups look the descriptor up
-        again and report False until one confirms it."""
+        """The verified card record of ``target`` (an ACE ID or ``@name@relay-host``). The
+        identity's descriptor is looked up first, at a relay (never a cached one), and its KEL
+        pinned, so the card verifies under a KEL a live descriptor confirmed, never one a relay
+        chose; a descriptor failure (``unknown_peer`` included: no live descriptor) is the
+        lookup's failure and pins nothing (04 § Card record). A handle resolves only to a record
+        whose ``home`` is the queried relay and whose ``handle`` is the queried one
+        (``unknown_peer``). A handle is set once per home: after a record with a handle was seen
+        for an identity, a record of it naming the same home with another or no handle is
+        ``invalid_authorization``; a new home adds a binding without forgetting earlier homes. A
+        handle's first resolution pins its ACE ID; a later resolution to another one is
+        ``invalid_authorization``. ``kel_live`` is the pin's own flag after the lookup: False
+        only when the pin had moved past the served descriptor's KEL by another path."""
         if is_ace_id(target):
-            fetch_card = functools.cache(lambda: self._fetch_card(target))
-            kel_live = self._card_kel(target, lambda: self.agent(target, refresh=True), fetch_card)
-            return self._check_card(fetch_card().bundle, kel_live=kel_live)
+            self.agent(target, refresh=True)
+            card = self._fetch_card(target)
+            return self._check_card(card.bundle, kel_live=self.peers.kel_live(target))
         card, relay, handle = self._card_by_handle(target)
-        kel_live = self._card_kel(
-            card.ace_id, lambda: self._fetch(card.ace_id, [relay.base_url]), lambda: card
-        )
+        self._fetch(card.ace_id, [relay.base_url])
+        kel_live = self.peers.kel_live(card.ace_id)
         return self._check_card(card.bundle, (relay.base_url, handle), kel_live=kel_live)
-
-    def _card_kel(
-        self,
-        ace_id: str,
-        fetch: Callable[[], VerifiedAgent],
-        card: Callable[[], VerifiedCard],
-    ) -> bool:
-        """The KEL a card lookup verifies under, and whether a live descriptor confirmed it. A
-        pin confirmed live is used as is. Otherwise the descriptor is looked up at a relay through
-        ``fetch`` (never a cached one) and the result is the pin's ``kel_live`` after it: a
-        relay's descriptor bound to the pin confirms it, a replayed or older one does not. When
-        every route answers ``unknown_peer``, an unconfirmed pin stays unconfirmed, and without a
-        pin the card's own bundle (``card``) pins the KEL (``_pin_bundle_kel``). Every other
-        failure propagates."""
-        pinned = self.peers.state(ace_id)
-        if pinned is not None and self.peers.kel_live(ace_id):
-            return True
-        try:
-            fetch()
-        except ACEError as exc:
-            if exc.code != "unknown_peer":
-                raise
-            if pinned is None:
-                self._pin_bundle_kel(card())
-            return False
-        return self.peers.kel_live(ace_id)
-
-    def _pin_bundle_kel(self, card: VerifiedCard) -> None:
-        """Pin the KEL of ``card`` (already verified for the looked-up identity; no live
-        descriptor: not ``kel_live``). ``peers.pin`` reconciles it with any pin written since;
-        ``_check_card`` then re-verifies the record under the pin."""
-        state, _ = self.peers.pin(list(card.state.events), self._now())
-        # As for a descriptor: another path advanced the pin past the card's KEL state (the pin
-        # was left as it was).
-        if state.last_hash != card.state.last_hash:
-            raise ACEError("stale_peer_binding", "the pin advanced past the card record")
 
     def _check_card(
         self, bundle: dict, resolved: tuple[str, str] | None = None, *, kel_live: bool = True
@@ -612,6 +578,15 @@ class NetworkClient:
                 self._relay_for(url).descriptor(ace_id), self._now(), live=True
             ),
         )
+
+    def verify_delegation(self, value: object) -> dict:
+        """A copy of the ``ace:delegation:1`` credential ``value`` once it verifies under our pin
+        of its issuer (profiles/delegation.md § Verifying a credential): the issuer's descriptor
+        (cached while usable, else looked up and pinned), then ``now < expiresAt`` and the
+        signature. A lookup or pin failure propagates as itself, never as "not delegated"."""
+        now = self._now()
+        issuer = check_credential(value, now)["issuer"]
+        return verify_delegation_credential(value, self.agent(issuer).state, now)
 
     def _target(self, target: str | dict | VerifiedAgent) -> VerifiedAgent:
         if isinstance(target, (VerifiedAgent, dict)):

@@ -8,9 +8,7 @@ from ace import (
     MemoryStore,
     PeerStore,
     create_permit,
-    issue_delegation,
     validate_card,
-    verify_erc8004_registration,
     verify_kel,
     verify_permit,
     verify_published_agent,
@@ -91,7 +89,6 @@ def test_invalid_cards(card):
         {"profiles": [TEXT.descriptor()], "ext": {"urn:x:1": {}}},  # not announced
         {"profiles": [{"id": "urn:x:1", "digest": "0" * 64}], "ext": {"urn:x:1": 1}},
         {"profiles": [COMMERCE.descriptor()], "ext": {"ace:commerce:1": {"settlement": []}}},
-        {"erc8004": [{"agentRegistry": "eip155:8453:0xabc", "agentId": "01"}]},
     ],
 )
 def test_invalid_fields_invalidate_the_descriptor(p, kw):
@@ -99,7 +96,7 @@ def test_invalid_fields_invalidate_the_descriptor(p, kw):
         p.source(**kw)
 
 
-def test_ext_and_erc8004(p):
+def test_ext(p):
     ext = {
         "ace:commerce:1": {
             "settlement": [
@@ -112,41 +109,8 @@ def test_ext_and_erc8004(p):
     src = p.source(
         profiles=[COMMERCE.descriptor(), {"id": "urn:x:1", "digest": "1" * 64}],
         ext=ext,
-        erc8004=[{"agentRegistry": "eip155:8453:0x" + "a" * 40, "agentId": "42"}],
     )
     assert verify_published_agent(src, now=NOW).ext == ext
-    reg = {
-        "services": [{"name": "web", "endpoint": "https://x"}, {"name": "ACE", "endpoint": p.id}]
-    }
-    assert verify_erc8004_registration(reg, p.id)
-    # only ``services`` (04 § ERC-8004)
-    assert not verify_erc8004_registration({"endpoints": [{"name": "ACE", "endpoint": p.id}]}, p.id)
-    assert not verify_erc8004_registration({"services": [{"name": "ACE", "endpoint": "x"}]}, p.id)
-    assert not verify_erc8004_registration("{not json", p.id)
-    assert not verify_erc8004_registration([], p.id)
-
-
-def test_delegations(p):
-    clock = p.clock
-    boss, other = Party(clock), Party(clock)
-    live = issue_delegation(boss.identity, p.id, now=NOW)
-    a = verify_published_agent(p.source(delegations=[live]), now=NOW)
-    assert a.delegations == (boss.id,)
-    # expired entries are dropped, not fatal
-    expired = issue_delegation(other.identity, p.id, now=NOW - 700000, lifetime=3600)
-    a = verify_published_agent(p.source(delegations=[live, expired]), now=NOW)
-    assert a.delegations == (boss.id,)
-    # wrong subject, tampered, duplicate issuer: the whole descriptor is invalid
-    with raises("invalid_authorization"):
-        p.source(delegations=[issue_delegation(boss.identity, other.id, now=NOW)])
-    bad = copy.deepcopy(live)
-    bad["credential"]["expiresAt"] -= 1
-    with raises("invalid_authorization"):
-        p.source(delegations=[bad])
-    with raises("invalid_authorization"):
-        p.source(delegations=[live, issue_delegation(boss.identity, p.id, now=NOW)])
-    with raises("invalid_authorization"):
-        issue_delegation(boss.identity, p.id, now=NOW, lifetime=604801)
 
 
 def test_permits(p):
@@ -174,19 +138,3 @@ def test_descriptor_pinning_keeps_the_newest(p):
     peers.adopt(new)
     assert peers.adopt(old).relays == ["https://new.example"]  # an older descriptor is ignored
     assert peers.agent(p.id).relays == ["https://new.example"]
-
-
-def test_delegation_issuer_is_reconciled_with_its_pin():
-    """M2: a delegation entry carrying an older issuer KEL, signed by a delegation the verifier's
-    pin of the issuer has superseded, is invalid (01 § Pinning, 04 § Delegations)."""
-    clock = Clock()
-    alice, dave, viewer = Party(clock), Party(clock), Party(clock)
-    stale = issue_delegation(dave.identity, alice.id, now=NOW - 5)
-    dave.identity.delegate(now=NOW - 4)  # dave replaces its signing key
-    src = alice.source(delegations=[stale])
-    assert verify_published_agent(src, now=NOW).delegations == (dave.id,)  # standalone: passes
-    viewer.peers.pin(dave.identity.get_kel(), NOW)
-    with raises("invalid_authorization"):
-        viewer.peers.adopt(src, NOW)
-    fresh = issue_delegation(dave.identity, alice.id, now=NOW - 3)
-    assert viewer.peers.adopt(alice.source(delegations=[fresh]), NOW).delegations == (dave.id,)

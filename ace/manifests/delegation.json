@@ -1,0 +1,23 @@
+{
+  "id": "ace:delegation:1",
+  "messages": [
+    {
+      "type": "ace:delegation:1",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "credential": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": true
+          }
+        },
+        "required": [
+          "credential"
+        ],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

@@ -391,13 +391,15 @@ def verify_operational_signature(
 ) -> None:
     """01 § Operational signatures, in order, for a ``{scheme, seq, value}`` signature over
     ``M(state.ace_id, signed_at, seq, payload)``: 1. the shape (``check_signature_shape``,
-    ``code``); 2. ``seq`` names the current signing delegation; 3. signed while live
-    (``signed_at < notAfter``); 4. the signature verifies (``code``); 5. the signer is usable at
-    ``now``. Failures of 2, 3 and 5 are ``stale_peer_binding``."""
+    ``code``); 2. ``seq`` names the current signing delegation; 3. signed while live (``ts`` of
+    the delegating ``dlg`` ``<= signed_at < notAfter``); 4. the signature verifies (``code``);
+    5. the signer is usable at ``now``. Failures of 2, 3 and 5 are ``stale_peer_binding``."""
     raw = check_signature_shape(signature, code)
     seq, signing = wire_int(signature["seq"]), state.signing  # type: ignore[index]
     if signing is None or seq != signing.seq:
         raise ACEError("stale_peer_binding", "seq is not the current signing delegation")
+    if signed_at < wire_int(state.events[signing.seq]["ts"]):  # type: ignore[operator]
+        raise ACEError("stale_peer_binding", "signed before the delegating dlg's ts")
     if signing.not_after is not None and signed_at >= signing.not_after:
         raise ACEError("stale_peer_binding", "signed at or after the delegation's notAfter")
     message = signing_message(state.ace_id, signed_at, signing.seq, payload)
