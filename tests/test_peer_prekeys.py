@@ -6,6 +6,7 @@ import time
 
 from ace import (
     TEXT,
+    ACEError,
     MemoryStore,
     NetworkClient,
     PrekeyVault,
@@ -280,6 +281,37 @@ def test_held_key_with_all_zero_x25519_half(relay):
     assert retry.prekey_id == bob.vault.current().id
     assert alice.vault.held(b, pin, now[0]) is None
     bob.pull()
+    alice.pull()
+    assert alice.outbox.get(mid).status == "delivered"
+    alice.close()
+    bob.close()
+
+
+def test_held_key_failing_the_mlkem_modulus_check_falls_back_to_published(relay):
+    """A held key whose ML-KEM half fails pyca's modulus check cannot be encapsulated to
+    (``invalid_argument``, never an outage): it is dropped and the same first attempt goes to
+    the published prekey."""
+    now, alice, bob, a, b = _pair(relay)
+    _ratchet(relay, now, alice, bob, a, b)
+    pin = _pin(alice, b)
+    real = alice.vault.held(b, pin, now[0]).public_key
+    bad = b"\xff\xff" + real[2:]  # the first 12-bit coefficient is 0xfff >= q
+    try:
+        _xwing.encapsulate(bad)
+    except ACEError as exc:
+        assert exc.code == "invalid_argument"
+    else:
+        raise AssertionError("encapsulated to a key failing the modulus check")
+    alice.vault.drop_held(b)
+    alice.vault.hold(b, Prekey(prekey_id(bad), bad), now[0], pin)
+    n = len(relay.sent)
+    mid = alice.send(b, "ace:text:1", {"message": "m3"})
+    (first,) = _since(relay, n, alice, bob)
+    assert first.prekey_id == bob.vault.current().id
+    assert alice.vault.held(b, pin, now[0]) is None
+    assert alice.outbox.get(mid).attempts == 1
+    (out,) = bob.pull()
+    assert out.kind == "delivered"
     alice.pull()
     assert alice.outbox.get(mid).status == "delivered"
     alice.close()

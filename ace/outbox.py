@@ -524,14 +524,31 @@ class Outbox:
                     raise
                 extra = None  # too large with it: sent without
                 plaintext = encode_content(*args, prekey=offered)
-            packet = create_packet(
-                self._identity,
-                e.to,
-                prekey,
-                plaintext,
-                timestamp=now,
-                message_id=e.message_id,
-            )
+            try:
+                packet = create_packet(
+                    self._identity,
+                    e.to,
+                    prekey,
+                    plaintext,
+                    timestamp=now,
+                    message_id=e.message_id,
+                )
+            except ACEError as exc:
+                if prekey is agent.prekey or exc.code != "invalid_argument":
+                    raise
+                # A held key that cannot be encapsulated to is dropped; the same attempt goes
+                # to the published prekey.
+                self._vault.drop_held(e.to)
+                prekey = agent.prekey
+                used = prekey.id
+                packet = create_packet(
+                    self._identity,
+                    e.to,
+                    prekey,
+                    plaintext,
+                    timestamp=now,
+                    message_id=e.message_id,
+                )
             if extra is None:
                 transport(packet, agent)
             else:

@@ -126,7 +126,8 @@ def check_public_key(public_key: bytes) -> None:
 def encapsulate(public_key: bytes) -> tuple[bytes, bytes]:
     """Encapsulate to an X-Wing public key.
 
-    Returns ``(shared_secret, ciphertext)``: 32 bytes and 1120 bytes.
+    Returns ``(shared_secret, ciphertext)``: 32 bytes and 1120 bytes. A key pyca refuses (e.g.
+    an ML-KEM half failing the modulus check) is ``invalid_argument``.
     """
     _check_length(public_key, PUBLIC_KEY_SIZE, "public key")
     pk_m = bytes(public_key[:_MLKEM_PK_SIZE])
@@ -137,7 +138,10 @@ def encapsulate(public_key: bytes) -> tuple[bytes, bytes]:
     ss_x = _x25519(ek_x, pk_x)
 
     # pyca returns (shared_secret[32], ciphertext[1088]).
-    ss_m, ct_m = MLKEM768PublicKey.from_public_bytes(pk_m).encapsulate()
+    try:
+        ss_m, ct_m = MLKEM768PublicKey.from_public_bytes(pk_m).encapsulate()
+    except ValueError:
+        raise ACEError("invalid_argument", "X-Wing encapsulation failed") from None
 
     ss = _combiner(ss_m, ss_x, ct_x, pk_x)
     return ss, ct_m + ct_x
