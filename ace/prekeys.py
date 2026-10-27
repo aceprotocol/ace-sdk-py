@@ -66,6 +66,19 @@ def prekey_public_key(seed: bytes) -> bytes:
     return _xwing.DecapsulationKey(seed).public_key
 
 
+def check_prekey(prekey: object) -> Prekey:
+    """``prekey`` if it is a ``Prekey`` of a 1216-byte public key and its ID, else
+    ``invalid_argument``."""
+    if (
+        not isinstance(prekey, Prekey)
+        or not isinstance(prekey.public_key, bytes)
+        or len(prekey.public_key) != KEM_PUBLIC_KEY_SIZE
+        or prekey_id(prekey.public_key) != prekey.id
+    ):
+        raise ACEError("invalid_argument", "prekey must be a 1216-byte key and its ID")
+    return prekey
+
+
 def decode_prekey_public_key(b64: object) -> bytes:
     """A content ``prekey`` member: canonical Base64 of 1216 bytes, else ``invalid_body``."""
     return decode_fixed_b64(b64, KEM_PUBLIC_KEY_SIZE, "invalid_body", "prekey")
@@ -367,13 +380,7 @@ class PrekeyVault:
         timestamp = check_wire_int(timestamp, "timestamp")
         if not is_sha256_hex(pin):
             raise ACEError("invalid_argument", "pin must be 64 lowercase hex")
-        if (
-            not isinstance(prekey, Prekey)
-            or not isinstance(prekey.public_key, bytes)
-            or len(prekey.public_key) != KEM_PUBLIC_KEY_SIZE
-            or prekey_id(prekey.public_key) != prekey.id
-        ):
-            raise ACEError("invalid_argument", "prekey must be a 1216-byte key and its ID")
+        check_prekey(prekey)
         with self._locked() as s:
             p = s.peers.get(peer, _Peer())
             if p.held is None or timestamp > p.held.timestamp:

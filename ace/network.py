@@ -43,7 +43,7 @@ from .errors import ACEError
 from .identity import ACEIdentity
 from .inbox import Inbox, ReceiveOutcome, Reply
 from .invitation import verify_invitation
-from .kel import event_bytes
+from .kel import event_bytes, tail_time
 from .limits import (
     CONTACT_REQUEST_TTL_SECONDS,
     MAX_INBOX_PAGE,
@@ -215,7 +215,7 @@ class NetworkClient:
         if self.profiles.get(DELEGATION_PROFILE_ID) is not None and not any(
             DELEGATION_TYPE in r.types for r in rules
         ):
-            rules = (*rules, delegation_rules(self.peers, identity.get_ace_id()))
+            rules = (*rules, delegation_rules(self.peers))
         self._rules = rules
         self.outbox = Outbox(
             identity,
@@ -681,16 +681,16 @@ class NetworkClient:
     def _send_contact(self, agent: VerifiedAgent, body: dict, permit: dict | None = None) -> str:
         """A contact packet: one attempt, never queued. A permit it carries counts as issued
         only once the packet was sent (a failed send leaves the peer due for a fresh one)."""
+        # the packet's timestamp, so the offered seed's window starts with the packet's
+        t = tail_time(self.identity.get_kel(), self._now())
         plaintext = encode_content(
             CONTACT_TYPE,
             CORE.messages[CONTACT_TYPE].digest,
             body,
-            prekey=self.vault.offer(agent.ace_id, self._now()).public_key,
+            prekey=self.vault.offer(agent.ace_id, t).public_key,
         )
         # to the published prekey, never a held peer prekey: a contact is never retried
-        packet = create_packet(
-            self.identity, agent.ace_id, agent.prekey, plaintext, timestamp=self._now()
-        )
+        packet = create_packet(self.identity, agent.ace_id, agent.prekey, plaintext, timestamp=t)
         self._post(packet, agent, permit)
         if "permit" in body:
             self.peers.note_issued(agent.ace_id, body["permit"])

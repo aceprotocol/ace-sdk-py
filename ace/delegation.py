@@ -117,9 +117,8 @@ class DelegationRules:
 
     types = frozenset({DELEGATION_TYPE})
 
-    def __init__(self, peers: PeerStore, local_ace_id: str) -> None:
+    def __init__(self, peers: PeerStore) -> None:
         self.peers = peers
-        self.local_ace_id = local_ace_id
 
     def check(self, event: MessageEvent, body: dict) -> None:
         now = self.peers._now()
@@ -143,6 +142,6 @@ class DelegationRules:
         return None
 
 
-def delegation_rules(peers: PeerStore, local_ace_id: str) -> DelegationRules:
+def delegation_rules(peers: PeerStore) -> DelegationRules:
     """The ``ace:delegation:1`` message rule; ``peers`` supplies the sender's pin and the clock."""
-    return DelegationRules(peers, local_ace_id)
+    return DelegationRules(peers)

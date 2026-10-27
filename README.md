@@ -19,13 +19,13 @@ pip install ace-sdk
 |---|---|
 | Identity | `SoftwareIdentity.generate/from_export/recover`, `.rotate()`, `.delegate()`, `verify_kel`, `extend_kel` |
 | Prekeys | `PrekeyVault()` (memory) / `PrekeyVault(path)` (0600 file): `current()`, `rotate(now)`, `open(id)`, `prune(now)` |
-| Packets | `encode_content`, `create_packet`, `decode_packet`, `verify_packet`, `decrypt_packet` |
+| Packets | `encode_content`, `create_packet`, `decode_packet`, `verify_packet`, `decrypt_packet` (the content bytes), `decode_content` |
 | Descriptors | `create_published_agent`, `verify_published_agent` -> `VerifiedAgent` |
 | Card records | `create_card_record` (`pay`, `erc8004`), `verify_card_bundle` -> `VerifiedCard`, `is_caip10_account`, `validate_erc8004`, `verify_erc8004_registration(json, ace_id)`; `RelayClient.publish_card/card/handle`; `NetworkClient.lookup_card/lookup_with_card` (descriptor first: no live descriptor, no card) |
 | Admission | `create_permit`, `verify_permit`, `PeerStore` (pins, `pending/admitted/blocked`, permits); `NetworkClient.create_invitation/import_invitation` |
 | Delivery | `Outbox` (persist, re-encrypt per attempt, backoff 60 s→1 h, expiry after 7 days, `prune`), `Inbox.open` (receive pipeline, receipts, quarantine) |
 | Profiles | `Profiles([TEXT, DELEGATION, COMMERCE, ProfileManifest(custom)])`; core (`ace:receipt:1`, `ace:contact:1`) is always installed |
-| Rules | `ProfileRules` (`types`, `check(event, body)`, `commit(event, body)`; send-side `commit` on the `delivered` receipt, `thread_busy` while a governed message is in flight); optional `commerce_rules(store, ace_id)`, `delegation_rules(peers, ace_id)` |
+| Rules | `ProfileRules` (`types`, `check(event, body)`, `commit(event, body)`; send-side `commit` on the `delivered` receipt, `thread_busy` while a governed message is in flight); optional `commerce_rules(store, ace_id)`, `delegation_rules(peers)` |
 | Delegation | `ace:delegation:1`: `create_delegation_credential`, `validate_delegation_ext`, `verify_delegation_credential`, `NetworkClient.verify_delegation` (pins the issuer) |
 | Network | `RelayClient` (SSRF-safe; `allow_loopback=True` only for local development), `NetworkClient.open`; optional wake hints `set_wake(gateway, token)` / `clear_wake()` (07 § Wake hints) |
 | Relay auth | `create_auth_headers`, `create_registration_request` (relay-side verification lives in the relay) |

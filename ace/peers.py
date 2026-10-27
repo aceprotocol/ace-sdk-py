@@ -64,7 +64,7 @@ def _record(d: dict, key: str) -> PeerRecord:
             d["issuedPermit"],
             d["profile"],
             d["updatedAt"],
-            d.get("kelLive", True),
+            d["kelLive"],
         )
         if (
             not is_ace_id(r.ace_id)

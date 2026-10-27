@@ -53,7 +53,7 @@ from .limits import (
     OFFLINE_WINDOW_SECONDS,
     TIMESTAMP_WINDOW_SECONDS,
 )
-from .prekeys import Prekey, PrekeyVault, decode_prekey_public_key, prekey_id
+from .prekeys import Prekey, PrekeyVault, check_prekey, decode_prekey_public_key
 from .profiles import CONTACT_TYPE, RECEIPT_TYPE
 
 PACKET_VERSION = "1"
@@ -294,8 +294,7 @@ def create_packet(
         prekey = Prekey(prekey.get("id"), public)  # type: ignore[arg-type]
     if not is_ace_id(to) or to == identity.get_ace_id():
         raise ACEError("invalid_argument", "to must be another ACE ID")
-    if prekey_id(prekey.public_key) != prekey.id:
-        raise ACEError("invalid_argument", "prekey id does not match its public key")
+    check_prekey(prekey)
     check_wire_int(timestamp, "timestamp")
     timestamp = tail_time(identity.get_kel(), timestamp)
     if len(plaintext) > MAX_PLAINTEXT_BYTES:

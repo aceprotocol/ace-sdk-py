@@ -44,6 +44,7 @@ from ._encoding import (
 )
 from .errors import ACEError
 from .identity import ACEIdentity
+from .kel import tail_time
 from .limits import (
     KEM_PUBLIC_KEY_SIZE,
     OFFLINE_WINDOW_SECONDS,
@@ -51,7 +52,7 @@ from .limits import (
     OUTBOX_MAX_BACKOFF_SECONDS,
 )
 from .packet import create_packet, encode_content
-from .prekeys import PrekeyVault
+from .prekeys import Prekey, PrekeyVault
 from .profiles import CONTACT_TYPE, RECEIPT_TYPE, Profiles
 from .rules import MessageEvent, ProfileRules, check_rules, governed, run_check, run_commit
 from .store import ACEStore, load_record, write_record
@@ -514,7 +515,9 @@ class Outbox:
             used = prekey.id
             c = e.content
             args = (c["type"], c["schemaDigest"], c["body"], c.get("threadId"))
-            offered = self._vault.offer(e.to, now).public_key
+            # the packet's timestamp, so the offered seed's window starts with the packet's
+            t = tail_time(self._identity.get_kel(), now)
+            offered = self._vault.offer(e.to, t).public_key
             extra = self._admission(e.to, now) if retry and self._admission is not None else None
             try:
                 plaintext = encode_content(
@@ -525,15 +528,14 @@ class Outbox:
                     raise
                 extra = None  # too large with it: sent without
                 plaintext = encode_content(*args, prekey=offered)
-            try:
-                packet = create_packet(
-                    self._identity,
-                    e.to,
-                    prekey,
-                    plaintext,
-                    timestamp=now,
-                    message_id=e.message_id,
+
+            def pack(prekey: Prekey) -> dict:
+                return create_packet(
+                    self._identity, e.to, prekey, plaintext, timestamp=t, message_id=e.message_id
                 )
+
+            try:
+                packet = pack(prekey)
             except ACEError as exc:
                 if prekey is agent.prekey or exc.code != "invalid_argument":
                     raise
@@ -542,14 +544,7 @@ class Outbox:
                 self._vault.drop_held(e.to)
                 prekey = agent.prekey
                 used = prekey.id
-                packet = create_packet(
-                    self._identity,
-                    e.to,
-                    prekey,
-                    plaintext,
-                    timestamp=now,
-                    message_id=e.message_id,
-                )
+                packet = pack(prekey)
             if extra is None:
                 transport(packet, agent)
             else:

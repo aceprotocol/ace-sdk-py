@@ -130,7 +130,7 @@ def test_verify_rejects_expired_and_tampered():
 def test_rule_requires_issuer_from_and_subject_to():
     clock = Clock()
     dave, bob, carol = Party(clock), Party(clock), Party(clock)
-    rules = delegation_rules(bob.peers, bob.id)
+    rules = delegation_rules(bob.peers)
     assert rules.types == frozenset({DELEGATION_TYPE})
     c = create_delegation_credential(dave.identity, bob.id, now=NOW)
 
@@ -156,7 +156,7 @@ def test_rule_requires_issuer_from_and_subject_to():
     with raises("invalid_body"):  # expired
         rules.check(event("receive", dave.id, bob.id), {"credential": c})
     # on send: the sender is the issuer (its own credential), no pin needed
-    sender_rules = delegation_rules(dave.peers, dave.id)
+    sender_rules = delegation_rules(dave.peers)
     clock.now = NOW
     sender_rules.check(event("send", dave.id, bob.id), {"credential": c})
     with raises("invalid_body"):

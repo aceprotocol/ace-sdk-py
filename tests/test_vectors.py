@@ -440,7 +440,7 @@ def test_delegation_message(c):
     if c["senderPinned"]:
         peers.pin(kel_of(c["from"]), c["now"])
     frm, to = AGENTS[c["from"]]["aceId"], AGENTS[c["to"]]["aceId"]
-    rules = delegation_rules(peers, to if c["direction"] == "receive" else frm)
+    rules = delegation_rules(peers)
     mid = "8a4f6a2e-3c0b-4d1e-9f7a-1b2c3d4e5f60"
     event = MessageEvent(c["direction"], mid, frm, to, c["now"], DELEGATION_TYPE, None)
     assert code_of(lambda: rules.check(event, c["body"])) == c["error"]

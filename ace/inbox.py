@@ -44,7 +44,7 @@ from .card_record import Contact
 from .descriptor import VerifiedAgent, check_stranger_source, verify_published_agent
 from .errors import ACEError, is_outcome_code
 from .identity import ACEIdentity, check_usable
-from .kel import KelState
+from .kel import KelState, tail_time
 from .limits import (
     DEFAULT_REPLAY_CAPACITY,
     MAX_FETCH_ATTEMPTS,
@@ -906,12 +906,14 @@ class Inbox:
             self._peers.reply_permit(to, seq, now) is None
         ):
             permit = body["permit"] = create_permit(self._identity, to, now=now)
+        # the packet's timestamp, so the offered seed's window starts with the packet's
+        t = tail_time(self._identity.get_kel(), now)
         plaintext = encode_content(
             RECEIPT_TYPE,
             CORE.messages[RECEIPT_TYPE].digest,
             body,
-            prekey=self._vault.offer(to, now).public_key,
+            prekey=self._vault.offer(to, t).public_key,
         )
         # never to a held peer prekey: a receipt is never retried (06 § Receipts)
-        packet = create_packet(self._identity, to, agent.prekey, plaintext, timestamp=now)
+        packet = create_packet(self._identity, to, agent.prekey, plaintext, timestamp=t)
         return Reply(to, packet, permit)
