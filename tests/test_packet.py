@@ -275,15 +275,20 @@ def test_packet_payload_decrypts_to_content():
 
 def test_largest_content_fits_a_packet():
     a, b, vault = parties()
-    shell = canonical_state_bytes({"body": {"m": ""}, "schemaDigest": DIGEST, "type": "ace:text:1"})
+    offer = to_base64(PEER_PREKEY)
+    shell = canonical_state_bytes(
+        {"body": {"m": ""}, "prekey": offer, "schemaDigest": DIGEST, "type": "ace:text:1"}
+    )
     raw = canonical_state_bytes(
         {
             "body": {"m": "x" * (MAX_PLAINTEXT_BYTES - len(shell))},
+            "prekey": offer,
             "schemaDigest": DIGEST,
             "type": "ace:text:1",
         }
     )
     assert len(raw) == MAX_PLAINTEXT_BYTES
+    decode_content(raw)  # valid content, `prekey` included
     p = create_packet(a, b.get_ace_id(), vault.current(), raw, timestamp=NOW)
     assert len(canonical_state_bytes(p)) <= MAX_PACKET_BYTES
     assert decrypt_packet(decode_packet(p), vault, NOW) == raw

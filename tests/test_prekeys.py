@@ -35,7 +35,7 @@ def test_offer_is_stable_until_used(vault):
     k = vault.offer(B, now)
     assert vault.offer(B, now + 1) == k and k.id == prekey_id(k.public_key)
     assert vault.open(k.id, now, sender=B).public_key == k.public_key
-    vault.used(B, k.id, now)
+    vault.used(B, k.id)
     k2 = vault.offer(B, now)
     assert k2.id != k.id
     assert vault.open(k.id, now, sender=B).public_key == k.public_key  # in use
@@ -51,9 +51,9 @@ def test_offers_are_per_peer(vault):
 
 def test_used_deletes_previous_in_use(vault):
     k1 = vault.offer(B, now)
-    vault.used(B, k1.id, now)
+    vault.used(B, k1.id)
     k2 = vault.offer(B, now)
-    vault.used(B, k2.id, now)
+    vault.used(B, k2.id)
     with raises("unknown_prekey"):
         vault.open(k1.id, now, sender=B)
     assert vault.open(k2.id, now, sender=B).public_key == k2.public_key
@@ -61,14 +61,14 @@ def test_used_deletes_previous_in_use(vault):
 
 def test_in_use_unchanged_on_reuse(vault):
     k1 = vault.offer(B, now)
-    vault.used(B, k1.id, now)
+    vault.used(B, k1.id)
     k2 = vault.offer(B, now)
-    vault.used(B, k2.id, now)
+    vault.used(B, k2.id)
     k3 = vault.offer(B, now)
-    vault.used(B, k2.id, now + 1)  # the in-use key again: nothing changes
+    vault.used(B, k2.id)  # the in-use key again: nothing changes
     assert vault.open(k2.id, now + 1, sender=B).public_key == k2.public_key
     assert vault.offer(B, now + 1) == k3
-    vault.used(B, "f" * 64, now)  # an unknown ID changes nothing
+    vault.used(B, "f" * 64)  # an unknown ID changes nothing
     assert vault.offer(B, now + 1) == k3
 
 
@@ -85,7 +85,7 @@ def test_offer_refreshes_the_window(vault):
     k = vault.offer(B, now)
     assert vault.offer(B, now + W - 1) == k  # carried again: its window restarts
     assert vault.open(k.id, now + W, sender=B) is not None
-    vault.used(B, k.id, now + W)
+    vault.used(B, k.id)
     assert vault.open(k.id, now + 2 * W - 2, sender=B) is not None
     with raises("unknown_prekey"):
         vault.open(k.id, now + 2 * W - 1, sender=B)
@@ -191,7 +191,7 @@ def test_file_mode_0600_kept(tmp_path):
     path = tmp_path / "prekeys.json"
     v = PrekeyVault(path)
     k = v.offer(B, now)
-    v.used(B, k.id, now)
+    v.used(B, k.id)
     v.hold(A, P1, now, PIN)
     v.held(A, OTHER_PIN, now)
     v.drop_held(A)
@@ -207,7 +207,7 @@ def test_file_vaults_sharing_a_path_see_each_others_peer_keys(tmp_path):
     send, receive = PrekeyVault(path), PrekeyVault(path)
     k = send.offer(B, now)
     assert receive.open(k.id, now, sender=B) is not None
-    receive.used(B, k.id, now)
+    receive.used(B, k.id)
     assert send.offer(B, now).id != k.id
     receive.hold(A, P1, now, PIN)
     assert send.held(A, PIN, now) == P1
@@ -225,7 +225,7 @@ def test_failed_write_leaves_peer_state_unchanged(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ace.prekeys, "write_file_atomic", fail)
     with raises("storage_failed"):
-        v.used(B, k.id, now)
+        v.used(B, k.id)
     with raises("storage_failed"):
         v.hold(A, P1, now, PIN)
     assert v.offer(B, now) == k and v._state.peers[B].in_use is None

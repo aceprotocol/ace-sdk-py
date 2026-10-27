@@ -477,8 +477,9 @@ class Outbox:
         extra: Admission | None = None
         try:
             # 06 § Outbox step 1: a retry refreshes any cached descriptor; if that fails, a cached
-            # one still unexpired and bound to the pins is used. A refresh after an
-            # `unknown_prekey` naming our published prekey never falls back.
+            # one still unexpired and bound to the pins is used, except one still publishing the
+            # prekey an `unknown_prekey` rejection named (only a fresh descriptor decides whether
+            # that rejection is final).
             if not retry:
                 agent = resolve(e.to, False)
             else:
@@ -486,7 +487,7 @@ class Outbox:
                     agent = resolve(e.to, True)
                 except ACEError:
                     agent = resolve(e.to, False)
-                    if e.refresh and not self._held_is(e.to, agent, e.prekey, now):
+                    if e.refresh and agent.prekey.id == e.prekey:
                         raise
             # 04 § Peer prekeys: the key held for `to` while bound to its current pin. A
             # rejection naming it drops it (the retry then goes to the published prekey).
@@ -594,11 +595,6 @@ class Outbox:
         if error is not None:
             return Attempt(message_id, "failed", cur.status, error)
         return Attempt(message_id, "sent", cur.status)
-
-    def _held_is(self, to: str, agent: Any, prekey: str | None, now: int) -> bool:
-        """Whether ``prekey`` is the peer prekey held for ``to`` under ``agent``'s pin."""
-        held = self._vault.held(to, agent.state.last_hash, now)
-        return held is not None and held.id == prekey
 
     def flush(self, transport: Transport, resolve: Resolver) -> list[Attempt]:
         """``deliver`` every pending entry that is due."""

@@ -619,7 +619,7 @@ class Inbox:
         """Step 6, then the issuer rule (04 § Peer prekeys): a packet that opened under the key we
         offered ``from`` makes it the in-use key, whatever its disposition from step 7 on."""
         plaintext = decrypt_packet(p, self._vault, now)
-        self._vault.used(p.from_id, p.prekey_id, now)
+        self._vault.used(p.from_id, p.prekey_id)
         return plaintext
 
     def _record(self, p: Packet, offered: bytes, type_: str, state: KelState) -> None:

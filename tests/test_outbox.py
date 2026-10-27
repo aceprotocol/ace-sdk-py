@@ -224,3 +224,32 @@ def test_enqueue_counts_body_depth_from_the_content_root():
         ob.enqueue(b.id, "ace:text:1", body)
     assert "depth" in info.value.message
     assert ob.entries() == []
+
+
+def test_rejected_superseded_held_key_falls_back_to_the_cached_descriptor():
+    """06 § Outbox step 1: after ``unknown_prekey`` named a held key since replaced by a newer
+    held key, a failed refresh falls back to the cached descriptor (it does not publish the
+    rejected ID); the retry goes to the published prekey and the newer held key stays."""
+    clock, a, b, ob = setup()
+    pin = a.peers.agent(b.id).state.last_hash
+    h1 = b.vault.offer(a.id, clock.now)
+    a.vault.hold(b.id, h1, clock.now, pin)
+    mid = ob.enqueue(b.id, "ace:text:1", {"message": "hi"})
+    sent = []
+    cached = lambda ace_id, refresh=False: a.peers.agent(ace_id)  # noqa: E731
+    assert ob.deliver(mid, lambda p, ag: sent.append(p), cached).result == "sent"
+    assert decode_packet(sent[-1]).prekey_id == h1.id
+    ob.settle(mid, "rejected", "unknown_prekey", sender=b.id, prekey=h1.id)
+    b.vault.used(a.id, h1.id)
+    h2 = b.vault.offer(a.id, clock.now)
+    a.vault.hold(b.id, h2, clock.now + 1, pin)  # a newer packet from b replaced the held key
+
+    def refresh_fails(ace_id, refresh=False):
+        if refresh:
+            raise ACEError("relay_unavailable", "down")
+        return a.peers.agent(ace_id)
+
+    att = ob.deliver(mid, lambda p, ag: sent.append(p), refresh_fails)
+    assert att.result == "sent" and ob.get(mid).status == "pending"
+    assert decode_packet(sent[-1]).prekey_id == b.vault.current().id
+    assert a.vault.held(b.id, pin, clock.now).id == h2.id

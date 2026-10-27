@@ -350,12 +350,11 @@ class PrekeyVault:
                 self._commit(s.with_peer(peer, p._replace(offered=offered)))
             return offered.prekey
 
-    def used(self, peer: str, prekey_id: str, now: int) -> None:
+    def used(self, peer: str, prekey_id: str) -> None:
         """A packet from ``peer`` opened under ``prekey_id``: when that is the offered key it
         becomes the in-use key (the previous in-use seed is deleted) and the next ``offer``
         generates a new one. Any other ID changes nothing."""
         _check_peer(peer)
-        check_wire_int(now, "now")
         with self._locked() as s:
             p = s.peers.get(peer)
             if p is not None and p.offered is not None and p.offered.prekey.id == prekey_id:
