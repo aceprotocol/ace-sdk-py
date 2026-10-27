@@ -74,7 +74,7 @@ from ace.commerce import ThreadStore, commerce_rules, validate_commerce_ext
 from ace.delegation import validate_erc8004
 from ace.errors import _CODE_RE
 from ace.kel import event_bytes, verify_operational_signature
-from ace.packet import packet_header, pad_plaintext
+from ace.packet import packet_header
 from ace.prekeys import _entry, _Peer, _State
 from ace.relay import map_relay_response
 from ace.rules import MessageEvent
@@ -298,10 +298,8 @@ def test_packet_deterministic(tmp_path):
     assert d["saltHex"] == ""  # 03: the HKDF salt is the empty string
     key = HKDF(algorithm=hashes.SHA256(), length=32, salt=b"", info=header).derive(ss)
     assert key.hex() == d["keyHex"]
-    content = canonical_state_bytes(d["content"])
-    assert content.hex() == d["contentHex"]
-    plaintext = pad_plaintext(content)
-    assert plaintext.hex() == d["plaintextHex"] and len(plaintext) == 4096
+    plaintext = canonical_state_bytes(d["content"])
+    assert plaintext.hex() == d["plaintextHex"]
     payload = nonce + AESGCM(key).encrypt(nonce, plaintext, header)
     assert payload.hex() == d["payloadHex"]
     assert (
@@ -318,7 +316,7 @@ def test_packet_deterministic(tmp_path):
         sender,
         bob,
         d["prekey"],
-        content,
+        plaintext,
         timestamp=d["timestamp"],
         message_id=d["messageId"],
         _kem=(ss, kem),

@@ -110,19 +110,6 @@ class DecapsulationKey:
         return _combiner(ss_m, ss_x, ct_x, self._pk_x)
 
 
-def check_public_key(public_key: bytes) -> None:
-    """Raise ``invalid_argument`` unless ``public_key`` is an X-Wing public key: 1216 bytes
-    whose ML-KEM-768 half passes the FIPS 203 modulus check (pyca checks it when parsing,
-    so no trial encapsulation is needed). Any 32 bytes are an X25519 public key."""
-    _check_length(public_key, PUBLIC_KEY_SIZE, "public key")
-    try:
-        MLKEM768PublicKey.from_public_bytes(bytes(public_key[:_MLKEM_PK_SIZE]))
-    except ValueError:
-        raise ACEError(
-            "invalid_argument", "X-Wing public key is not a valid ML-KEM-768 key"
-        ) from None
-
-
 def encapsulate(public_key: bytes) -> tuple[bytes, bytes]:
     """Encapsulate to an X-Wing public key.
 

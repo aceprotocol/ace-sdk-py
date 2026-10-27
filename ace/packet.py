@@ -4,13 +4,12 @@
                             prekeyId, kemCiphertextBytes)
     (ss, kemCiphertext) = XWing.Encapsulate(prekey.publicKey)
     key     = HKDF-SHA256(ikm=ss, salt="" (empty), info=header, L=32)
-    payload = nonce[12] || AES-256-GCM(key, nonce, pad(plaintext), aad=header)
+    payload = nonce[12] || AES-256-GCM(key, nonce, plaintext, aad=header)
     signature: action "packet", aceId = from, timestamp,
                payload encodePayload(to, messageId, prekeyId, kemCiphertextBytes, payloadBytes)
 
 The header binds from, to and messageId, so a packet whose signature is stripped and re-signed
-by another identity no longer decrypts. ``pad`` hides the content length up to a power-of-two
-bucket (at least ``MIN_PLAINTEXT_BUCKET``): u32be(len) || content || zeros.
+by another identity no longer decrypts.
 """
 
 from __future__ import annotations
@@ -51,7 +50,6 @@ from .limits import (
     KEM_PUBLIC_KEY_SIZE,
     MAX_PACKET_BYTES,
     MAX_PLAINTEXT_BYTES,
-    MIN_PLAINTEXT_BUCKET,
     OFFLINE_WINDOW_SECONDS,
     TIMESTAMP_WINDOW_SECONDS,
 )
@@ -62,9 +60,7 @@ PACKET_VERSION = "1"
 _LABEL = "ace.v1.packet"
 _NONCE = 12
 _MIN_PAYLOAD = _NONCE + 16  # nonce + AES-GCM tag
-_LENGTH_PREFIX = 4
-_LARGEST_BUCKET = MAX_PLAINTEXT_BYTES + _LENGTH_PREFIX
-_MAX_PAYLOAD = _LARGEST_BUCKET + _MIN_PAYLOAD
+_MAX_PAYLOAD = MAX_PLAINTEXT_BYTES + _MIN_PAYLOAD
 _KEYS = {"ace", "messageId", "from", "to", "timestamp", "encryption", "signature"}
 
 
@@ -185,54 +181,6 @@ def packet_sign_payload(
 
 def aead_key(ss: bytes, header: bytes) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=b"", info=header).derive(ss)
-
-
-# --- padding (03 § Encryption) -------------------------------------------------
-
-
-def plaintext_bucket(content_len: int) -> int:
-    """The padded plaintext length for ``content_len`` content bytes: the smallest power of two
-    >= ``MIN_PLAINTEXT_BUCKET`` holding ``content_len + 4``; above 2^20, ``MAX_PLAINTEXT_BYTES +
-    4``."""
-    n = content_len + _LENGTH_PREFIX
-    if n > 1 << 20:
-        return _LARGEST_BUCKET
-    b = MIN_PLAINTEXT_BUCKET
-    while b < n:
-        b *= 2
-    return b
-
-
-PLAINTEXT_BUCKETS: frozenset[int] = frozenset(
-    [MIN_PLAINTEXT_BUCKET << i for i in range(((1 << 20) // MIN_PLAINTEXT_BUCKET).bit_length())]
-    + [_LARGEST_BUCKET]
-)
-
-
-def pad_plaintext(content: bytes) -> bytes:
-    """``u32be(len(content)) || content || zeros`` to ``plaintext_bucket(len(content))``."""
-    n = len(content)
-    return (
-        n.to_bytes(_LENGTH_PREFIX, "big")
-        + bytes(content)
-        + bytes(plaintext_bucket(n) - n - _LENGTH_PREFIX)
-    )
-
-
-def unpad_plaintext(plaintext: bytes) -> bytes:
-    """The content inside a padded plaintext, or ``invalid_body`` unless the length is a bucket,
-    the prefix fits, the bucket is the one the prefix implies and the padding is all zero."""
-    size = len(plaintext)
-    n = int.from_bytes(plaintext[:_LENGTH_PREFIX], "big")
-    if (
-        size not in PLAINTEXT_BUCKETS
-        or n > MAX_PLAINTEXT_BYTES
-        or _LENGTH_PREFIX + n > size
-        or plaintext_bucket(n) != size
-        or any(plaintext[_LENGTH_PREFIX + n :])
-    ):
-        raise ACEError("invalid_body", "plaintext padding is invalid")
-    return bytes(plaintext[_LENGTH_PREFIX : _LENGTH_PREFIX + n])
 
 
 # --- private content ------------------------------------------------------------
@@ -356,7 +304,7 @@ def create_packet(
     ss, kem = _xwing.encapsulate(prekey.public_key) if _kem is None else _kem
     header = packet_header(from_id, to, mid, timestamp, prekey.id, kem)
     nonce = os.urandom(_NONCE) if _nonce is None else _nonce
-    payload = nonce + AESGCM(aead_key(ss, header)).encrypt(nonce, pad_plaintext(plaintext), header)
+    payload = nonce + AESGCM(aead_key(ss, header)).encrypt(nonce, bytes(plaintext), header)
     sign_payload = packet_sign_payload(to, mid, prekey.id, kem, payload)
     signature = sign_operational(identity, timestamp, sign_payload, "packet")
     out = Packet(mid, from_id, to, timestamp, prekey.id, kem, payload, signature).to_dict()
@@ -400,8 +348,8 @@ def decode_packet(obj: object) -> Packet:
         enc["kemCiphertext"], KEM_CIPHERTEXT_SIZE, "invalid_packet", "kemCiphertext"
     )
     payload = decode_b64(enc["payload"], "invalid_packet", "payload", max_bytes=_MAX_PAYLOAD)
-    if len(payload) - _MIN_PAYLOAD not in PLAINTEXT_BUCKETS:
-        raise ACEError("invalid_packet", "encryption.payload is not a padded bucket")
+    if len(payload) < _MIN_PAYLOAD:
+        raise ACEError("invalid_packet", "payload is too short")
     if (
         type(sig) is not dict
         or set(sig) != {"scheme", "seq", "value"}
@@ -440,16 +388,15 @@ def check_window(packet: Packet, now: int) -> None:
 
 
 def decrypt_packet(packet: Packet, vault: PrekeyVault, now: int | None = None) -> bytes:
-    """The unpadded plaintext; ``unknown_prekey``, ``decryption_failed`` or ``invalid_body`` (bad
-    padding). ``now`` lets the vault refuse prekeys whose retention ended (04 § Prekey); a peer
-    prekey opens only a packet from the peer it was offered to (04 § Peer prekeys)."""
+    """The plaintext; ``unknown_prekey`` or ``decryption_failed``. ``now`` lets the vault refuse
+    prekeys whose retention ended (04 § Prekey); a peer prekey opens only a packet from the peer
+    it was offered to (04 § Peer prekeys)."""
     key = vault.open(packet.prekey_id, now, sender=packet.from_id)
     try:
         ss = key.decapsulate(packet.kem_ciphertext)
         p = packet.payload
-        padded = AESGCM(aead_key(ss, packet.header)).decrypt(p[:_NONCE], p[_NONCE:], packet.header)
+        return AESGCM(aead_key(ss, packet.header)).decrypt(p[:_NONCE], p[_NONCE:], packet.header)
     except InvalidTag:
         raise ACEError("decryption_failed", "AEAD authentication failed") from None
     except Exception as exc:
         raise ACEError("decryption_failed", f"decryption failed: {type(exc).__name__}") from None
-    return unpad_plaintext(padded)

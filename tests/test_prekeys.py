@@ -6,7 +6,7 @@ import stat
 
 import pytest
 
-from ace import PrekeyVault, SoftwareIdentity, _xwing
+from ace import PrekeyVault, SoftwareIdentity
 from ace._encoding import to_base64
 from ace.limits import OFFLINE_WINDOW_SECONDS as W
 from ace.prekeys import Prekey, prekey_id, prekey_public_key
@@ -271,18 +271,3 @@ def test_held_public_key_of_wrong_length_is_storage_failed(tmp_path):
     with open(path, "w") as f:
         json.dump(doc, f)
     assert PrekeyVault(path).held(A, PIN, now) == P1
-
-
-def test_loading_held_keys_checks_no_mlkem_key(tmp_path, monkeypatch):
-    """The vault trusts its own document: loads never run the X-Wing public-key check."""
-    path = tmp_path / "prekeys.json"
-    v = PrekeyVault(path, clock=lambda: now)
-    for peer in (A, B):
-        v.hold(peer, P1, now, PIN)
-    calls = []
-    real = _xwing.check_public_key
-    monkeypatch.setattr(_xwing, "check_public_key", lambda pk: calls.append(pk) or real(pk))
-    again = PrekeyVault(path, clock=lambda: now)
-    for _ in range(20):
-        assert again.held(A, PIN, now) == P1
-    assert calls == []
