@@ -25,6 +25,7 @@ from . import _xwing
 from ._encoding import (
     check_wire_int,
     decode_fixed_b64,
+    is_ace_id,
     is_sha256_hex,
     sha256_hex,
     to_base64,
@@ -183,7 +184,7 @@ class PrekeyVault:
             return _State(
                 None if cur is None else self._parse(cur, "createdAt"),
                 [self._parse(r, "supersededAt") for r in data["retained"]],
-                {k: self._parse_peer(v) for k, v in peers.items()},
+                {_peer_key(k): self._parse_peer(v) for k, v in peers.items()},
             )
         except (ValueError, KeyError, TypeError, ACEError) as exc:
             raise ACEError("storage_failed", f"prekey file is invalid: {exc}") from None
@@ -292,8 +293,9 @@ class PrekeyVault:
         """The decapsulation key for ``prekey_id``, or ``unknown_prekey``: the published current
         or a retained prekey, else (only when ``sender`` is given) the peer prekey offered to
         ``sender`` or in use by it, while its window lasts. A retired prekey whose retention has
-        ended is refused even before it is deleted; expired retired seeds are pruned here
-        opportunistically (04 § Prekey, § Peer prekeys)."""
+        ended is refused even before it is deleted; expired retired seeds, and an expired peer
+        seed ``prekey_id`` names, are deleted here opportunistically (04 § Prekey, § Peer
+        prekeys)."""
         if not is_sha256_hex(prekey_id):
             raise ACEError("unknown_prekey", "prekey id must be 64 lowercase hex")
         t = self._time(now)
@@ -308,9 +310,17 @@ class PrekeyVault:
                 if e.prekey.id == prekey_id:
                     return e.key
             p = s.peers.get(sender) if sender is not None else None
-            for e in (p.offered, p.in_use) if p is not None else ():
-                if e is not None and e.prekey.id == prekey_id and _seed_live(e, t):
-                    return e.key
+            seeds = [e for e in (p.offered, p.in_use) if e is not None] if p is not None else []
+            for e in seeds:
+                if e.prekey.id == prekey_id:
+                    if _seed_live(e, t):
+                        return e.key
+                    assert sender is not None and p is not None
+                    try:  # its window ended: delete it (best effort, refused below either way)
+                        self._commit(self._state.with_peer(sender, _pruned(p, t)))
+                    except ACEError:
+                        pass
+                    break
         raise ACEError("unknown_prekey", "unknown or deleted prekey")
 
     def prune(self, now: int) -> None:
@@ -318,17 +328,8 @@ class PrekeyVault:
         and held keys whose window ended; a peer left with nothing is removed."""
         now = check_wire_int(now, "now")
         with self._locked() as s:
-            pruned = s._replace(retired=_live(s.retired, now))
-            for peer, p in s.peers.items():
-                held = p.held if p.held is not None and _held_live(p.held, now) else None
-                pruned = pruned.with_peer(
-                    peer,
-                    _Peer(
-                        p.offered if _seed_live(p.offered, now) else None,
-                        p.in_use if _seed_live(p.in_use, now) else None,
-                        held,
-                    ),
-                )
+            peers = {k: q for k, p in s.peers.items() if (q := _pruned(p, now)) != _Peer()}
+            pruned = s._replace(retired=_live(s.retired, now), peers=peers)
             if pruned != s:
                 self._commit(pruned)
 
@@ -403,8 +404,23 @@ class PrekeyVault:
 
 
 def _check_peer(peer: object) -> None:
-    if not isinstance(peer, str) or not peer:
-        raise ACEError("invalid_argument", "peer must be a non-empty string")
+    if not is_ace_id(peer):
+        raise ACEError("invalid_argument", "peer must be an ACE ID")
+
+
+def _peer_key(peer: object) -> str:
+    if not is_ace_id(peer):
+        raise ValueError("peer key")
+    return peer  # type: ignore[return-value]
+
+
+def _pruned(p: _Peer, now: int) -> _Peer:
+    """``p`` without the seeds and held key whose window ended at ``now``."""
+    return _Peer(
+        p.offered if _seed_live(p.offered, now) else None,
+        p.in_use if _seed_live(p.in_use, now) else None,
+        p.held if p.held is not None and _held_live(p.held, now) else None,
+    )
 
 
 def _held_live(h: _Held, now: int) -> bool:

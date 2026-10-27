@@ -441,8 +441,9 @@ def check_window(packet: Packet, now: int) -> None:
 
 def decrypt_packet(packet: Packet, vault: PrekeyVault, now: int | None = None) -> bytes:
     """The unpadded plaintext; ``unknown_prekey``, ``decryption_failed`` or ``invalid_body`` (bad
-    padding). ``now`` lets the vault refuse prekeys whose retention ended (04 § Prekey)."""
-    key = vault.open(packet.prekey_id, now)
+    padding). ``now`` lets the vault refuse prekeys whose retention ended (04 § Prekey); a peer
+    prekey opens only a packet from the peer it was offered to (04 § Peer prekeys)."""
+    key = vault.open(packet.prekey_id, now, sender=packet.from_id)
     try:
         ss = key.decapsulate(packet.kem_ciphertext)
         p = packet.payload

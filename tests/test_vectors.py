@@ -543,7 +543,14 @@ def test_commerce_sender(c):
         def get_ace_id(self):
             return a
 
-    ob = Outbox(_Id(), store, Profiles([TEXT, COMMERCE]), rules=[rules], clock=lambda: clock["t"])
+    ob = Outbox(
+        _Id(),
+        store,
+        Profiles([TEXT, COMMERCE]),
+        vault=PrekeyVault(),
+        rules=[rules],
+        clock=lambda: clock["t"],
+    )
     conv = conversation_key(a, b)
     for i, st in enumerate(c["steps"]):
         clock["t"] = V["now"] + i

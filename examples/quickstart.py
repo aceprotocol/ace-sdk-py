@@ -23,7 +23,7 @@ class Agent:
         self.id = self.identity.get_ace_id()
         self.store, self.vault = MemoryStore(), PrekeyVault()
         self.peers = PeerStore(self.store)
-        self.outbox = Outbox(self.identity, self.store, Profiles())
+        self.outbox = Outbox(self.identity, self.store, Profiles(), vault=self.vault)
         self.inbox = Inbox.open(
             self.identity,
             self.store,

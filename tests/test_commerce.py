@@ -46,7 +46,14 @@ class Market:
             x.peers.set_status(y.id, "admitted")
         self.rules = {p.id: commerce_rules(p.store, p.id) for p in (self.buyer, self.seller)}
         self.outbox = {
-            p.id: Outbox(p.identity, p.store, PROFILES, rules=[self.rules[p.id]], clock=self.clock)
+            p.id: Outbox(
+                p.identity,
+                p.store,
+                PROFILES,
+                vault=p.vault,
+                rules=[self.rules[p.id]],
+                clock=self.clock,
+            )
             for p in (self.buyer, self.seller)
         }
         self.inbox = {

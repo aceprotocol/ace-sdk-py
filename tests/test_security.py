@@ -302,7 +302,7 @@ def test_directory_skips_entries_failing_verification_or_the_query(relay, pair, 
 def test_contact_profile_and_errors_are_core():
     assert Profiles().message_digest("ace:contact:1") == CONTACT_DIGEST
     with pytest.raises(ACEError):
-        Outbox(SoftwareIdentity.generate(), MemoryStore(), Profiles()).enqueue(
+        Outbox(SoftwareIdentity.generate(), MemoryStore(), Profiles(), vault=PrekeyVault()).enqueue(
             "ace:sha256:" + "1" * 64, "ace:receipt:1", {}
         )
 
@@ -393,7 +393,7 @@ def test_a_rotated_holders_older_issued_descriptor_replaces_the_superseded_keys_
     viewer.peers.adopt(evil, NOW)
     viewer.peers.adopt(holder.source(), clock.now)  # smaller issuedAt, newer KEL: replaces
     assert viewer.peers.agent(holder.id).prekey.id == holder.vault.current().id
-    ob = Outbox(viewer.identity, viewer.store, Profiles(), clock=clock)
+    ob = Outbox(viewer.identity, viewer.store, Profiles(), vault=viewer.vault, clock=clock)
     mid = ob.enqueue(holder.id, "ace:text:1", {"message": "hi"})
     ob.deliver(mid, lambda p, ag: None, lambda ace_id, refresh=False: viewer.peers.agent(ace_id))
     assert ob.get(mid).prekey == holder.vault.current().id != attacker.current().id

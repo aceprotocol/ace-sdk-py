@@ -1,7 +1,9 @@
 """Outbox (contract § 6): persist the private content, then re-encrypt and re-sign per attempt.
 
-Each attempt encrypts to the recipient's *current* prekey with a fresh timestamp and the same
-``messageId``. A relay ``{ok: true}`` is not delivery: an entry stays ``pending`` until a
+The first attempt encrypts to the peer prekey held for the recipient (04 § Peer prekeys) while it
+is usable, else, like every later attempt, to its *current* published prekey, with a fresh
+timestamp and the same ``messageId``; every packet offers our peer prekey for the recipient. A
+relay ``{ok: true}`` is not delivery: an entry stays ``pending`` until a
 receipt settles it (``delivered`` / ``rejected``) or ``OFFLINE_WINDOW_SECONDS`` pass after the
 first attempt (``expired``: we stopped retrying, the outcome is unknown; the recipient may still
 have processed it, and a late receipt still settles the entry). Backoff: 60 s, doubling, at most
@@ -27,7 +29,6 @@ from __future__ import annotations
 
 import copy
 import dataclasses
-import os
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
@@ -50,7 +51,7 @@ from .limits import (
     OUTBOX_MAX_BACKOFF_SECONDS,
 )
 from .packet import create_packet, encode_content
-from .prekeys import prekey_public_key
+from .prekeys import PrekeyVault
 from .profiles import CONTACT_TYPE, RECEIPT_TYPE, Profiles
 from .rules import MessageEvent, ProfileRules, check_rules, governed, run_check, run_commit
 from .store import ACEStore, load_record, write_record
@@ -202,6 +203,7 @@ class Outbox:
         store: ACEStore,
         profiles: Profiles,
         *,
+        vault: PrekeyVault,
         rules: list[ProfileRules] | tuple[ProfileRules, ...] = (),
         resolve_peer: Callable[[str], Any] | None = None,
         admission: AdmissionHook | None = None,
@@ -210,9 +212,13 @@ class Outbox:
         """``resolve_peer(to)`` ensures a descriptor for ``to`` is held or resolvable; ``enqueue``
         calls it before storing anything (permanent failure: ``unknown_peer``; transient:
         re-raised). ``admission(to, now)``: what an attempt after the first adds to its content
-        (05 § Admission recovery)."""
+        (05 § Admission recovery). ``vault``: the peer prekeys every packet offers and the ones
+        held for first attempts (04 § Peer prekeys)."""
         if not isinstance(profiles, Profiles):
             raise ACEError("invalid_argument", "profiles must be a Profiles")
+        if not isinstance(vault, PrekeyVault):
+            raise ACEError("invalid_argument", "vault must be a PrekeyVault")
+        self._vault = vault
         self._identity = identity
         self._store = store
         self._profiles = profiles
@@ -377,9 +383,10 @@ class Outbox:
         prekey: str | None = None,
     ) -> OutboxEntry | None:
         """Apply a receipt from ``sender``; returns the entry it matched (None for none).
-        ``rejected:unknown_prekey`` is not final: the next attempt refreshes the descriptor, and
-        only if the prekey is unchanged is it final. It
-        counts only when its ``prekey`` is the prekey of the latest attempt, and only once (a
+        ``rejected:unknown_prekey`` is not final: when it names the held peer prekey the next
+        attempt drops it; otherwise the next attempt refreshes the descriptor, and only if the
+        published prekey is unchanged is it final. It counts only when its ``prekey`` is the
+        prekey of the latest attempt, and only once (a
         late or replayed receipt is ignored, 06 § Outbox). An ``expired`` entry's outcome is
         unknown, so its receipt still settles it (except ``unknown_prekey``: nothing retries)."""
         with self._store.lock("outbox"):
@@ -440,9 +447,11 @@ class Outbox:
         *,
         force: bool = False,
     ) -> Attempt:
-        """One attempt now (when due, or ``force``): resolve the recipient, encrypt to its current
-        prekey, sign with a fresh timestamp and hand the packet to ``transport``. An attempt
-        after the first refreshes the descriptor and adds the ``admission`` hook's result to the
+        """One attempt now (when due, or ``force``): resolve the recipient, encrypt (the first
+        attempt to the peer prekey held for it, else to its current published prekey, offering
+        ours), sign with a fresh timestamp and hand the packet to ``transport``. A
+        ``rejected:unknown_prekey`` naming the held key drops it. An attempt after the first
+        refreshes the descriptor and adds the ``admission`` hook's result to the
         content, unless that would exceed ``MAX_PLAINTEXT_BYTES`` (05 § Admission recovery)."""
         now = self._now()
         with self._store.lock("outbox"):
@@ -464,19 +473,28 @@ class Outbox:
         error: ACEError | None = None
         used = e.prekey
         retry = e.attempts > 0
+        peer_rejected = False
         extra: Admission | None = None
         try:
             # 06 § Outbox step 1: a retry refreshes any cached descriptor; if that fails, a cached
-            # one still unexpired and bound to the pins is used (an `unknown_prekey` refresh never
-            # falls back)
-            if retry and not e.refresh:
+            # one still unexpired and bound to the pins is used. A refresh after an
+            # `unknown_prekey` naming our published prekey never falls back.
+            if not retry:
+                agent = resolve(e.to, False)
+            else:
                 try:
                     agent = resolve(e.to, True)
                 except ACEError:
                     agent = resolve(e.to, False)
-            else:
-                agent = resolve(e.to, e.refresh)
-            if e.refresh and agent.prekey.id == e.prekey:
+                    if e.refresh and not self._held_is(e.to, agent, e.prekey, now):
+                        raise
+            # 04 § Peer prekeys: the key held for `to` while bound to its current pin. A
+            # rejection naming it drops it (the retry then goes to the published prekey).
+            held = self._vault.held(e.to, agent.state.last_hash, now)
+            peer_rejected = e.refresh and held is not None and held.id == e.prekey
+            if peer_rejected:
+                self._vault.drop_held(e.to)
+            elif e.refresh and agent.prekey.id == e.prekey:
                 with self._store.lock("outbox"):
                     cur = self._load(message_id)
                     if cur is None:
@@ -489,10 +507,13 @@ class Outbox:
                         )
                     self._save(cur.replace(in_flight_at=None))
                 return Attempt(message_id, "skipped", cur.status)
-            used = agent.prekey.id
+            # 06 § Outbox step 2: the first attempt to the held peer prekey, else (and every
+            # later attempt) to the published one; every packet offers our peer prekey for `to`.
+            prekey = agent.prekey if retry or held is None else held
+            used = prekey.id
             c = e.content
             args = (c["type"], c["schemaDigest"], c["body"], c.get("threadId"))
-            offered = prekey_public_key(os.urandom(32))  # Task 5: replaced by vault.offer()
+            offered = self._vault.offer(e.to, now).public_key
             extra = self._admission(e.to, now) if retry and self._admission is not None else None
             try:
                 plaintext = encode_content(
@@ -506,7 +527,7 @@ class Outbox:
             packet = create_packet(
                 self._identity,
                 e.to,
-                agent.prekey,
+                prekey,
                 plaintext,
                 timestamp=now,
                 message_id=e.message_id,
@@ -549,12 +570,18 @@ class Outbox:
                     in_flight_at=None,
                     code=None if error is None else error.code,
                     prekey=used if error is None else cur.prekey,
-                    refresh=cur.refresh and error is not None,
+                    # a rejection of the held key is settled once it is dropped
+                    refresh=cur.refresh and error is not None and not peer_rejected,
                 )
             self._save(cur)
         if error is not None:
             return Attempt(message_id, "failed", cur.status, error)
         return Attempt(message_id, "sent", cur.status)
+
+    def _held_is(self, to: str, agent: Any, prekey: str | None, now: int) -> bool:
+        """Whether ``prekey`` is the peer prekey held for ``to`` under ``agent``'s pin."""
+        held = self._vault.held(to, agent.state.last_hash, now)
+        return held is not None and held.id == prekey
 
     def flush(self, transport: Transport, resolve: Resolver) -> list[Attempt]:
         """``deliver`` every pending entry that is due."""

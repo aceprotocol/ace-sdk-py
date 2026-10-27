@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import copy
 import functools
-import os
 import re
 import threading
 from dataclasses import dataclass, replace
@@ -50,7 +49,7 @@ from .outbox import Admission, Attempt, Outbox, OutboxEntry
 from .packet import PrivateMessage, create_packet, encode_content
 from .peers import PeerStore
 from .permit import create_permit, verify_permit
-from .prekeys import PrekeyVault, prekey_public_key
+from .prekeys import PrekeyVault
 from .profiles import CONTACT_TYPE, CORE, Profiles
 from .relay import RelayClient, RelayEntry
 from .rules import ProfileRules
@@ -215,6 +214,7 @@ class NetworkClient:
             store,
             self.profiles,
             rules=rules,
+            vault=vault,
             resolve_peer=self._known,
             admission=self._admission,
             clock=clock,
@@ -710,8 +710,9 @@ class NetworkClient:
             CONTACT_TYPE,
             CORE.messages[CONTACT_TYPE].digest,
             body,
-            prekey=prekey_public_key(os.urandom(32)),  # Task 5: replaced by vault.offer()
+            prekey=self.vault.offer(agent.ace_id, self._now()).public_key,
         )
+        # to the published prekey, never a held peer prekey: a contact is never retried
         packet = create_packet(
             self.identity, agent.ace_id, agent.prekey, plaintext, timestamp=self._now()
         )
@@ -982,8 +983,10 @@ class NetworkClient:
 
     def block(self, ace_id: str) -> None:
         """Block locally (in force at once, surviving restart), drop its held request and register
-        the block at the home relay; a relay failure is retried by ``maintain``."""
+        the block at the home relay; a relay failure is retried by ``maintain``. The peer prekey
+        held for it is dropped (04 § Peer prekeys)."""
         self._decide(ace_id, "blocked")
+        self.vault.drop_held(ace_id)
 
     def unblock(self, ace_id: str) -> None:
         """Remove a block (the explicit admission action, 05 § Blocks); the peer is a stranger

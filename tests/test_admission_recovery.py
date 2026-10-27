@@ -95,7 +95,7 @@ def _outbox(fresh=True):
         hooked.append(now)
         return Admission(_adm(), fresh)
 
-    ob = Outbox(a.identity, a.store, Profiles(), admission=admission, clock=clock)
+    ob = Outbox(a.identity, a.store, Profiles(), vault=a.vault, admission=admission, clock=clock)
     return clock, a, b, ob, hooked
 
 

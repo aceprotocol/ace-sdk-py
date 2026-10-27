@@ -15,7 +15,7 @@ def setup():
     clock = Clock()
     a, b = Party(clock), Party(clock)
     a.peers.adopt(b.source())
-    return clock, a, b, Outbox(a.identity, a.store, Profiles(), clock=clock)
+    return clock, a, b, Outbox(a.identity, a.store, Profiles(), vault=a.vault, clock=clock)
 
 
 def test_backoff_schedule():

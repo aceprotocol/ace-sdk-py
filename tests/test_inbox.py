@@ -36,7 +36,9 @@ class World:
             self.b.peers.set_status(self.a.id, "admitted")
             self.a.peers.adopt(self.b.source())
             self.a.peers.set_status(self.b.id, "admitted")
-        self.outbox = Outbox(self.a.identity, self.a.store, Profiles(), clock=self.clock)
+        self.outbox = Outbox(
+            self.a.identity, self.a.store, Profiles(), vault=self.a.vault, clock=self.clock
+        )
         self.inbox = Inbox.open(
             self.b.identity,
             self.b.store,

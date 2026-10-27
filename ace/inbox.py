@@ -14,7 +14,10 @@ any) first and acknowledges the relay entry only when ``outcome.ack`` is true. O
     is a recovery or contact candidate, as a stranger is
  4. operational signature (delegation ``seq``, signed while live, signer usable now)
  5. time window ``now - OFFLINE <= ts <= now + 300``
- 6. prekey decryption (``rejected:unknown_prekey``)
+ 6. prekey decryption, published or offered to ``from`` (``rejected:unknown_prekey``); a
+    packet opened under the key offered to ``from`` makes it in use, and an authenticated
+    sender's packet other than a contact records the peer prekey it carries as held for ``from``
+    (04 § Peer prekeys); ``prekey`` is stripped from the content
  7. ``(type, schemaDigest)`` must be installed (``rejected:unsupported_schema``)
  8. body schema (``rejected:invalid_body``)
  9. dedupe by ``(from, messageId)``, receipts and contacts too: a duplicate is receipted
@@ -32,7 +35,6 @@ record (the sender's retry is a duplicate and gets a receipt); a rejected packet
 
 from __future__ import annotations
 
-import os
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
@@ -63,7 +65,7 @@ from .packet import (
 )
 from .peers import PeerStore
 from .permit import create_permit, verify_permit
-from .prekeys import PrekeyVault, prekey_public_key
+from .prekeys import Prekey, PrekeyVault, prekey_id
 from .profiles import CONTACT_TYPE, CORE, RECEIPT_TYPE, Profiles
 from .replay import ReplayDetector
 from .rules import MessageEvent, ProfileRules, check_rules, governed, run_check, run_commit
@@ -470,16 +472,18 @@ class Inbox:
             raise _Drop(exc) from None
         # 6. decrypt
         try:
-            plaintext = decrypt_packet(p, self._vault, now)
+            plaintext = self._decrypt(p, now)
         except ACEError as exc:
             if exc.code == "unknown_prekey":
                 return self._reject(p, exc, now)
+            if exc.is_transient:
+                raise  # the vault's storage: retried
             raise _Drop(exc) from None
         # 7-8. content, installed schema, body
         c = None
         try:
             c = decode_content(plaintext)
-            c.pop("prekey")  # Task 5: recorded by vault.used()/hold()
+            self._record(p, c.pop("prekey"), c["type"], state)
             self._profiles.validate(c["type"], c["schemaDigest"], c["body"])
         except ACEError as exc:
             if exc.category != "permanent":
@@ -545,14 +549,14 @@ class Inbox:
         a stranger only while our card record is ``open``. Anything else is dropped."""
         try:
             check_window(p, now)
-            c = decode_content(decrypt_packet(p, self._vault, now))
-            c.pop("prekey")  # Task 5: recorded by vault.used()/hold()
+            c = decode_content(self._decrypt(p, now))
         except ACEError as exc:
             if exc.category != "permanent":
                 raise
             raise _Drop(exc) from None
+        offered = c.pop("prekey")
         if c["type"] != CONTACT_TYPE and self._valid_proof(c.get("admission"), p.from_id, now):
-            return self._restore(p, c, now)
+            return self._restore(p, c, offered, now)
         if stranger and self._contact() != "open":
             raise _Drop(ACEError("not_permitted", "sender is not admitted"))
         return self._candidate(p, now, stranger=stranger, content=c)
@@ -568,16 +572,16 @@ class Inbox:
             return False
         return True
 
-    def _restore(self, p: Packet, c: dict, now: int) -> ReceiveOutcome:
+    def _restore(self, p: Packet, c: dict, offered: bytes, now: int) -> ReceiveOutcome:
         """A recovery candidate (06 § Recovery candidates): its proof is a valid permit we
         issued, which justifies verifying its ``source``, without any network lookup (relays do
         not federate): a PublishedAgent naming the sender under our pin rules, then the packet
         signature and the reply permit under its KEL. Only then is ``source`` pinned, the sender
         recorded ``admitted`` (a new row with no profile) with the proof as the newest permit
-        issued to it, and the reply permit held; the pipeline continues at step 8. Step 7
-        (installed type) drops first; a body failing step 8 is rejected once the sender is
-        recorded. Every failure before the sender is recorded is drop and pins nothing; from then
-        on the dispositions of the table apply."""
+        issued to it, the reply permit and the offered peer prekey held; the pipeline continues
+        at step 8. Step 7 (installed type) drops first; a body failing step 8 is rejected once
+        the sender is recorded. Every failure before the sender is recorded is drop and pins
+        nothing; from then on the dispositions of the table apply."""
         admission = c.pop("admission")  # never handed over or journaled
         invalid = None
         try:
@@ -606,9 +610,26 @@ class Inbox:
                 raise
             raise _Drop(exc) from None
         self._hold(permit, state, now)
+        self._record(p, offered, c["type"], state)
         if invalid is not None:
             return self._reject(p, invalid, now)
         return self._commit(PrivateMessage.of(p, c), now, receipt=True)
+
+    def _decrypt(self, p: Packet, now: int) -> bytes:
+        """Step 6, then the issuer rule (04 § Peer prekeys): a packet that opened under the key we
+        offered ``from`` makes it the in-use key, whatever its disposition from step 7 on."""
+        plaintext = decrypt_packet(p, self._vault, now)
+        self._vault.used(p.from_id, p.prekey_id, now)
+        return plaintext
+
+    def _record(self, p: Packet, offered: bytes, type_: str, state: KelState) -> None:
+        """The holder rule (04 § Peer prekeys): the peer prekey a packet from an authenticated
+        sender carries is held for it under ``state``'s pin when the packet is newer than the
+        one that carried the held key. Contact packets record nothing."""
+        if type_ != CONTACT_TYPE:
+            self._vault.hold(
+                p.from_id, Prekey(prekey_id(offered), offered), p.timestamp, state.last_hash
+            )
 
     def _verify_source(
         self, p: Packet, source: object, permit: object | None, now: int
@@ -646,8 +667,8 @@ class Inbox:
         try:
             if content is None:
                 check_window(p, now)
-                content = decode_content(decrypt_packet(p, self._vault, now))
-                content.pop("prekey")  # Task 5: recorded by vault.used()/hold()
+                content = decode_content(self._decrypt(p, now))
+                content.pop("prekey")  # an unpinned sender's packet records no held key
             c = content
             if c["type"] != CONTACT_TYPE:
                 raise ACEError("not_permitted", "an unpinned sender may only send contact packets")
@@ -890,7 +911,8 @@ class Inbox:
             RECEIPT_TYPE,
             CORE.messages[RECEIPT_TYPE].digest,
             body,
-            prekey=prekey_public_key(os.urandom(32)),  # Task 5: replaced by vault.offer()
+            prekey=self._vault.offer(to, now).public_key,
         )
+        # never to a held peer prekey: a receipt is never retried (06 § Receipts)
         packet = create_packet(self._identity, to, agent.prekey, plaintext, timestamp=now)
         return Reply(to, packet, permit)
