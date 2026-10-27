@@ -67,8 +67,19 @@ def prekey_public_key(seed: bytes) -> bytes:
 
 
 def decode_prekey_public_key(b64: object) -> bytes:
-    """A content ``prekey`` member: canonical Base64 of 1216 bytes, else ``invalid_body``."""
-    return decode_fixed_b64(b64, KEM_PUBLIC_KEY_SIZE, "invalid_body", "prekey")
+    """A content ``prekey`` member: canonical Base64 of an X-Wing public key, else
+    ``invalid_body``. Checked here, at decode, so a key that cannot be encapsulated to is
+    never held."""
+    public = decode_fixed_b64(b64, KEM_PUBLIC_KEY_SIZE, "invalid_body", "prekey")
+    _check_xwing_public_key(public, "invalid_body", "prekey")
+    return public
+
+
+def _check_xwing_public_key(public: bytes, code: str, what: str) -> None:
+    try:
+        _xwing.check_public_key(public)
+    except ACEError:
+        raise ACEError(code, f"{what} is not an X-Wing public key") from None
 
 
 @dataclass
@@ -205,6 +216,7 @@ class PrekeyVault:
             public = decode_fixed_b64(
                 h["publicKey"], KEM_PUBLIC_KEY_SIZE, "storage_failed", "publicKey"
             )
+            _check_xwing_public_key(public, "storage_failed", "held.publicKey")
             held = _Held(Prekey(prekey_id(public), public), h["timestamp"], h["pin"])
         return _Peer(
             None if d["offered"] is None else self._parse(d["offered"], "offeredAt"),

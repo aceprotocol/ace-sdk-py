@@ -375,6 +375,7 @@ def test_decode_content_prekey_rules():
         {**base, "prekey": "QQ=="},  # wrong length
         {**base, "prekey": 7},  # not a string
         {**base, "prekey": to_base64(PEER_PREKEY)[:-1] + "B"},  # non-canonical Base64
+        {**base, "prekey": to_base64(b"\xff" * 1216)},  # 1216 bytes, not an X-Wing key
     ):
         with raises("invalid_body"):
             decode_content(canonical_state_bytes(bad))
@@ -386,6 +387,6 @@ def test_decode_content_prekey_rules():
 
 def test_decode_prekey_public_key():
     assert decode_prekey_public_key(to_base64(PEER_PREKEY)) == PEER_PREKEY
-    for bad in ("QQ==", None, to_base64(PEER_PREKEY) + "A"):
+    for bad in ("QQ==", None, to_base64(PEER_PREKEY) + "A", to_base64(b"\xff" * 1216)):
         with raises("invalid_body"):
             decode_prekey_public_key(bad)  # type: ignore[arg-type]

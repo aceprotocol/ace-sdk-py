@@ -186,6 +186,22 @@ def test_reorder_keeps_newer_held_key(relay):
     bob.close()
 
 
+def test_prekey_that_is_not_an_xwing_key_is_rejected_and_not_held(relay):
+    """A 1216-byte ``prekey`` whose ML-KEM half fails the FIPS 203 modulus check is malformed
+    content: rejected at step 7 (``invalid_body``) and never held, so no later attempt
+    encapsulates to it."""
+    now, alice, bob, a, b = _pair(relay)
+    plain = encode_content("ace:text:1", TEXT_DIGEST, {"message": "x"}, prekey=b"\xff" * 1216)
+    p = create_packet(alice.identity, b, bob.vault.current(), plain, timestamp=now[0])
+    seen = len(bob.received)
+    out = bob.inbox.receive(wire(p))
+    assert out.kind == "rejected" and out.error.code == "invalid_body"
+    assert bob.vault.held(a, _pin(bob, a), now[0]) is None
+    assert len(bob.received) == seen
+    alice.close()
+    bob.close()
+
+
 def test_unknown_prekey_on_held_key_drops_it(relay, tmp_path):
     path = tmp_path / "bob-prekeys.json"
     now, alice, bob, a, b = _pair(relay, b_vault=PrekeyVault(path))

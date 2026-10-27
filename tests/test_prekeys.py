@@ -250,3 +250,24 @@ def test_peers_are_ace_ids(vault, tmp_path):
         json.dump(doc, f)
     with raises("storage_failed"):
         PrekeyVault(path)
+
+
+def test_held_public_key_that_is_not_an_xwing_key_is_storage_failed(tmp_path):
+    path = tmp_path / "prekeys.json"
+    held = {"publicKey": to_base64(b"\xff" * 1216), "timestamp": now, "pin": PIN}
+    doc = {
+        "version": 2,
+        "current": None,
+        "retained": [],
+        "peers": {A: {"offered": None, "inUse": None, "held": held}},
+    }
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(doc, f)
+    with raises("storage_failed"):
+        PrekeyVault(path)
+    held["publicKey"] = to_base64(P1.public_key)  # the same file with a valid key loads
+    os.chmod(path, 0o600)
+    with open(path, "w") as f:
+        json.dump(doc, f)
+    assert PrekeyVault(path).held(A, PIN, now) == P1
