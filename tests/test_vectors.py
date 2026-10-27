@@ -74,8 +74,8 @@ from ace.commerce import ThreadStore, commerce_rules, validate_commerce_ext
 from ace.delegation import validate_erc8004
 from ace.errors import _CODE_RE
 from ace.kel import event_bytes, verify_operational_signature
-from ace.packet import packet_header
-from ace.prekeys import _entry, _State
+from ace.packet import packet_header, pad_plaintext
+from ace.prekeys import _entry, _Peer, _State
 from ace.relay import map_relay_response
 from ace.rules import MessageEvent
 from ace.store import MemoryStore
@@ -264,16 +264,24 @@ def test_xwing_draft_vectors():
         assert dk.decapsulate(bytes.fromhex(c["ciphertext"])).hex() == c["sharedSecret"]
 
 
-def bob_vault(tmp_path) -> PrekeyVault:
-    """A vault holding only the vector prekey seed, through the public 0600 file format."""
+def _b64_seed(seed_hex: str) -> str:
+    return base64.b64encode(bytes.fromhex(seed_hex)).decode()
+
+
+def bob_vault(tmp_path, peer_seeds: dict | None = None) -> PrekeyVault:
+    """A vault holding the vector prekey seed and, per ``peerSeeds`` entry, the peer prekey
+    offered to that peer (offeredAt = the vectors' now), through the public 0600 file format."""
     seed = V["packet"]["deterministic"]["prekeySeed"]
     tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / "prekeys.json"
     doc = {
         "version": 2,
-        "current": {"seed": base64.b64encode(bytes.fromhex(seed)).decode(), "createdAt": 0},
+        "current": {"seed": _b64_seed(seed), "createdAt": 0},
         "retained": [],
-        "peers": {},
+        "peers": {
+            peer: {"offered": {"seed": _b64_seed(s), "offeredAt": NOW}, "inUse": None, "held": None}
+            for peer, s in (peer_seeds or {}).items()
+        },
     }
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -290,8 +298,10 @@ def test_packet_deterministic(tmp_path):
     assert d["saltHex"] == ""  # 03: the HKDF salt is the empty string
     key = HKDF(algorithm=hashes.SHA256(), length=32, salt=b"", info=header).derive(ss)
     assert key.hex() == d["keyHex"]
-    plaintext = canonical_state_bytes(d["content"])
-    assert plaintext.hex() == d["plaintextHex"]
+    content = canonical_state_bytes(d["content"])
+    assert content.hex() == d["contentHex"]
+    plaintext = pad_plaintext(content)
+    assert plaintext.hex() == d["plaintextHex"] and len(plaintext) == 4096
     payload = nonce + AESGCM(key).encrypt(nonce, plaintext, header)
     assert payload.hex() == d["payloadHex"]
     assert (
@@ -308,7 +318,7 @@ def test_packet_deterministic(tmp_path):
         sender,
         bob,
         d["prekey"],
-        plaintext,
+        content,
         timestamp=d["timestamp"],
         message_id=d["messageId"],
         _kem=(ss, kem),
@@ -340,7 +350,8 @@ def test_packet_open(c, tmp_path):
         p = decode_packet(c["packet"])
         if p.to_id != me:
             raise ACEError("wrong_recipient", "")
-        open_packet(p, state_of(c["sender"], c["now"]), bob_vault(tmp_path), now=c["now"])
+        vault = bob_vault(tmp_path, c.get("peerSeeds"))
+        open_packet(p, state_of(c["sender"], c["now"]), vault, now=c["now"])
 
     assert code_of(run) == c["error"]
 
@@ -597,7 +608,14 @@ def test_receive_pipeline(c):
         peers.adopt(agent, NOW)
         peers.set_status(AGENTS[name]["aceId"], "admitted")
     vault = PrekeyVault()
-    vault._state = _State(_entry(bytes.fromhex(V["packet"]["deterministic"]["prekeySeed"]), 0), [])
+    vault._state = _State(
+        _entry(bytes.fromhex(V["packet"]["deterministic"]["prekeySeed"]), 0),
+        [],
+        {
+            peer: _Peer(offered=_entry(bytes.fromhex(s), NOW))
+            for peer, s in c.get("peerSeeds", {}).items()
+        },
+    )
     inbox = Inbox.open(
         me,
         store,
@@ -623,6 +641,17 @@ def test_receive_pipeline(c):
         assert (None if out.error is None else out.error.code) == want["code"]
         assert (out.receipt is None) == (want["receipt"] is None)
     inbox.close()
+    if "vaultAfter" in c:
+        after = c["vaultAfter"]
+        other = next(a["aceId"] for a in AGENTS.values() if a["aceId"] != after["peer"])
+        peer = vault._state.peers[after["peer"]]
+        assert peer.in_use is not None and peer.in_use.prekey.id == after["inUse"]
+        assert peer.offered is None or peer.offered.prekey.id != after["inUse"]
+        vault.open(after["inUse"], clock["t"], sender=after["peer"])
+        assert (
+            code_of(lambda: vault.open(after["inUse"], clock["t"], sender=other))
+            == "unknown_prekey"
+        )
 
 
 # --- auth, registration, relay errors -------------------------------------------------------
