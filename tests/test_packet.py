@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import json
 import os
 import stat
 
@@ -26,7 +27,8 @@ from ace.packet import (
     plaintext_bucket,
     unpad_plaintext,
 )
-from tests.helpers import NOW, open_packet, raises, retained
+from ace.prekeys import decode_prekey_public_key, prekey_public_key
+from tests.helpers import NOW, PEER_PREKEY, open_packet, raises, retained
 
 DIGEST = TEXT.messages["ace:text:1"].digest
 
@@ -39,7 +41,7 @@ def parties():
 
 
 def text(msg="hello", thread=None):
-    return encode_content("ace:text:1", DIGEST, {"message": msg}, thread)
+    return encode_content("ace:text:1", DIGEST, {"message": msg}, thread, prekey=PEER_PREKEY)
 
 
 def state(identity):
@@ -76,7 +78,12 @@ def test_header_and_content_bytes():
         pk.kem_ciphertext,
     )
     assert text() == canonical_state_bytes(
-        {"type": "ace:text:1", "schemaDigest": DIGEST, "body": {"message": "hello"}}
+        {
+            "type": "ace:text:1",
+            "schemaDigest": DIGEST,
+            "body": {"message": "hello"},
+            "prekey": to_base64(PEER_PREKEY),
+        }
     )
     with raises("invalid_body"):
         decode_content(
@@ -247,9 +254,9 @@ def _body_at(n: int) -> dict:
 
 def test_sent_body_depth_counts_from_the_content_root():
     """02 § JSON values: receivers count depth from the private content, so senders do too."""
-    encode_content("ace:text:1", DIGEST, _body_at(31))
+    encode_content("ace:text:1", DIGEST, _body_at(31), prekey=PEER_PREKEY)
     with raises("invalid_body") as info:
-        encode_content("ace:text:1", DIGEST, _body_at(32))
+        encode_content("ace:text:1", DIGEST, _body_at(32), prekey=PEER_PREKEY)
     assert "depth" in info.value.message
 
 
@@ -339,3 +346,46 @@ def test_largest_content_fits_a_packet():
     p = create_packet(a, b.get_ace_id(), vault.current(), raw, timestamp=NOW)
     assert len(canonical_state_bytes(p)) <= MAX_PACKET_BYTES
     assert decrypt_packet(decode_packet(p), vault, NOW) == raw
+
+
+# --- private content carries the offered peer prekey (03 § Private content) -----------------
+
+
+def test_encode_content_requires_prekey():
+    with pytest.raises(TypeError):
+        encode_content("ace:text:1", DIGEST, {"message": "hi"})  # type: ignore[call-arg]
+    with raises("invalid_argument"):
+        encode_content("ace:text:1", DIGEST, {}, prekey=bytes(1215))
+    with raises("invalid_argument"):
+        encode_content("ace:text:1", DIGEST, {}, prekey="not bytes")  # type: ignore[arg-type]
+
+
+def test_content_prekey_round_trip():
+    pk = prekey_public_key(bytes(32))
+    raw = encode_content("ace:text:1", DIGEST, {"message": "hi"}, "t", prekey=pk)
+    assert json.loads(raw)["prekey"] == to_base64(pk)
+    c = decode_content(raw)
+    assert c["prekey"] == pk and c["body"] == {"message": "hi"} and c["threadId"] == "t"
+
+
+def test_decode_content_prekey_rules():
+    base = {"type": "ace:text:1", "schemaDigest": DIGEST, "body": {}}
+    for bad in (
+        base,  # missing
+        {**base, "prekey": "QQ=="},  # wrong length
+        {**base, "prekey": 7},  # not a string
+        {**base, "prekey": to_base64(PEER_PREKEY)[:-1] + "B"},  # non-canonical Base64
+    ):
+        with raises("invalid_body"):
+            decode_content(canonical_state_bytes(bad))
+    assert (
+        decode_content(canonical_state_bytes({**base, "prekey": to_base64(PEER_PREKEY)}))["prekey"]
+        == PEER_PREKEY
+    )
+
+
+def test_decode_prekey_public_key():
+    assert decode_prekey_public_key(to_base64(PEER_PREKEY)) == PEER_PREKEY
+    for bad in ("QQ==", None, to_base64(PEER_PREKEY) + "A"):
+        with raises("invalid_body"):
+            decode_prekey_public_key(bad)  # type: ignore[arg-type]

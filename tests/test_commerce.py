@@ -27,7 +27,7 @@ from ace.commerce import (
     validate_commerce_ext,
 )
 from ace.rules import MessageEvent
-from tests.helpers import Clock, Party, raises, wire
+from tests.helpers import PEER_PREKEY, Clock, Party, raises, wire
 
 PROFILES = Profiles([TEXT, COMMERCE])
 STABLE = {
@@ -130,7 +130,11 @@ def test_opposite_parties_can_reuse_a_message_id_without_skipping_the_transition
     try:
         mid, _ = m.send(b, s, RFQ, {"need": "translate"})
         plaintext = encode_content(
-            OFFER, COMMERCE.messages[OFFER].digest, {"price": "10", "currency": "USDC"}, "t1"
+            OFFER,
+            COMMERCE.messages[OFFER].digest,
+            {"price": "10", "currency": "USDC"},
+            "t1",
+            prekey=PEER_PREKEY,
         )
         packet = create_packet(
             s.identity, b.id, b.vault.current(), plaintext, timestamp=m.clock.now, message_id=mid
@@ -220,7 +224,11 @@ def test_receiver_rejects_with_the_rule_code():
     from ace import create_packet, encode_content
 
     plain = encode_content(
-        OFFER, COMMERCE.messages[OFFER].digest, {"price": "1", "currency": "USDC"}, "t9"
+        OFFER,
+        COMMERCE.messages[OFFER].digest,
+        {"price": "1", "currency": "USDC"},
+        "t9",
+        prekey=PEER_PREKEY,
     )
     p = create_packet(s.identity, b.id, b.vault.current(), plain, timestamp=m.clock.now)
     out = m.inbox[b.id].receive(wire(p))

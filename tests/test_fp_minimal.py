@@ -22,13 +22,13 @@ from ace.limits import CONTACT_REQUEST_TTL_SECONDS, OFFLINE_WINDOW_SECONDS
 from ace.profiles import CONTACT_TYPE
 
 from .fake_relay import FakeRelay
-from .helpers import Clock, Party, raises, wire
+from .helpers import PEER_PREKEY, Clock, Party, raises, wire
 
 TEXT_DIGEST = TEXT.messages["ace:text:1"].digest
 
 
 def _text(a: Party, b: Party, ts: int) -> bytes:
-    plain = encode_content("ace:text:1", TEXT_DIGEST, {"message": "hi"})
+    plain = encode_content("ace:text:1", TEXT_DIGEST, {"message": "hi"}, prekey=PEER_PREKEY)
     return wire(create_packet(a.identity, b.id, b.vault.current(), plain, timestamp=ts))
 
 
@@ -215,7 +215,9 @@ def test_step3_without_refresh_continues_as_candidate():
         "source": a.source(profiles=[TEXT.descriptor()]),
         "permit": create_permit(a.identity, b.id, now=clock.now),
     }
-    plain = encode_content(CONTACT_TYPE, CORE.messages[CONTACT_TYPE].digest, body)
+    plain = encode_content(
+        CONTACT_TYPE, CORE.messages[CONTACT_TYPE].digest, body, prekey=PEER_PREKEY
+    )
     packet = create_packet(a.identity, b.id, b.vault.current(), plain, timestamp=clock.now)
     out = inbox.receive(wire(packet))
     assert out.kind == "delivered" and [m.type for m in got] == [CONTACT_TYPE]

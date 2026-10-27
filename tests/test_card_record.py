@@ -34,7 +34,7 @@ from ace.profiles import CONTACT_TYPE
 from ace.store import load_record, write_record
 
 from .fake_relay import FakeRelay
-from .helpers import NOW, Clock, raises
+from .helpers import NOW, PEER_PREKEY, Clock, raises
 
 RELAY = "https://relay.test"
 SOL = "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp:7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"
@@ -733,7 +733,9 @@ def test_no_card_means_closed(world):
         "source": alice.publish(),
         "permit": create_permit(alice.identity, b, now=world.clock.now),
     }
-    plaintext = encode_content(CONTACT_TYPE, CORE.messages[CONTACT_TYPE].digest, body)
+    plaintext = encode_content(
+        CONTACT_TYPE, CORE.messages[CONTACT_TYPE].digest, body, prekey=PEER_PREKEY
+    )
     packet = create_packet(
         alice.identity, b, desc["descriptor"]["prekey"], plaintext, timestamp=world.clock.now
     )

@@ -25,7 +25,7 @@ from ace import (
 )
 
 from .fake_relay import FakeRelay
-from .helpers import Clock, Party, wire
+from .helpers import PEER_PREKEY, Clock, Party, wire
 
 TEXT_DIGEST = TEXT.messages["ace:text:1"].digest
 
@@ -112,7 +112,7 @@ def _world(rule=None, on_message=None):
     inbox = Inbox.open(b.identity, b.store, b.vault, b.peers, Profiles(), **opts)
 
     def packet():
-        plain = encode_content("ace:text:1", TEXT_DIGEST, {"message": "hi"})
+        plain = encode_content("ace:text:1", TEXT_DIGEST, {"message": "hi"}, prekey=PEER_PREKEY)
         return wire(create_packet(a.identity, b.id, b.vault.current(), plain, timestamp=clock.now))
 
     return clock, a, b, inbox, got, packet, opts

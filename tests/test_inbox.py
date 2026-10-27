@@ -17,7 +17,7 @@ from ace import (
     encode_content,
 )
 from ace.limits import MAX_PERMIT_LIFETIME, OFFLINE_WINDOW_SECONDS
-from tests.helpers import Clock, Party, raises, wire
+from tests.helpers import PEER_PREKEY, Clock, Party, raises, wire
 
 TEXT_DIGEST = TEXT.messages["ace:text:1"].digest
 CONTACT_DIGEST = CORE.messages["ace:contact:1"].digest
@@ -72,7 +72,10 @@ class World:
     ):
         sender = sender or self.a
         plain = encode_content(
-            type_, digest or TEXT_DIGEST, body if body is not None else {"message": "hi"}
+            type_,
+            digest or TEXT_DIGEST,
+            body if body is not None else {"message": "hi"},
+            prekey=PEER_PREKEY,
         )
         return create_packet(
             sender.identity,

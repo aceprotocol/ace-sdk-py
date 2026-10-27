@@ -22,11 +22,11 @@ from ace import (
     decrypt_packet,
     encode_content,
 )
-from ace._encoding import canonical_state_bytes
+from ace._encoding import canonical_state_bytes, to_base64
 from ace.limits import MAX_PLAINTEXT_BYTES
 from ace.outbox import Admission, _key
 from ace.store import load_record, write_record
-from tests.helpers import Clock, Party, raises, wire
+from tests.helpers import PEER_PREKEY, Clock, Party, raises, wire
 from tests.test_inbox import TEXT_DIGEST, World
 
 RECEIPT_DIGEST = CORE.messages["ace:receipt:1"].digest
@@ -40,10 +40,14 @@ def _adm():
 
 
 def test_admission_is_encoded_when_present_and_decoded_as_the_closed_triple():
-    raw = encode_content("ace:text:1", TEXT_DIGEST, {"message": "hi"}, admission=_adm())
+    raw = encode_content(
+        "ace:text:1", TEXT_DIGEST, {"message": "hi"}, admission=_adm(), prekey=PEER_PREKEY
+    )
     assert json.loads(raw)["admission"] == _adm()
     assert decode_content(raw)["admission"] == _adm()
-    assert "admission" not in json.loads(encode_content("ace:text:1", TEXT_DIGEST, {}))
+    assert "admission" not in json.loads(
+        encode_content("ace:text:1", TEXT_DIGEST, {}, prekey=PEER_PREKEY)
+    )
 
 
 @pytest.mark.parametrize(
@@ -65,7 +69,7 @@ def test_any_other_admission_shape_is_invalid_body(bad):
         decode_content(json.dumps(content).encode())
     if bad is not None:
         with raises("invalid_argument"):
-            encode_content("ace:text:1", TEXT_DIGEST, {}, admission=bad)
+            encode_content("ace:text:1", TEXT_DIGEST, {}, admission=bad, prekey=PEER_PREKEY)
 
 
 def test_admission_on_a_receipt_or_contact_is_invalid():
@@ -74,7 +78,7 @@ def test_admission_on_a_receipt_or_contact_is_invalid():
         with raises("invalid_body"):
             decode_content(json.dumps(content).encode())
         with raises("invalid_argument"):
-            encode_content(type_, TEXT_DIGEST, {}, admission=_adm())
+            encode_content(type_, TEXT_DIGEST, {}, admission=_adm(), prekey=PEER_PREKEY)
 
 
 # --- Outbox sender (05 § Admission recovery 1, 06 § Outbox) -----------------------------------
@@ -124,7 +128,7 @@ def test_retries_refresh_the_descriptor_and_carry_admission_never_stored():
 
 def test_admission_is_left_out_when_the_content_would_exceed_the_limit():
     clock, a, b, ob, _ = _outbox()
-    base = len(encode_content("ace:text:1", TEXT_DIGEST, {"message": ""}))
+    base = len(encode_content("ace:text:1", TEXT_DIGEST, {"message": ""}, prekey=PEER_PREKEY))
     mid = ob.enqueue(b.id, "ace:text:1", {"message": ""})
     big = {"message": "x" * (MAX_PLAINTEXT_BYTES - base - 10)}  # beyond the text schema: white-box
     e = ob.get(mid)
@@ -160,6 +164,7 @@ def _packet(w, admission, *, type_="ace:text:1", digest=TEXT_DIGEST, body=None, 
         "type": type_,
         "schemaDigest": digest,
         "body": {"message": "hi"} if body is None else body,
+        "prekey": to_base64(PEER_PREKEY),
     }
     plain = canonical_state_bytes({**content, "admission": admission})  # also where encode refuses
     return create_packet(sender.identity, w.b.id, w.b.vault.current(), plain, timestamp=w.clock.now)

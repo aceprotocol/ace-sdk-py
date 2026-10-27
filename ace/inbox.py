@@ -32,6 +32,7 @@ record (the sender's retry is a duplicate and gets a receipt); a rejected packet
 
 from __future__ import annotations
 
+import os
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
@@ -62,7 +63,7 @@ from .packet import (
 )
 from .peers import PeerStore
 from .permit import create_permit, verify_permit
-from .prekeys import PrekeyVault
+from .prekeys import PrekeyVault, prekey_public_key
 from .profiles import CONTACT_TYPE, CORE, RECEIPT_TYPE, Profiles
 from .replay import ReplayDetector
 from .rules import MessageEvent, ProfileRules, check_rules, governed, run_check, run_commit
@@ -478,6 +479,7 @@ class Inbox:
         c = None
         try:
             c = decode_content(plaintext)
+            c.pop("prekey")  # Task 5: recorded by vault.used()/hold()
             self._profiles.validate(c["type"], c["schemaDigest"], c["body"])
         except ACEError as exc:
             if exc.category != "permanent":
@@ -544,6 +546,7 @@ class Inbox:
         try:
             check_window(p, now)
             c = decode_content(decrypt_packet(p, self._vault, now))
+            c.pop("prekey")  # Task 5: recorded by vault.used()/hold()
         except ACEError as exc:
             if exc.category != "permanent":
                 raise
@@ -644,6 +647,7 @@ class Inbox:
             if content is None:
                 check_window(p, now)
                 content = decode_content(decrypt_packet(p, self._vault, now))
+                content.pop("prekey")  # Task 5: recorded by vault.used()/hold()
             c = content
             if c["type"] != CONTACT_TYPE:
                 raise ACEError("not_permitted", "an unpinned sender may only send contact packets")
@@ -882,6 +886,11 @@ class Inbox:
             self._peers.reply_permit(to, seq, now) is None
         ):
             permit = body["permit"] = create_permit(self._identity, to, now=now)
-        plaintext = encode_content(RECEIPT_TYPE, CORE.messages[RECEIPT_TYPE].digest, body)
+        plaintext = encode_content(
+            RECEIPT_TYPE,
+            CORE.messages[RECEIPT_TYPE].digest,
+            body,
+            prekey=prekey_public_key(os.urandom(32)),  # Task 5: replaced by vault.offer()
+        )
         packet = create_packet(self._identity, to, agent.prekey, plaintext, timestamp=now)
         return Reply(to, packet, permit)

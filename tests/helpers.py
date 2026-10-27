@@ -17,8 +17,11 @@ from ace import (
     SoftwareIdentity,
     create_published_agent,
 )
+from ace.prekeys import prekey_public_key
 
 NOW = 1760140800
+#: A peer prekey for private content (any X-Wing public key; senders offer one per packet).
+PEER_PREKEY = prekey_public_key(bytes(range(32)))
 # injected clocks that are not non-negative integer Unix seconds within 2^53-1
 BAD_CLOCK_VALUES = (
     float("nan"),

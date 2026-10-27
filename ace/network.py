@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import copy
 import functools
+import os
 import re
 import threading
 from dataclasses import dataclass, replace
@@ -49,7 +50,7 @@ from .outbox import Admission, Attempt, Outbox, OutboxEntry
 from .packet import PrivateMessage, create_packet, encode_content
 from .peers import PeerStore
 from .permit import create_permit, verify_permit
-from .prekeys import PrekeyVault
+from .prekeys import PrekeyVault, prekey_public_key
 from .profiles import CONTACT_TYPE, CORE, Profiles
 from .relay import RelayClient, RelayEntry
 from .rules import ProfileRules
@@ -705,7 +706,12 @@ class NetworkClient:
     def _send_contact(self, agent: VerifiedAgent, body: dict, permit: dict | None = None) -> str:
         """A contact packet: one attempt, never queued. A permit it carries counts as issued
         only once the packet was sent (a failed send leaves the peer due for a fresh one)."""
-        plaintext = encode_content(CONTACT_TYPE, CORE.messages[CONTACT_TYPE].digest, body)
+        plaintext = encode_content(
+            CONTACT_TYPE,
+            CORE.messages[CONTACT_TYPE].digest,
+            body,
+            prekey=prekey_public_key(os.urandom(32)),  # Task 5: replaced by vault.offer()
+        )
         packet = create_packet(
             self.identity, agent.ace_id, agent.prekey, plaintext, timestamp=self._now()
         )

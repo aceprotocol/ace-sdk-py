@@ -21,7 +21,7 @@ from ace import (
     encode_content,
     sha256_hex,
 )
-from tests.helpers import Clock, raises, wire
+from tests.helpers import PEER_PREKEY, Clock, raises, wire
 from tests.test_inbox import World
 from tests.test_network import client
 
@@ -65,7 +65,7 @@ def test_contact_cannot_undo_a_block_completed_by_another_client(relay, pair, mo
         alice.identity,
         b,
         bob.vault.current(),
-        encode_content("ace:contact:1", CONTACT_DIGEST, body),
+        encode_content("ace:contact:1", CONTACT_DIGEST, body, prekey=PEER_PREKEY),
         timestamp=bob._now(),
     )
     actor = NetworkClient.open(bob.identity, bob.store, bob.relay, bob.vault, receive=False)
@@ -189,7 +189,9 @@ def test_relay_send_refuses_a_permit_for_another_packet():
         a,
         b.get_ace_id(),
         vault.current(clock.now),
-        encode_content("ace:text:1", TEXT.messages["ace:text:1"].digest, {"message": "x"}),
+        encode_content(
+            "ace:text:1", TEXT.messages["ace:text:1"].digest, {"message": "x"}, prekey=PEER_PREKEY
+        ),
         timestamp=clock.now,
     )
     wrong = create_permit(

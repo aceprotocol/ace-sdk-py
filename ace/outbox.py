@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import os
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
@@ -42,8 +43,14 @@ from ._encoding import (
 )
 from .errors import ACEError
 from .identity import ACEIdentity
-from .limits import OFFLINE_WINDOW_SECONDS, OUTBOX_FIRST_BACKOFF_SECONDS, OUTBOX_MAX_BACKOFF_SECONDS
+from .limits import (
+    KEM_PUBLIC_KEY_SIZE,
+    OFFLINE_WINDOW_SECONDS,
+    OUTBOX_FIRST_BACKOFF_SECONDS,
+    OUTBOX_MAX_BACKOFF_SECONDS,
+)
 from .packet import create_packet, encode_content
+from .prekeys import prekey_public_key
 from .profiles import CONTACT_TYPE, RECEIPT_TYPE, Profiles
 from .rules import MessageEvent, ProfileRules, check_rules, governed, run_check, run_commit
 from .store import ACEStore, load_record, write_record
@@ -300,7 +307,8 @@ class Outbox:
         content: dict = {"type": type_, "schemaDigest": digest, "body": body}
         if thread_id is not None:
             content["threadId"] = thread_id
-        encode_content(type_, digest, body, thread_id)  # size check before anything is stored
+        # size check before anything is stored; every packet carries a prekey of this length
+        encode_content(type_, digest, body, thread_id, prekey=bytes(KEM_PUBLIC_KEY_SIZE))
         now = self._now()
         event = MessageEvent("send", mid, self._identity.get_ace_id(), to, now, type_, thread_id)
         if self._resolve_peer is not None:
@@ -484,16 +492,17 @@ class Outbox:
             used = agent.prekey.id
             c = e.content
             args = (c["type"], c["schemaDigest"], c["body"], c.get("threadId"))
+            offered = prekey_public_key(os.urandom(32))  # Task 5: replaced by vault.offer()
             extra = self._admission(e.to, now) if retry and self._admission is not None else None
             try:
                 plaintext = encode_content(
-                    *args, admission=None if extra is None else extra.content
+                    *args, prekey=offered, admission=None if extra is None else extra.content
                 )
             except ACEError as exc:
                 if extra is None or exc.code != "limit_exceeded":
                     raise
                 extra = None  # too large with it: sent without
-                plaintext = encode_content(*args)
+                plaintext = encode_content(*args, prekey=offered)
             packet = create_packet(
                 self._identity,
                 e.to,

@@ -24,7 +24,7 @@ from ace import (
     normalize_relay_url,
 )
 
-from .helpers import raises
+from .helpers import PEER_PREKEY, raises
 
 SSE = "text/event-stream"
 
@@ -61,7 +61,9 @@ def pair(relay):
 
 
 def text_packet(sender, recipient, msg="hi"):
-    plain = encode_content("ace:text:1", TEXT.messages["ace:text:1"].digest, {"message": msg})
+    plain = encode_content(
+        "ace:text:1", TEXT.messages["ace:text:1"].digest, {"message": msg}, prekey=PEER_PREKEY
+    )
     return create_packet(
         sender.identity, recipient.id, recipient.vault.current(), plain, timestamp=relay_now()
     )

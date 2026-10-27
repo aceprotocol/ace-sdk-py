@@ -28,7 +28,12 @@ from ._encoding import (
     wire_int,
 )
 from .errors import ACEError
-from .limits import KEM_SEED_SIZE, MAX_RETAINED_PREKEYS, OFFLINE_WINDOW_SECONDS
+from .limits import (
+    KEM_PUBLIC_KEY_SIZE,
+    KEM_SEED_SIZE,
+    MAX_RETAINED_PREKEYS,
+    OFFLINE_WINDOW_SECONDS,
+)
 from .store import flock_file, write_file_atomic
 
 _LOCK_SECONDS = 10.0
@@ -47,6 +52,16 @@ class Prekey(NamedTuple):
 def prekey_id(public_key: bytes) -> str:
     """Lowercase hex SHA-256 of the 1216-byte X-Wing public key."""
     return sha256_hex(bytes(public_key))
+
+
+def prekey_public_key(seed: bytes) -> bytes:
+    """The 1216-byte X-Wing public key of a 32-byte prekey seed."""
+    return _xwing.DecapsulationKey(seed).public_key
+
+
+def decode_prekey_public_key(b64: object) -> bytes:
+    """A content ``prekey`` member: canonical Base64 of 1216 bytes, else ``invalid_body``."""
+    return decode_fixed_b64(b64, KEM_PUBLIC_KEY_SIZE, "invalid_body", "prekey")
 
 
 @dataclass
