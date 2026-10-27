@@ -3,6 +3,8 @@ import hashlib
 import os
 import stat
 
+import pytest
+
 from ace import (
     TEXT,
     PrekeyVault,
@@ -15,8 +17,15 @@ from ace import (
 )
 from ace._encoding import canonical_state_bytes, conversation_key, to_base64
 from ace._signing import encode_payload
-from ace.limits import OFFLINE_WINDOW_SECONDS
-from ace.packet import decrypt_packet, packet_header
+from ace.limits import MAX_PACKET_BYTES, MAX_PLAINTEXT_BYTES, OFFLINE_WINDOW_SECONDS
+from ace.packet import (
+    PLAINTEXT_BUCKETS,
+    decrypt_packet,
+    packet_header,
+    pad_plaintext,
+    plaintext_bucket,
+    unpad_plaintext,
+)
 from tests.helpers import NOW, open_packet, raises, retained
 
 DIGEST = TEXT.messages["ace:text:1"].digest
@@ -242,3 +251,91 @@ def test_sent_body_depth_counts_from_the_content_root():
     with raises("invalid_body") as info:
         encode_content("ace:text:1", DIGEST, _body_at(32))
     assert "depth" in info.value.message
+
+
+# --- plaintext padding (03 § Encryption) -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "n,b",
+    [
+        (0, 4096),
+        (4092, 4096),
+        (4093, 8192),
+        (2**20 - 4, 2**20),
+        (2**20 - 3, 1_179_652),
+        (MAX_PLAINTEXT_BYTES, 1_179_652),
+    ],
+)
+def test_plaintext_bucket(n, b):
+    assert plaintext_bucket(n) == b
+
+
+def test_plaintext_buckets_set():
+    assert PLAINTEXT_BUCKETS == frozenset([4096 << i for i in range(9)] + [1_179_652])
+
+
+def test_pad_unpad_roundtrip():
+    c = b"x" * 5000
+    p = pad_plaintext(c)
+    assert len(p) == 8192 and p[:4] == (5000).to_bytes(4, "big") and unpad_plaintext(p) == c
+    assert p[4 + 5000 :] == bytes(8192 - 5004)
+    assert unpad_plaintext(pad_plaintext(b"")) == b""
+
+
+def _u32(n: int) -> bytes:
+    return n.to_bytes(4, "big")
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        _u32(5) + b"x" * 5 + bytes(4095 - 9),  # not a bucket length (4095)
+        _u32(8200) + bytes(8188),  # 4 + n > len
+        _u32(5000) + bytes(4092),  # prefix 5000 inside a 4096 buffer
+        _u32(10) + b"x" * 10 + bytes(8192 - 14),  # 8192 buffer, n = 10 belongs to 4096
+        _u32(5) + b"x" * 5 + bytes(100) + b"\x01" + bytes(4096 - 110),  # non-zero padding
+        _u32(MAX_PLAINTEXT_BYTES + 1) + bytes(1_179_648),  # n > MAX_PLAINTEXT_BYTES
+    ],
+)
+def test_unpad_rejects(bad):
+    with raises("invalid_body"):
+        unpad_plaintext(bad)
+
+
+def test_decode_packet_requires_a_padded_bucket():
+    a, b, vault = parties()
+    p = create_packet(a, b.get_ace_id(), vault.current(), text(), timestamp=NOW)
+    for size in (27, 4096 + 27):
+        q = copy.deepcopy(p)
+        q["encryption"]["payload"] = to_base64(bytes(size))
+        with raises("invalid_packet"):
+            decode_packet(q)
+    q = copy.deepcopy(p)
+    q["encryption"]["payload"] = to_base64(bytes(4096 + 28))
+    assert len(decode_packet(q).payload) == 4096 + 28  # length check passes; signature is later
+    with raises("invalid_signature"):
+        open_packet(q, state(a), vault, now=NOW)
+
+
+def test_packet_payload_is_padded_and_decrypts_to_content():
+    a, b, vault = parties()
+    p = decode_packet(create_packet(a, b.get_ace_id(), vault.current(), text(), timestamp=NOW))
+    assert len(p.payload) == 4096 + 28
+    assert decrypt_packet(p, vault, NOW) == text()
+
+
+def test_largest_content_fits_a_packet():
+    a, b, vault = parties()
+    shell = canonical_state_bytes({"body": {"m": ""}, "schemaDigest": DIGEST, "type": "ace:text:1"})
+    raw = canonical_state_bytes(
+        {
+            "body": {"m": "x" * (MAX_PLAINTEXT_BYTES - len(shell))},
+            "schemaDigest": DIGEST,
+            "type": "ace:text:1",
+        }
+    )
+    assert len(raw) == MAX_PLAINTEXT_BYTES
+    p = create_packet(a, b.get_ace_id(), vault.current(), raw, timestamp=NOW)
+    assert len(canonical_state_bytes(p)) <= MAX_PACKET_BYTES
+    assert decrypt_packet(decode_packet(p), vault, NOW) == raw
