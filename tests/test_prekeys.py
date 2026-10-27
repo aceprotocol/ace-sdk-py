@@ -153,39 +153,17 @@ def test_drop_held_removes_empty_peer(vault):
     assert vault._state.peers == {}
 
 
-def _write(path, doc):
-    path.unlink(missing_ok=True)
+def test_unknown_version_or_shape_is_storage_failed(tmp_path):
+    path = tmp_path / "prekeys.json"
+    doc = {"version": 1, "current": None, "retired": []}
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(doc, f)
-
-
-def test_version_1_file_is_read_as_version_2(tmp_path):
-    path = tmp_path / "prekeys.json"
-    v = PrekeyVault(path)
-    first = v.current(now)
-    v.rotate(now + 10)
-    second = v.current(now + 10)
-    doc = json.loads(path.read_bytes())
-    _write(path, {"version": 1, "current": doc["current"], "retired": doc["retained"]})
-    again = PrekeyVault(path)
-    assert again.current(now + 20) == second
-    assert again.open(first.id, now + 20) is not None
-    again.offer(B, now + 20)
-    assert json.loads(path.read_bytes())["version"] == 2
-
-
-def test_other_versions_are_storage_failed(tmp_path):
-    path = tmp_path / "prekeys.json"
-    _write(path, {"version": 3, "current": None, "retained": [], "peers": {}})
-    with raises("storage_failed"):
-        PrekeyVault(path)
-    _write(path, {"version": 1, "current": None, "retired": [], "peers": {}})
     with raises("storage_failed"):
         PrekeyVault(path)
 
 
-def test_file_format_version_2(tmp_path):
+def test_file_format_version_1(tmp_path):
     path = tmp_path / "prekeys.json"
     v = PrekeyVault(path)
     pub = v.current(now)
@@ -193,7 +171,7 @@ def test_file_format_version_2(tmp_path):
     k = v.offer(B, now)
     v.hold(A, P1, now, PIN)
     doc = json.loads(path.read_bytes())
-    assert doc["version"] == 2 and set(doc) == {"version", "current", "retained", "peers"}
+    assert doc["version"] == 1 and set(doc) == {"version", "current", "retained", "peers"}
     assert [r["supersededAt"] for r in doc["retained"]] == [now + 1]
     assert doc["peers"][B]["offered"]["offeredAt"] == now
     assert doc["peers"][B]["inUse"] is None and doc["peers"][B]["held"] is None
@@ -262,7 +240,7 @@ def test_peers_are_ace_ids(vault, tmp_path):
             vault.hold(bad, P1, now, PIN)
     path = tmp_path / "bad.json"
     doc = {
-        "version": 2,
+        "version": 1,
         "current": None,
         "retained": [],
         "peers": {"b": {"offered": None, "inUse": None, "held": None}},
@@ -278,7 +256,7 @@ def test_held_public_key_of_wrong_length_is_storage_failed(tmp_path):
     path = tmp_path / "prekeys.json"
     held = {"publicKey": to_base64(b"\x01" * 1215), "timestamp": now, "pin": PIN}
     doc = {
-        "version": 2,
+        "version": 1,
         "current": None,
         "retained": [],
         "peers": {A: {"offered": None, "inUse": None, "held": held}},

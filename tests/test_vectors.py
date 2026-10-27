@@ -279,7 +279,7 @@ def bob_vault(tmp_path, peer_seeds: dict | None = None) -> PrekeyVault:
     tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / "prekeys.json"
     doc = {
-        "version": 2,
+        "version": 1,
         "current": {"seed": _b64_seed(seed), "createdAt": 0},
         "retained": [],
         "peers": {

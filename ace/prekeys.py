@@ -42,7 +42,7 @@ from .limits import (
 from .store import flock_file, write_file_atomic
 
 _LOCK_SECONDS = 10.0
-_VERSION = 2
+_VERSION = 1
 _MAX_FILE_BYTES = 64 << 20  # peer state grows with the number of peers
 
 
@@ -187,10 +187,6 @@ class PrekeyVault:
             if len(raw) > _MAX_FILE_BYTES:
                 raise ValueError("too large")
             data = json.loads(raw.decode("utf-8"))
-            if isinstance(data, dict) and data.get("version") == 1 and set(data) == {"version", "current", "retired"}:
-                # Version 1 (0.6.0 and earlier) is version 2 without peers: read it as such, and the next commit writes
-                # version 2. Refusing it would cut every upgraded agent off its own published prekey.
-                data = {"version": _VERSION, "current": data["current"], "retained": data["retired"], "peers": {}}
             if not isinstance(data, dict) or data.get("version") != _VERSION:
                 raise ValueError("version")
             if set(data) != {"version", "current", "retained", "peers"}:
