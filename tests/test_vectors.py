@@ -270,9 +270,10 @@ def bob_vault(tmp_path) -> PrekeyVault:
     tmp_path.mkdir(parents=True, exist_ok=True)
     path = tmp_path / "prekeys.json"
     doc = {
-        "version": 1,
+        "version": 2,
         "current": {"seed": base64.b64encode(bytes.fromhex(seed)).decode(), "createdAt": 0},
-        "retired": [],
+        "retained": [],
+        "peers": {},
     }
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
