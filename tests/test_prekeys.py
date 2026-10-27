@@ -153,12 +153,34 @@ def test_drop_held_removes_empty_peer(vault):
     assert vault._state.peers == {}
 
 
-def test_version_1_file_is_storage_failed(tmp_path):
-    path = tmp_path / "prekeys.json"
-    doc = {"version": 1, "current": None, "retired": []}
+def _write(path, doc):
+    path.unlink(missing_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(doc, f)
+
+
+def test_version_1_file_is_read_as_version_2(tmp_path):
+    path = tmp_path / "prekeys.json"
+    v = PrekeyVault(path)
+    first = v.current(now)
+    v.rotate(now + 10)
+    second = v.current(now + 10)
+    doc = json.loads(path.read_bytes())
+    _write(path, {"version": 1, "current": doc["current"], "retired": doc["retained"]})
+    again = PrekeyVault(path)
+    assert again.current(now + 20) == second
+    assert again.open(first.id, now + 20) is not None
+    again.offer(B, now + 20)
+    assert json.loads(path.read_bytes())["version"] == 2
+
+
+def test_other_versions_are_storage_failed(tmp_path):
+    path = tmp_path / "prekeys.json"
+    _write(path, {"version": 3, "current": None, "retained": [], "peers": {}})
+    with raises("storage_failed"):
+        PrekeyVault(path)
+    _write(path, {"version": 1, "current": None, "retired": [], "peers": {}})
     with raises("storage_failed"):
         PrekeyVault(path)
 

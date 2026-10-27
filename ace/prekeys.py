@@ -187,6 +187,10 @@ class PrekeyVault:
             if len(raw) > _MAX_FILE_BYTES:
                 raise ValueError("too large")
             data = json.loads(raw.decode("utf-8"))
+            if isinstance(data, dict) and data.get("version") == 1 and set(data) == {"version", "current", "retired"}:
+                # Version 1 (0.6.0 and earlier) is version 2 without peers: read it as such, and the next commit writes
+                # version 2. Refusing it would cut every upgraded agent off its own published prekey.
+                data = {"version": _VERSION, "current": data["current"], "retained": data["retired"], "peers": {}}
             if not isinstance(data, dict) or data.get("version") != _VERSION:
                 raise ValueError("version")
             if set(data) != {"version", "current", "retained", "peers"}:
