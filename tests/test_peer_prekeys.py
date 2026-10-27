@@ -11,6 +11,7 @@ from ace import (
     PrekeyVault,
     RelayClient,
     SoftwareIdentity,
+    _xwing,
     create_packet,
     decode_content,
     decode_packet,
@@ -245,6 +246,42 @@ def test_unknown_prekey_on_held_key_drops_it(relay, tmp_path):
     (retry,) = _since(relay, n, alice, bob)
     assert retry.prekey_id == bob.vault.current().id
     assert alice.vault.held(b, _pin(alice, b), now[0]) is None
+    alice.close()
+    bob.close()
+
+
+def test_held_key_with_all_zero_x25519_half(relay):
+    """A held key whose ML-KEM half is valid and whose X25519 half is all zeros is an X-Wing
+    public key (03 § X-Wing: no added X25519 checks). pyca's ``exchange`` raises ``ValueError``
+    for the all-zero shared secret; ``_xwing`` takes it as 32 zero bytes, as the draft does, so
+    encapsulation to the held key never fails here and needs no fallback: the first attempt goes
+    to it, B (which has no such key) answers ``unknown_prekey`` naming it, and the retry drops it
+    and goes to the published prekey."""
+    now, alice, bob, a, b = _pair(relay)
+    _ratchet(relay, now, alice, bob, a, b)
+    pin = _pin(alice, b)
+    real = alice.vault.held(b, pin, now[0]).public_key
+    low_order = real[:-32] + bytes(32)
+    _xwing.check_public_key(low_order)  # the receiver side accepts it
+    alice.vault.drop_held(b)
+    alice.vault.hold(b, Prekey(prekey_id(low_order), low_order), now[0], pin)
+    n = len(relay.sent)
+    mid = alice.send(b, "ace:text:1", {"message": "m3"})
+    (first,) = _since(relay, n, alice, bob)
+    assert first.prekey_id == prekey_id(low_order)
+    (out,) = bob.pull()
+    assert out.kind == "rejected" and out.error.code == "unknown_prekey"
+    alice.pull()
+    assert alice.outbox.get(mid).refresh
+    n = len(relay.sent)
+    (attempt,) = alice.flush()
+    assert attempt.result == "sent"
+    (retry,) = _since(relay, n, alice, bob)
+    assert retry.prekey_id == bob.vault.current().id
+    assert alice.vault.held(b, pin, now[0]) is None
+    bob.pull()
+    alice.pull()
+    assert alice.outbox.get(mid).status == "delivered"
     alice.close()
     bob.close()
 
