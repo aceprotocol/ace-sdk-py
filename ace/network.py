@@ -562,9 +562,9 @@ class NetworkClient:
         current, cached, bound = self.peers.lookup_state(ace_id, self._now())
         if current is not None and not refresh:
             return current
-        # A descriptor no longer bound to our current pins (the subject's KEL or a delegation
-        # issuer's moved on) may name relays chosen by a superseded, possibly compromised key:
-        # our relay is asked too, as when nothing is cached.
+        # A descriptor no longer bound to the subject's current pin (its KEL moved on) may name
+        # relays chosen by a superseded, possibly compromised key: our relay is asked too, as
+        # when nothing is cached.
         urls = [self.relay.base_url] if cached is None else cached.relays
         if cached is not None and not bound and self.relay.base_url not in urls:
             urls.append(self.relay.base_url)
@@ -931,8 +931,7 @@ class NetworkClient:
         """A held request (24 h) can outlive its source descriptor: pin the source's KEL (05 § Flow
         step 3) and refresh the descriptor, from the source's routes while the source is bound
         to the pin, else by a normal lookup. A KEL pinned (or advanced) from the source alone is
-        not confirmed live, as a card bundle's own KEL is not, until the refreshed descriptor
-        confirms it (04 § Card record)."""
+        not confirmed live until the refreshed descriptor confirms it (04 § Card record)."""
         # A pin failure (a fork: kel_conflict) fails the accept, never passed over by a lookup.
         state, _ = self.peers.pin(source["kel"], self._now())
         relays = list(source["descriptor"]["relays"])
