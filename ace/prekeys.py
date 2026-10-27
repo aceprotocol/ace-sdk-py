@@ -71,15 +71,11 @@ def decode_prekey_public_key(b64: object) -> bytes:
     ``invalid_body``. Checked here, at decode, so a key that cannot be encapsulated to is
     never held."""
     public = decode_fixed_b64(b64, KEM_PUBLIC_KEY_SIZE, "invalid_body", "prekey")
-    _check_xwing_public_key(public, "invalid_body", "prekey")
-    return public
-
-
-def _check_xwing_public_key(public: bytes, code: str, what: str) -> None:
     try:
         _xwing.check_public_key(public)
     except ACEError:
-        raise ACEError(code, f"{what} is not an X-Wing public key") from None
+        raise ACEError("invalid_body", "prekey is not an X-Wing public key") from None
+    return public
 
 
 @dataclass
@@ -216,7 +212,8 @@ class PrekeyVault:
             public = decode_fixed_b64(
                 h["publicKey"], KEM_PUBLIC_KEY_SIZE, "storage_failed", "publicKey"
             )
-            _check_xwing_public_key(public, "storage_failed", "held.publicKey")
+            # The vault trusts its own document: the key was checked at content decode before
+            # hold(), so a load checks only the length and re-derives the ID, as for seeds.
             held = _Held(Prekey(prekey_id(public), public), h["timestamp"], h["pin"])
         return _Peer(
             None if d["offered"] is None else self._parse(d["offered"], "offeredAt"),
@@ -375,7 +372,9 @@ class PrekeyVault:
 
     def hold(self, peer: str, prekey: Prekey, timestamp: int, pin: str) -> None:
         """Record the prekey ``peer`` offered in a packet dated ``timestamp`` and authenticated
-        under pin state ``pin``, unless the held key came from a packet at least as new."""
+        under pin state ``pin``, unless the held key came from a packet at least as new. Length
+        and ID only: the key comes from a content ``prekey`` that ``decode_prekey_public_key``
+        already checked as an X-Wing public key."""
         _check_peer(peer)
         timestamp = check_wire_int(timestamp, "timestamp")
         if not is_sha256_hex(pin):
