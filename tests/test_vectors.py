@@ -648,6 +648,13 @@ def test_receive_pipeline(c):
         assert peer.in_use is not None and peer.in_use.prekey.id == after["inUse"]
         assert peer.offered is None or peer.offered.prekey.id != after["inUse"]
         vault.open(after["inUse"], clock["t"], sender=after["peer"])
+        if "held" in after:  # the holder rule, under bob's pin for peer (its last KEL event digest)
+            name = next(n for n, a in AGENTS.items() if a["aceId"] == after["peer"])
+            pin = verify_kel(c["admitted"][name]["kel"], NOW).last_hash
+            got = vault.held(after["peer"], pin, clock["t"])
+            assert got is not None
+            assert base64.b64encode(got.public_key).decode() == after["held"]["publicKey"]
+            assert vault._state.peers[after["peer"]].held.timestamp == after["held"]["timestamp"]
         assert (
             code_of(lambda: vault.open(after["inUse"], clock["t"], sender=other))
             == "unknown_prekey"
